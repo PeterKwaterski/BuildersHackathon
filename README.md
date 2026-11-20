@@ -1,6 +1,12 @@
-# Blast Radius starter
+# Blast Radius selector
 
-A working submission for the Blast Radius track. It runs every test on every commit, so it never misses a failure and scores badly. Your job is to run less without missing.
+A test-impact selector for the Blast Radius track. It combines per-test coverage,
+fixture ownership, import-time execution, dialect usage and static assignment
+dependencies, then packs the selected tests onto the cheapest worker count.
+
+The committed model is derived only from the pinned sqlglot source and passing
+baseline test runs. It does not read or encode `sample/answers.json`. That file
+is used only by the supplied scorer after the selector has produced its output.
 
 ## The problem
 
@@ -37,6 +43,14 @@ make check    # the output's format only
 `make sample` prints your simulated seconds and misses, which are exact for that output. The board adds the CPU seconds your container used and takes the middle of 3 runs, so expect it a little higher. Your program never sees `sample/answers.json`: only the patches and `tests.json` are mounted.
 
 `sample/answers.json` lists the tests each sample commit breaks and the kind of change it is. The practice and final commits are hidden, and so is everything your program prints when it runs on them. A rejected submission tells you which rule it broke and nothing more, so reproduce problems here.
+
+The current exact-image sample result is **188.749 simulated seconds with zero
+misses**. Model collection used the pinned Python 3.13 image and the locked
+dependencies. Ordinary coverage is merged with a coverage-only synchronous
+process-pool pass so both serialization paths and optimizer/executor bodies are
+represented. `tools/build_model.py` compacts those answer-independent inputs
+into `selector_model.json.gz`; runtime test IDs are resolved against
+`/data/tests.json` rather than assuming fixed test numbers.
 
 ## Submit
 
