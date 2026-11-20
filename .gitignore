@@ -1,0 +1,14 @@
+# Local scorer output
+output.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
