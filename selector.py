@@ -25,6 +25,9 @@ MODULE_CONSTANT_MODEL = Path(__file__).with_name("module_constant_model.json.gz"
 CODE_REFLECTION_MODEL = Path(__file__).with_name("code_reflection_model.json.gz")
 CODE_REFLECTION_RANGES_SHA256 = "c84e754efedb3fbaa3323a6ceb381e180c46dd385f295a5b2b44e22ec7401338"
 FRESH_ALIAS_PROFILE = Path(__file__).with_name("fresh_alias_profile.json.gz")
+GENERATOR_DISPATCH_MODEL = Path(__file__).with_name("generator_dispatch_model.json.gz")
+GENERATOR_DISPATCH_INVENTORY_SHA256 = "3e3cb5a12da0fb01cd68f9b2fc789bc8d020523e015fea7016e04679c34d1dca"
+GENERATOR_DISPATCH_PROFILE_SHA256 = "8829e844dbd6870f2bca81cc7fb4f89f16ccdef7ecbba278748cdd850aeb1bfd"
 MAX_WORKERS = 8
 WORKER_COST_MS = 2_000
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -1634,6 +1637,142 @@ def zero_reader_dict_edit(
     return selected_readers
 
 
+def generator_transform_edit(
+    change: dict,
+    path: str,
+    dispatch_model: dict,
+) -> set[int] | None:
+    """Narrow a deferred Generator.TRANSFORMS lambda to exact dispatch readers."""
+    entries = dispatch_model.get("d", {}).get(path)
+    source = pinned_sources().get(path)
+    changed = patched_source(change, path)
+    if (
+        not entries
+        or source is None
+        or changed is None
+        or len(change.get("hunks", ())) != 1
+        or any(COMMENT_DIRECTIVE.search(line) for line in change["payload"])
+    ):
+        return None
+    try:
+        original_tree = ast.parse(source, filename=path, type_comments=True)
+        changed_tree = ast.parse(changed, filename=path, type_comments=True)
+    except (SyntaxError, ValueError):
+        return None
+
+    def assignments(tree: ast.Module):
+        result = {}
+
+        def visit(body: list[ast.stmt], owner: tuple[str, ...]) -> None:
+            for statement in body:
+                if isinstance(statement, ast.ClassDef):
+                    visit(statement.body, (*owner, statement.name))
+                    continue
+                targets = statement.targets if isinstance(statement, ast.Assign) else (
+                    [statement.target] if isinstance(statement, ast.AnnAssign) else []
+                )
+                if (
+                    len(targets) == 1
+                    and isinstance(targets[0], ast.Name)
+                    and targets[0].id == "TRANSFORMS"
+                    and isinstance(getattr(statement, "value", None), ast.Dict)
+                ):
+                    key = (".".join(owner), statement.lineno, statement.end_lineno or statement.lineno)
+                    result[key] = statement if key not in result else None
+
+        visit(tree.body, ())
+        return result
+
+    original_assignments = assignments(original_tree)
+    changed_assignments = assignments(changed_tree)
+    by_assignment = {}
+    for entry in entries:
+        if not isinstance(entry, list) or len(entry) != 8:
+            return None
+        start, end, owner, index, key_dump, value_dump, state, readers = entry
+        by_assignment.setdefault((owner, start, end), {})[index] = (
+            key_dump, value_dump, state, readers
+        )
+
+    candidates = []
+    for assignment_key, indexed_entries in by_assignment.items():
+        original_statement = original_assignments.get(assignment_key)
+        changed_statement = changed_assignments.get(assignment_key)
+        if original_statement is None or changed_statement is None:
+            continue
+        original_dict = original_statement.value
+        changed_dict = changed_statement.value
+        if len(original_dict.keys) != len(changed_dict.keys):
+            continue
+        old_keys = [
+            ast.dump(key, include_attributes=False) if key is not None else None
+            for key in original_dict.keys
+        ]
+        new_keys = [
+            ast.dump(key, include_attributes=False) if key is not None else None
+            for key in changed_dict.keys
+        ]
+        if old_keys != new_keys:
+            continue
+        changed_indices = [
+            index
+            for index, (old, new) in enumerate(zip(original_dict.values, changed_dict.values))
+            if ast.dump(old, include_attributes=False) != ast.dump(new, include_attributes=False)
+        ]
+        if len(changed_indices) != 1:
+            continue
+        index = changed_indices[0]
+        record = indexed_entries.get(index)
+        if record is None:
+            continue
+        key_dump, value_dump, state, readers = record
+        if (
+            state != "safe"
+            or old_keys[index] != key_dump
+            or ast.dump(original_dict.values[index], include_attributes=False) != value_dump
+            or not isinstance(readers, list)
+            or any(
+                type(reader) is not int
+                or reader < 0
+                or reader >= dispatch_model.get("n", 0)
+                for reader in readers
+            )
+        ):
+            continue
+        candidates.append((original_dict.values[index], changed_dict.values[index], readers))
+    if len(candidates) != 1:
+        return None
+    original_value, changed_value, readers = candidates[0]
+
+    def lambda_shape(value: ast.AST):
+        if not isinstance(value, ast.Lambda):
+            return None
+        arguments = value.args
+        if arguments.defaults or any(default is not None for default in arguments.kw_defaults):
+            return None
+        return ast.dump(arguments, include_attributes=False)
+
+    if lambda_shape(original_value) is None or lambda_shape(original_value) != lambda_shape(changed_value):
+        return None
+
+    class Replace(ast.NodeTransformer):
+        def __init__(self, target: ast.AST):
+            self.target = target
+
+        def generic_visit(self, node):
+            if node is self.target:
+                return ast.Constant(value="__blast_radius_generator_transform__")
+            return super().generic_visit(node)
+
+    Replace(original_value).visit(original_tree)
+    Replace(changed_value).visit(changed_tree)
+    if ast.dump(original_tree, include_attributes=False) != ast.dump(
+        changed_tree, include_attributes=False
+    ):
+        return None
+    return set(readers)
+
+
 def profile_equivalent_predicate_edit(
     change: dict,
     path: str,
@@ -2260,6 +2399,77 @@ def valid_code_reflection_model(model: object, pinned_sha: str, test_digest: str
     )
 
 
+def valid_generator_dispatch_model(
+    model: object, pinned_sha: str, test_digest: str, n: int
+) -> bool:
+    """Validate every generator entry before any precise dispatch decision."""
+    if (
+        not isinstance(model, dict)
+        or set(model) != {"d", "n", "p", "sha", "t", "v"}
+        or model.get("v") != 1
+        or model.get("sha") != pinned_sha
+        or model.get("t") != test_digest
+        or model.get("n") != n
+        or not isinstance(model.get("d"), dict)
+    ):
+        return False
+    try:
+        profile_digest = hashlib.sha256(
+            json.dumps(model["d"], sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    except (TypeError, ValueError, OverflowError, RecursionError, MemoryError):
+        return False
+    if model.get("p") != profile_digest:
+        return False
+    states = {
+        "safe",
+        "unsupported-value",
+        "ineffective",
+        "json-path-order",
+        "unsafe-observation",
+    }
+    actual_inventory = []
+    for path, entries in model["d"].items():
+        if type(path) is not str or not isinstance(entries, list):
+            return False
+        for entry in entries:
+            if not isinstance(entry, list) or len(entry) != 8:
+                return False
+            start, end, owner, index, key_dump, value_dump, state, readers = entry
+            if (
+                type(start) is not int
+                or type(end) is not int
+                or start <= 0
+                or end < start
+                or type(owner) is not str
+                or type(index) is not int
+                or index < 0
+                or type(key_dump) is not str
+                or type(value_dump) is not str
+                or state not in states
+                or not isinstance(readers, list)
+                or readers != sorted(set(readers))
+                or any(
+                    type(reader) is not int or reader < 0 or reader >= n
+                    for reader in readers
+                )
+            ):
+                return False
+            actual_inventory.append([path, start, end, owner, index, key_dump, value_dump])
+
+    try:
+        inventory_digest = hashlib.sha256(
+            json.dumps(sorted(actual_inventory), separators=(",", ":")).encode()
+        ).hexdigest()
+    except (TypeError, ValueError, OverflowError, MemoryError, RecursionError):
+        return False
+    return (
+        len(actual_inventory) == 1350
+        and inventory_digest == GENERATOR_DISPATCH_INVENTORY_SHA256
+        and profile_digest == GENERATOR_DISPATCH_PROFILE_SHA256
+    )
+
+
 def selected_indices(
     patch: Path,
     model: dict,
@@ -2272,6 +2482,7 @@ def selected_indices(
     constant_model: dict | None = None,
     reflection_model: dict | None = None,
     fresh_alias_model: dict | None = None,
+    generator_dispatch_model: dict | None = None,
 ) -> set[int]:
     selected: set[int] = set()
     changes = patch_changes(patch)
@@ -2328,6 +2539,14 @@ def selected_indices(
             # A syntax or import error fails every collected test in the file,
             # even when only one test function covered the changed line.
             selected.update(test_file_indices[path])
+
+        if generator_dispatch_model is not None and len(changes) == 1:
+            generator_indices = generator_transform_edit(
+                change, path, generator_dispatch_model
+            )
+            if generator_indices is not None:
+                selected.update(generator_indices)
+                continue
 
         fixture_set = model["x"].get(path)
         if fixture_set is not None:
@@ -2489,6 +2708,20 @@ def main() -> None:
         reflection_model = json.load(reflection_model_file)
     with gzip.open(FRESH_ALIAS_PROFILE, "rt", encoding="utf-8") as fresh_alias_file:
         fresh_alias_model = json.load(fresh_alias_file)
+    try:
+        with gzip.open(GENERATOR_DISPATCH_MODEL, "rt", encoding="utf-8") as dispatch_file:
+            generator_dispatch_model = json.load(dispatch_file)
+    except (
+        OSError,
+        EOFError,
+        UnicodeError,
+        json.JSONDecodeError,
+        ValueError,
+        TypeError,
+        RecursionError,
+        MemoryError,
+    ):
+        generator_dispatch_model = {"d": {}}
     test_digest = hashlib.sha256(
         "\0".join(test["id"] for test in tests).encode("utf-8")
     ).hexdigest()
@@ -2541,6 +2774,10 @@ def main() -> None:
         or fresh_alias_model.get("t") != test_digest
     ):
         fresh_alias_model = {"d": {}}
+    if not valid_generator_dispatch_model(
+        generator_dispatch_model, model.get("sha"), test_digest, len(tests)
+    ):
+        generator_dispatch_model = {"d": {}}
     mapped_tests = [tests_by_id.get(test_id) for test_id in model["t"]]
     all_indices = {index for index, test in enumerate(mapped_tests) if test is not None}
     test_file_indices: dict[str, set[int]] = {}
@@ -2564,6 +2801,7 @@ def main() -> None:
             constant_model,
             reflection_model,
             fresh_alias_model,
+            generator_dispatch_model,
         )
         selected = [
             mapped_tests[index]

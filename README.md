@@ -110,6 +110,21 @@ entry can never itself be certified. Every uncertainty falls back to the ordinar
 assignment dependency cone. The certificate is derived from pinned sources and
 tests and contains no sample commit, patch, or answer information.
 
+`tools/collect_generator_dispatch.py`,
+`tools/collect_generator_provenance.py`, and
+`tools/build_generator_dispatch_model.py` reproduce the exact deferred
+`Generator.TRANSFORMS` dispatch certificate. The source-derived inventory binds
+1,350 entries across 37 generator classes, while forward and reverse import
+orders independently resolve inherited origins. Runtime narrowing is limited
+to one default-free lambda body in one unchanged dictionary: keys, lambda
+arguments, assignment coordinates, every AST node outside the lambda, and the
+single-hunk structure must remain identical. Import-time observation, table
+mutation, ineffective entries, JSONPath order-sensitive cleanup, dynamic
+subclasses, missing child evidence, or stale provenance all fall back to the
+ordinary selector. The packaged model contains 521 safe deferred handlers and
+is bound to the pinned source, test manifest, complete inventory, and exact
+profile digest.
+
 `tools/collect_arg_type_derivations.py` and
 `tools/build_arg_type_derivation_model.py` reproduce the source-derived class
 dictionary certificate documented in `tools/ARG_TYPE_DERIVATION.md`. It
