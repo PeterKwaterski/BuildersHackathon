@@ -12,6 +12,7 @@ COPY selector.py /app/selector.py
 COPY semantic.py /app/semantic.py
 COPY semantic_noops.py /app/semantic_noops.py
 COPY runtime_verify.py /app/runtime_verify.py
+COPY max_nodes_exact.py /app/max_nodes_exact.py
 COPY selector_model.json.gz /app/selector_model.json.gz
 COPY semantic_sources.json.gz /app/semantic_sources.json.gz
 COPY zero_reader_model.json.gz /app/zero_reader_model.json.gz
@@ -24,4 +25,5 @@ COPY fresh_alias_profile.json.gz /app/fresh_alias_profile.json.gz
 COPY generator_dispatch_model.json.gz /app/generator_dispatch_model.json.gz
 COPY new_module_model.json.gz /app/new_module_model.json.gz
 COPY function_default_model.json.gz /app/function_default_model.json.gz
+COPY max_nodes_exact_profile.json.gz /app/max_nodes_exact_profile.json.gz
 CMD ["python", "/app/selector.py"]

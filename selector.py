@@ -38,6 +38,7 @@ FRESH_ALIAS_PROFILE = Path(__file__).with_name("fresh_alias_profile.json.gz")
 GENERATOR_DISPATCH_MODEL = Path(__file__).with_name("generator_dispatch_model.json.gz")
 NEW_MODULE_MODEL = Path(__file__).with_name("new_module_model.json.gz")
 FUNCTION_DEFAULT_MODEL = Path(__file__).with_name("function_default_model.json.gz")
+MAX_NODES_TEST_ID = "tests/test_parser.py::TestParser::test_max_nodes"
 # Filled only after all exact Python 3.13 traces build the final artifact.
 # An empty pin intentionally disables the profile.
 FUNCTION_DEFAULT_PROFILE_SHA256 = "f729c7f9c1eb6a30646b513006ad6829b159ca118e42714e07082bda966d2968"
@@ -1235,6 +1236,28 @@ def patched_source(change: dict, path: str) -> str | None:
     ending = "\n" if source.endswith("\n") else ""
     change["_patched_source"] = "\n".join(result) + ending
     return change["_patched_source"]
+
+
+def exact_max_nodes_passes(changes: list[dict], tests: list[dict]) -> bool:
+    """Prove the pinned expensive parser limit test passes without running it."""
+    if len(changes) != 1:
+        return False
+    change = changes[0]
+    if (
+        change.get("old") != "sqlglot/parser.py"
+        or change.get("new") != "sqlglot/parser.py"
+    ):
+        return False
+    original = pinned_sources().get("sqlglot/parser.py")
+    prospective = patched_source(change, "sqlglot/parser.py")
+    if original is None or prospective is None:
+        return False
+    try:
+        from max_nodes_exact import can_skip
+
+        return can_skip(original, prospective, tests)
+    except (ImportError, OSError, ValueError, TypeError, MemoryError, RecursionError):
+        return False
 
 
 def invalid_python_patch(change: dict, path: str) -> bool:
@@ -3393,6 +3416,10 @@ def main() -> None:
             if mapped_tests[index] is not None
         ]
         changes = patch_changes(patch)
+        if any(test["id"] == MAX_NODES_TEST_ID for test in selected) and exact_max_nodes_passes(
+            changes, tests
+        ):
+            selected = [test for test in selected if test["id"] != MAX_NODES_TEST_ID]
         verification_sources = []
         if changes and all(
             change["old"] == change["new"]
