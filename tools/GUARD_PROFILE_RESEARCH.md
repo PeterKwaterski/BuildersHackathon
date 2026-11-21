@@ -1,6 +1,41 @@
 # Per-test guard profiles
 
-Status: **FULL-RERUN-READY; NO-SHIP**
+Status: **ARTIFACT BUILT AND PINNED; EXACT-IMAGE AUDIT PENDING**
+
+## Final paired evidence
+
+Fresh normal and synchronous-worker collections from frozen Peter-only commit
+`c6f0ecbaebeb03ab9a4bec4bdffcd93f8a7c6bcc` both completed in the exact
+Python 3.13.18 collector image `sha256:736857c2a387...`.  Each ran all 1,620
+runnable tests, the exact separately declared skip, and 25,440 subtests with
+pytest and outer-process exit 0.  Normal accounted for 29/29 child logs and
+2,183 complete pool tasks; synchronous mode accounted for its one child and
+zero pool tasks.  Both have empty duplicate-protocol and XFAIL/XPASS sets.
+Every one of the 27 source-derived memory-sensitive owners remained escaped
+with zero event memberships.
+
+The two modes share all required provenance: pinned source commit/tree and
+tracked inventory, ordered runnable and skipped-test digests, collector/common/
+support/worker-transform code, materialized source, Python/image, environment,
+and sensitive-owner census.  Their separately reproduced executed-tree hashes
+are bound by mode.  Two builds with reversed input order are byte-identical:
+
+- 5,457 total sites in 131 files;
+- 4,825 safe, 515 unattributed, and 117 unobserved sites;
+- gzip SHA-256 `31bc8832c304e14e0c75173d61379f8570975a0e93620e883f5a78d87463aecb`;
+- decoded SHA-256 `2c1301936ca7da3f32f3b8a0ec36d48df2b8b657fc92e4b97caa1b9871b45cce`.
+
+An answer-free scan of 117 public patches whose changed lines mention a guard
+shape found 16 changed selections, all in validation set 4.  Relative to the
+disabled artifact, the profile removes 411 selections and 13.991 aggregate
+packed seconds.  This is capability evidence, not an official-score forecast.
+
+Separate read-only leader-ablation containers overlapped the latter portions
+of collection and contaminated wall-time measurements.  They did not share
+files or cgroups with the guard containers; both guard runs were OOM-free and
+all process-local allocation, roster, lifecycle, hash, and provenance gates
+passed.  The collection wall times must not be used as selector performance
+evidence.  Final selector CPU is measured separately.
 
 The first audit's collect-ready verdict was invalidated when source-light
 preflight found the pinned tree's uninitialized `sqlglot-integration-tests`
@@ -153,18 +188,19 @@ and not an artifact copied into it.
 No replacement full trace, profile build, selector enablement, replay, or scorer
 run has been performed. The prior full-normal exit-1 evidence remains rejected.
 
-## Admission sequence and blockers
+## Remaining exact-image admission
 
-Do not enable this feature until all of the following are complete:
+The first three gates are complete.  Do not submit until the final gate is
+complete:
 
-1. Fresh normal and synchronous-worker collection in the exact locked Python
-   3.13/runtime image, with the complete pinned 1,620-test manifest.
-2. Two deterministic builds from the admitted inputs that are byte-identical.
-3. Pin the resulting raw artifact SHA-256 in `selector.py` and include the
-   artifact in the repository.
-4. Run the full Docker suite and adversarial/replay validation, checking every
+1. Complete fresh normal and synchronous-worker collection in the exact locked
+   Python 3.13/runtime image with the pinned manifest. **Done.**
+2. Build twice from admitted inputs and require byte identity. **Done.**
+3. Pin the raw artifact and package it in the image. **Done in the candidate
+   integration branch.**
+4. Run the exact Docker sample plus adversarial/replay validation, checking every
    failing patch/test pair is retained and measuring the actual score impact.
 
-Until then `GUARD_PROFILE_SHA256 = ""` deliberately keeps the runtime path
-disabled. The current source/LIGHT verdict is therefore **FULL-RERUN-READY /
-NO-SHIP**.
+The candidate now binds the artifact by raw SHA-256 and fails closed when it is
+missing, malformed, or stale.  Exact-image verification remains the final
+shipping gate.

@@ -32,9 +32,9 @@ SEMANTIC_SOURCES_SHA256 = "f453c6266c20edcc9ba7127ebedde0bdf45d44633279352c2daaf
 ZERO_READER_MODEL = Path(__file__).with_name("zero_reader_model.json.gz")
 PREDICATE_PROFILE = Path(__file__).with_name("predicate_profile.json.gz")
 GUARD_PROFILE = Path(__file__).with_name("guard_profile.json.gz")
-# Filled only after two independently admitted Python 3.13 trace modes produce
-# the final deterministic artifact. An empty pin deliberately disables it.
-GUARD_PROFILE_SHA256 = ""
+# Deterministic artifact from independently admitted normal and synchronous
+# Python 3.13 traces at the pinned source revision.
+GUARD_PROFILE_SHA256 = "31bc8832c304e14e0c75173d61379f8570975a0e93620e883f5a78d87463aecb"
 ARG_TYPE_DERIVATION_MODEL = Path(__file__).with_name(
     "arg_type_derivation_model.json.gz"
 )
