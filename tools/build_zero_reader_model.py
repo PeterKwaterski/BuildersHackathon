@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Build a conservative zero-reader dictionary-key certificate.
+"""Build a conservative exact-reader dictionary-key certificate.
 
 The input traces are answer-independent observations from the complete pinned
 test suite.  A dictionary is admitted only when static taint proves its object
 identity reaches keyed reads or key/shape-only operations and no value-wide or
-opaque consumer.  The runtime selector still re-proves the exact patch shape.
+opaque consumer. Each literal key records its complete set of owning tests,
+including the empty set. The runtime selector still re-proves the patch shape.
 """
 
 from __future__ import annotations
@@ -369,6 +370,17 @@ def build_scoped_flow_model(
                     key = (node.value.id, node.attr)
                     explicit_class_attributes.add(key)
                     return {("class_attribute", *key)}
+            # Imported classes commonly have a module qualifier, for example
+            # ``parser.Parser.FUNCTIONS``. The terminal class name still
+            # identifies a unique pinned class, so keep its value-wide import
+            # reads from poisoning every unrelated subclass dictionary.
+            if (
+                isinstance(node.value, ast.Attribute)
+                and node.value.attr[:1].isupper()
+            ):
+                key = (node.value.attr, node.attr)
+                explicit_class_attributes.add(key)
+                return {("class_attribute", *key)}
             dynamic_attributes.add(node.attr)
             return {("dynamic_attribute", node.attr)}
 
@@ -468,6 +480,18 @@ def build_scoped_flow_model(
                     for operator, comparator in zip(parent.ops, parent.comparators)
                 )
                 if membership:
+                    continue
+                identity_none = all(
+                    isinstance(operator, (ast.Is, ast.IsNot))
+                    and (
+                        isinstance(comparator, ast.Constant)
+                        and comparator.value is None
+                        or isinstance(parent.left, ast.Constant)
+                        and parent.left.value is None
+                    )
+                    for operator, comparator in zip(parent.ops, parent.comparators)
+                )
+                if identity_none:
                     continue
                 unsafe.update(symbols)
                 continue
@@ -614,10 +638,12 @@ def main() -> None:
             legacy_certificate_cache[target] = certified_target(
                 target, legacy_edges, legacy_unsafe
             )
-        if not (certificate_cache[symbol] or legacy_certificate_cache[target]):
+        scoped_certificate = certificate_cache[symbol]
+        legacy_certificate = legacy_certificate_cache[target]
+        if not (scoped_certificate or legacy_certificate):
             continue
         runtime_keys = []
-        key_dumps = []
+        key_readers = {}
         valid = True
         for key in node.value.keys:
             # ``None`` is an unchanged ``**mapping`` entry. The wrapped final
@@ -635,15 +661,24 @@ def main() -> None:
                 valid = False
                 break
             runtime_keys.append(runtime_key)
-            if repr(runtime_key) not in events:
-                key_dumps.append(ast.dump(key, include_attributes=False))
-        if valid and key_dumps:
+            owners = events.get(repr(runtime_key), ())
+            if "__NO_TEST__" in owners:
+                continue
+            if not scoped_certificate and owners:
+                # Preserve the already-audited legacy zero-reader proof, but
+                # require the owner-aware scoped proof before narrowing a
+                # nonzero reader set.
+                continue
+            key_readers[ast.dump(key, include_attributes=False)] = sorted(
+                test_ids.index(owner) for owner in owners
+            )
+        if valid and key_readers:
             certified[relative].append(
-                [node.lineno, node.end_lineno or node.lineno, target, key_dumps]
+                [node.lineno, node.end_lineno or node.lineno, target, key_readers]
             )
 
     output = {
-        "v": 1,
+        "v": 2,
         "sha": PINNED_SHA,
         "n": len(expected_tests),
         "t": hashlib.sha256("\0".join(test_ids).encode("utf-8")).hexdigest(),
@@ -654,7 +689,7 @@ def main() -> None:
     ).encode("utf-8")
     args.output.write_bytes(gzip.compress(payload, compresslevel=9, mtime=0))
     print(
-        f"certified {sum(len(entries) for entries in certified.values())} dictionaries "
+        f"certified exact readers for {sum(len(entries) for entries in certified.values())} dictionaries "
         f"across {len(certified)} files"
     )
 

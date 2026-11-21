@@ -956,18 +956,18 @@ def zero_reader_dict_edit(
     path: str,
     zero_model: dict,
     hook_attributes: set[str] | None = None,
-) -> bool:
-    """Prove the patch only changes certified dictionary values no test reads."""
+) -> set[int] | None:
+    """Narrow dictionary value edits to their exact certified key readers."""
     entries = zero_model.get("d", {}).get(path)
     source = pinned_sources().get(path)
     changed = patched_source(change, path)
     if not entries or source is None or changed is None:
-        return False
+        return None
     try:
         original_tree = ast.parse(source, filename=path, type_comments=True)
         changed_tree = ast.parse(changed, filename=path, type_comments=True)
     except (SyntaxError, ValueError):
-        return False
+        return None
 
     def assignments(tree: ast.Module):
         result = {}
@@ -1000,7 +1000,7 @@ def zero_reader_dict_edit(
     changed_assignments = assignments(changed_tree)
     candidates = []
     changed_lines = change["lines"]
-    for start, end, target, zero_keys in entries:
+    for start, end, target, key_readers in entries:
         if not any(start <= line <= end for line in changed_lines):
             continue
         matches = [
@@ -1012,19 +1012,21 @@ def zero_reader_dict_edit(
             and (statement.end_lineno or statement.lineno) == end
         ]
         if len(matches) != 1:
-            return False
-        candidates.append((*matches[0], set(zero_keys)))
+            return None
+        candidates.append((*matches[0], key_readers))
     if len(candidates) != 1:
-        return False
+        return None
 
-    key, original_statement, zero_keys = candidates[0]
+    key, original_statement, key_readers = candidates[0]
+    if not isinstance(key_readers, dict):
+        return None
     changed_statement = changed_assignments.get(key)
     if changed_statement is None:
-        return False
+        return None
     original_dict = original_statement.value
     changed_dict = changed_statement.value
     if len(original_dict.keys) != len(changed_dict.keys):
-        return False
+        return None
     original_key_dumps = [
         ast.dump(item, include_attributes=False) if item is not None else None
         for item in original_dict.keys
@@ -1034,7 +1036,7 @@ def zero_reader_dict_edit(
         for item in changed_dict.keys
     ]
     if original_key_dumps != changed_key_dumps:
-        return False
+        return None
 
     runtime_keys = []
     for key_node in original_dict.keys:
@@ -1044,9 +1046,9 @@ def zero_reader_dict_edit(
             runtime_key = ast.literal_eval(key_node)
             hash(runtime_key)
         except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
-            return False
+            return None
         if runtime_key in runtime_keys:
-            return False
+            return None
         runtime_keys.append(runtime_key)
 
     changed_values = [
@@ -1058,11 +1060,45 @@ def zero_reader_dict_edit(
         != ast.dump(new, include_attributes=False)
     ]
     if not changed_values:
-        return False
+        return None
     all_changed_values_are_deferred_factories = True
+    selected_readers: set[int] = set()
+
+    def deferred_lambda_shape(value: ast.AST):
+        if not isinstance(value, ast.Lambda):
+            return None
+        arguments = value.args
+        if (
+            arguments.defaults
+            or any(default is not None for default in arguments.kw_defaults)
+            or any(
+                argument.annotation is not None
+                for argument in [
+                    *arguments.posonlyargs,
+                    *arguments.args,
+                    *arguments.kwonlyargs,
+                    *([arguments.vararg] if arguments.vararg else []),
+                    *([arguments.kwarg] if arguments.kwarg else []),
+                ]
+            )
+        ):
+            return None
+        return ast.dump(arguments, include_attributes=False)
+
     for index in changed_values:
-        if original_key_dumps[index] is None or original_key_dumps[index] not in zero_keys:
-            return False
+        key_dump = original_key_dumps[index]
+        readers = key_readers.get(key_dump) if key_dump is not None else None
+        if (
+            not isinstance(readers, list)
+            or any(
+                type(reader) is not int
+                or reader < 0
+                or reader >= zero_model.get("n", 0)
+                for reader in readers
+            )
+        ):
+            return None
+        selected_readers.update(readers)
         try:
             ast.literal_eval(original_dict.values[index])
             ast.literal_eval(changed_dict.values[index])
@@ -1074,7 +1110,10 @@ def zero_reader_dict_edit(
                 changed_dict.values[index], changed_tree, path
             )
             if original_shape is None or original_shape != changed_shape:
-                return False
+                original_shape = deferred_lambda_shape(original_dict.values[index])
+                changed_shape = deferred_lambda_shape(changed_dict.values[index])
+                if original_shape is None or original_shape != changed_shape:
+                    return None
         else:
             all_changed_values_are_deferred_factories = False
         original_dict.values[index] = ast.Constant(value=None)
@@ -1083,10 +1122,12 @@ def zero_reader_dict_edit(
     if ast.dump(original_tree, include_attributes=False) != ast.dump(
         changed_tree, include_attributes=False
     ):
-        return False
-    return all_changed_values_are_deferred_factories or not import_expression_hazard(
+        return None
+    if not all_changed_values_are_deferred_factories and import_expression_hazard(
         change, path, hook_attributes
-    )
+    ):
+        return None
+    return selected_readers
 
 
 def profile_equivalent_predicate_edit(
@@ -1469,7 +1510,15 @@ def derived_arg_types_edit(
             and original_key_dumps[index] in readers
         ):
             return None
-        selected.update(readers[original_key_dumps[index]])
+        key_readers = readers[original_key_dumps[index]]
+        if not isinstance(key_readers, list) or any(
+            type(reader) is not int
+            or reader < 0
+            or reader >= derivation_model.get("n", 0)
+            for reader in key_readers
+        ):
+            return None
+        selected.update(key_readers)
         original_dict.values[index] = ast.Constant(value=None)
         changed_dict.values[index] = ast.Constant(value=None)
 
@@ -1583,10 +1632,13 @@ def selected_indices(
             selected.update(all_indices)
             continue
 
-        if zero_model is not None and zero_reader_dict_edit(
-            change, path, zero_model, model.get("h")
-        ):
-            continue
+        if zero_model is not None:
+            dictionary_indices = zero_reader_dict_edit(
+                change, path, zero_model, model.get("h")
+            )
+            if dictionary_indices is not None:
+                selected.update(dictionary_indices)
+                continue
 
         if predicate_model is not None and profile_equivalent_predicate_edit(
             change, path, predicate_model, model.get("h")
@@ -1723,7 +1775,7 @@ def main() -> None:
         "\0".join(test["id"] for test in tests).encode("utf-8")
     ).hexdigest()
     if (
-        zero_model.get("v") != 1
+        zero_model.get("v") != 2
         or zero_model.get("sha") != model.get("sha")
         or zero_model.get("n") != len(tests)
         or zero_model.get("t")
@@ -1738,7 +1790,7 @@ def main() -> None:
     ):
         predicate_model = {"d": {}}
     if (
-        derivation_model.get("v") != 1
+        derivation_model.get("v") != 2
         or derivation_model.get("sha") != model.get("sha")
         or derivation_model.get("n") != len(tests)
         or derivation_model.get("t") != test_digest

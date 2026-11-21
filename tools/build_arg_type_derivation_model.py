@@ -283,6 +283,15 @@ def merge_documents(documents: list[dict], key: str):
     return merged
 
 
+def merge_key_documents(documents: list[dict], key: str):
+    merged = defaultdict(lambda: defaultdict(set))
+    for document in documents:
+        for label, events in document.get(key, {}).items():
+            for value, owners in events.items():
+                merged[label][value].update(owners)
+    return merged
+
+
 def main() -> None:
     args = arguments()
     if len(args.manifest) < 2 or len(args.trace) < 2:
@@ -307,6 +316,13 @@ def main() -> None:
             raise SystemExit(f"manifest {path} lacks subprocess accounting")
 
     documents = [json.loads(path.read_text()) for path in args.trace]
+    if any(
+        "derived_keys" not in document
+        or "derived_order" not in document
+        or "keys" not in document
+        for document in documents
+    ):
+        raise SystemExit("traces lack per-key requiredness/key-only evidence")
     if any(document.get("conflicts") for document in documents):
         raise SystemExit("derived identity map reported a conflict")
     unmapped = {
@@ -329,31 +345,49 @@ def main() -> None:
         for label, events in document.get("dict", {}).items():
             for key, owners in events.items():
                 dict_events[label][key].update(owners)
-    derived = merge_documents(documents, "derived")
-    derivations = merge_documents(documents, "derivations")
+    derived_keys = merge_key_documents(documents, "derived_keys")
+    derived_order = merge_documents(documents, "derived_order")
 
     certified: dict[str, list[list[object]]] = defaultdict(list)
     for relative, statement, label, _class_name in assignments:
         if label in forbidden:
             continue
-        if any(label not in document.get("dict", {}) for document in documents):
-            continue
         if any(label not in document.get("derivations", {}) for document in documents):
             continue
         events = dict_events[label]
-        if not events or any(
+        if any(
             "__NO_TEST__" in owners for key, owners in events.items() if key != VALUE_WILDCARD
         ):
             continue
         if "__NO_TEST__" in events.get(VALUE_WILDCARD, ()):
             continue
-        all_relevant_owners = set(derived.get(label, ())) | {
-            owner for owner in events.get(VALUE_WILDCARD, ())
-        }
-        if any(owner not in expected for owner in all_relevant_owners):
-            continue
         dictionary = statement.value
         if any(key is None for key in dictionary.keys):
+            continue
+        order_owners = set()
+        order_valid = True
+        for key_node, value_node in zip(dictionary.keys, dictionary.values):
+            try:
+                runtime_key = ast.literal_eval(key_node)
+                runtime_value = ast.literal_eval(value_node)
+            except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+                order_valid = False
+                break
+            if runtime_value:
+                order_owners.update(
+                    derived_keys.get(label, {}).get(repr(runtime_key), ())
+                )
+        if not order_valid:
+            continue
+        if order_owners != set(derived_order.get(label, ())):
+            raise SystemExit(f"derived order evidence mismatch for {label}")
+        # Changing membership can reorder a set even when the edited key is
+        # present. If another currently required key is missing, retain that
+        # owner for every key because error-message ordering may be observed.
+        all_relevant_owners = {
+            owner for owner in events.get(VALUE_WILDCARD, ())
+        } | order_owners
+        if any(owner not in expected for owner in all_relevant_owners):
             continue
         runtime_keys = []
         key_entries = []
@@ -369,7 +403,11 @@ def main() -> None:
                 valid = False
                 break
             runtime_keys.append(runtime_key)
-            owners = set(all_relevant_owners) | set(events.get(repr(runtime_key), ()))
+            owners = (
+                set(all_relevant_owners)
+                | set(events.get(repr(runtime_key), ()))
+                | set(derived_keys.get(label, {}).get(repr(runtime_key), ()))
+            )
             if "__NO_TEST__" in owners or any(owner not in expected for owner in owners):
                 valid = False
                 break
@@ -390,7 +428,7 @@ def main() -> None:
         "n": len(test_ids),
         "sha": revision,
         "t": hashlib.sha256("\0".join(test_ids).encode()).hexdigest(),
-        "v": 1,
+        "v": 2,
     }
     raw = json.dumps(output, sort_keys=True, separators=(",", ":")).encode()
     args.output.write_bytes(gzip.compress(raw, compresslevel=9, mtime=0))

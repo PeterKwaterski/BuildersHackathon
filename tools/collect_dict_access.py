@@ -55,7 +55,9 @@ class TrackingDict(dict):
         return super().get(key, default)
 
     def __contains__(self, key):
-        record(self._br_label, key)
+        # Membership observes only key presence, which the runtime gate proves
+        # unchanged for a value-only edit.
+        record(self._br_label, ("__BR_WILDCARD__", "keys"))
         return super().__contains__(key)
 
     def __len__(self):

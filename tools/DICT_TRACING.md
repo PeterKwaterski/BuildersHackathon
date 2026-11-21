@@ -1,7 +1,7 @@
 # Dictionary access trace provenance
 
 `collect_dict_access.py` produces the answer-independent input used by the
-zero-reader certificate. It validates the pinned sqlglot revision, copies the
+exact-key reader certificate. It validates the pinned sqlglot revision, copies the
 checkout to a temporary directory, wraps simple module/class dictionary
 literals, and runs the pinned suite. It never reads sample patches or answers.
 
@@ -28,21 +28,26 @@ python tools/collect_dict_access.py \
 
 The corresponding `/tmp/dict-access.manifest.json` is provenance evidence.
 The trace itself is intentionally not committed: it is large and the compact
-certificate contains only source labels and keys proved to have no reader.
+certificate contains only source labels, literal-key syntax, and exact owning
+test indices. Empty owner lists retain the previous zero-reader proof.
 
 The collector is deliberately observational rather than a proof by itself.
-The certificate builder must reject value-wide observations, unresolved
+The certificate builder rejects value-wide observations, unresolved
 identity flow, native/opaque consumers, exact-type checks, copies, and any key
-seen in a test or import context. Its source analysis uses scope-qualified
+seen in an import context. Key-presence operations are recorded separately
+because the runtime proves the keys and their order are identical; they do not
+observe a changed value. Its source analysis uses scope-qualified
 symbols for module/class assignments and function parameters, while retaining
-the older global analysis as an independent conservative proof. Dynamic class
+the older global analysis only for already-audited zero-reader entries. A
+nonzero reader set requires the owner-aware scoped proof. Dynamic class
 attributes flow through a shared attribute node; explicit class references
-flow only from definitions with that exact class name. Either proof may admit a
-dictionary, but neither can override a recorded value-wide read.
+flow only from definitions with that exact class name, including module-qualified
+class references. Neither proof can override a recorded value-wide read.
 
 Dictionary unpack entries are retained in the runtime structure comparison but
 are never certified as keys. The runtime selector allows a certified explicit
-key to change only when its old and new values are literals, or when both are
+key to change only when its old and new values are literals, same-signature
+default-free lambdas, or when both are
 same-shape calls with literal arguments to the same statically proved pure
 closure factory. Such a factory may only define one undecorated, default-free
 nested function and return it; evaluated annotations, decorators, side-effecting

@@ -44,7 +44,7 @@ make check    # the output's format only
 
 `sample/answers.json` lists the tests each sample commit breaks and the kind of change it is. The practice and final commits are hidden, and so is everything your program prints when it runs on them. A rejected submission tells you which rule it broke and nothing more, so reproduce problems here.
 
-The current exact-image sample result is **102.598 simulated seconds with zero
+The current exact-image sample result is **100.285 simulated seconds with zero
 misses**. Seven recent selector-body measurements in the scorer container had a
 1.103-second median; process startup is additional and the board measures the
 complete container. Model collection used the pinned Python 3.13 image and the
@@ -72,17 +72,17 @@ without changing local or closure bindings.
 
 `tools/collect_dict_access.py` reproduces the complete pinned-suite access trace
 described in `tools/DICT_TRACING.md`; `tools/build_zero_reader_model.py` turns it
-into a still narrower certificate. Static identity flow must prove
+into an exact-key reader certificate. Static identity flow must prove
 that a dictionary reaches only keyed readers or key/shape-only operations; an
 unknown call, copy, value-wide operation, native boundary, relevant
 import-context read, or value-observing trace wildcard rejects it. Scope-qualified
 flow keeps unrelated modules, classes, and function parameters distinct; an
 explicit class reference and a dynamic `self` attribute remain conservative.
-At runtime this certificate is used only for an existing literal key with no
-reader at all, identical old/new key order, and a whole-file AST that becomes
+At runtime this certificate is used only for an existing literal key with an
+exact certified reader set, identical old/new key order, and a whole-file AST that becomes
 identical when the changed value is replaced by a sentinel. Values must be
-literals or calls to a statically proved side-effect-free closure factory with
-literal arguments. Unchanged dictionary unpacking is permitted, but an unpack
+literals, default-free same-signature lambdas, or calls to a statically proved
+side-effect-free closure factory with literal arguments. Unchanged dictionary unpacking is permitted, but an unpack
 entry can never itself be certified. Every uncertainty falls back to the ordinary
 assignment dependency cone. The certificate is derived from pinned sources and
 tests and contains no sample commit, patch, or answer information.
@@ -93,8 +93,11 @@ dictionary certificate documented in `tools/ARG_TYPE_DERIVATION.md`. It
 identity-links every `required_args` set to the exact `arg_types` dictionary
 that produced it, so inherited and dynamic subclasses are covered without a
 class-name join. Runtime use accepts only boolean value edits in an otherwise
-identical certified dictionary and selects the union of direct, value-wide,
-and derived-set consumers from two complete passing suite modes.
+identical certified dictionary and selects exact value readers plus only those
+derived-set invocations where that key's requiredness can affect validation.
+Key-presence operations remain separately recorded but do not observe a value
+edit; missing-required-key owners are retained globally to preserve possible
+set-order effects. Both complete passing suite modes are required.
 
 `tools/collect_predicate_values.py` and
 `tools/build_predicate_profile.py` reproduce the still narrower ordering

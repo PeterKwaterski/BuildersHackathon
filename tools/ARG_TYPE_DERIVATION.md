@@ -1,8 +1,9 @@
 # `arg_types` derivation certificate
 
 `arg_type_derivation_model.json.gz` narrows boolean value edits in expression
-class `arg_types` dictionaries to their direct readers and to readers of the
-`required_args` set derived from that exact dictionary object. The evidence is
+class `arg_types` dictionaries to value-observing direct readers and to the
+exact `required_args` invocations where that key's requiredness can matter.
+The evidence is
 answer-independent: sample patches, commit IDs, and expected failures are not
 inputs.
 
@@ -11,8 +12,12 @@ then instruments the exact pinned `Expr.__init_subclass__` derivation and the
 sole `Expression.error_messages` consumer. A strong identity map retains each
 derived set and its source dictionary label; reads are credited only after an
 `id` and object-identity check. This covers inherited dictionaries and dynamic
-subclasses without joining on class names. Ordinary keyed and value-wide
-dictionary operations are traced separately. Process children inherit the
+subclasses without joining on class names. At every validated consumer call,
+the collector records which source keys are missing, `None`, or an empty list.
+A present nonempty key behaves identically whether optional or required.
+Key-presence operations such as `k in arg_types` are recorded separately from
+value reads because the runtime gate proves all keys unchanged. Ordinary exact
+value and value-wide dictionary operations remain conservative. Process children inherit the
 owning pytest node and write mergeable logs.
 
 The pinned suite also contains exactly four calls to the sole
@@ -54,6 +59,12 @@ with module/class-time consumers or unsupported events are excluded. Any
 value-wide dictionary event outside an owning pytest test, including one
 recorded as `__NO_TEST__`, rejects that source label rather than being filtered
 from its owner set.
+
+Changing membership in a Python set can reorder its other members. The builder
+therefore finds every invocation where a currently required key is missing and
+retains that owner for every key of the source dictionary, even when the edited
+key itself is present. This preserves observable error-message ordering without
+turning all derived-set reads into value-wide consumers.
 
 At runtime both complete files are parsed. Acceptance requires exactly one
 certified class dictionary assignment, identical literal collision-free keys,

@@ -38,7 +38,10 @@ from pathlib import Path
 
 CURRENT_TEST = os.environ.get("BR_PARENT_TEST")
 DICT_EVENTS = defaultdict(lambda: defaultdict(set))
+KEY_ONLY_EVENTS = defaultdict(lambda: defaultdict(set))
 DERIVED_READS = defaultdict(set)
+DERIVED_KEY_READS = defaultdict(lambda: defaultdict(set))
+DERIVED_ORDER_READS = defaultdict(set)
 DERIVATIONS = defaultdict(set)
 UNMAPPED_READS = set()
 CONFLICTS = set()
@@ -49,6 +52,9 @@ def owner():
 
 def record(label, key):
     DICT_EVENTS[label][repr(key)].add(owner())
+
+def record_key_only(label, key):
+    KEY_ONLY_EVENTS[label][repr(key)].add(owner())
 
 class TrackingDict(dict):
     def __init__(self, source, label):
@@ -64,7 +70,7 @@ class TrackingDict(dict):
         return super().get(key, default)
 
     def __contains__(self, key):
-        record(self._br_label, key)
+        record_key_only(self._br_label, key)
         return super().__contains__(key)
 
     def __len__(self):
@@ -170,29 +176,62 @@ def derive(source, result, attribute):
         return result
     identity = id(result)
     prior = DERIVED.get(identity)
-    if prior is not None and (prior[0] is not result or prior[1:] != (label, attribute)):
+    if prior is not None and (
+        prior[0] is not result
+        or prior[1] != label
+        or prior[2] != attribute
+        or prior[3] is not source
+    ):
         CONFLICTS.add(owner())
         return result
-    DERIVED[identity] = (result, label, attribute)
+    DERIVED[identity] = (result, label, attribute, source)
     DERIVATIONS[label].add(owner())
     return result
 
-def read_derived(result, attribute):
+def read_derived(result, attribute, values):
     mapping = DERIVED.get(id(result))
     if mapping is None or mapping[0] is not result or mapping[2] != attribute:
         UNMAPPED_READS.add(owner())
         return result
-    DERIVED_READS[mapping[1]].add(owner())
+    label = mapping[1]
+    DERIVED_READS[label].add(owner())
+    # Record only keys whose requiredness can affect this invocation.  A
+    # present nonempty value behaves identically whether the key is optional
+    # or required; a missing/None/empty-list value can change the errors.
+    source = mapping[3]
+    missing_required = False
+    for key in dict.keys(source):
+        value = values.get(key)
+        if value is None or (isinstance(value, list) and not value):
+            DERIVED_KEY_READS[label][repr(key)].add(owner())
+            if dict.__getitem__(source, key):
+                missing_required = True
+    # Adding/removing even a present key can change a set's iteration order.
+    # If another currently required key is missing, conservatively retain the
+    # owner for every candidate key because error ordering may be observable.
+    if missing_required:
+        DERIVED_ORDER_READS[label].add(owner())
     return result
 
 def document():
     return {
         "conflicts": sorted(CONFLICTS),
         "derived": {label: sorted(owners) for label, owners in sorted(DERIVED_READS.items())},
+        "derived_keys": {
+            label: {key: sorted(owners) for key, owners in sorted(events.items())}
+            for label, events in sorted(DERIVED_KEY_READS.items())
+        },
+        "derived_order": {
+            label: sorted(owners) for label, owners in sorted(DERIVED_ORDER_READS.items())
+        },
         "derivations": {label: sorted(owners) for label, owners in sorted(DERIVATIONS.items())},
         "dict": {
             label: {key: sorted(owners) for key, owners in sorted(events.items())}
             for label, events in sorted(DICT_EVENTS.items())
+        },
+        "keys": {
+            label: {key: sorted(owners) for key, owners in sorted(events.items())}
+            for label, events in sorted(KEY_ONLY_EVENTS.items())
         },
         "unmapped": sorted(UNMAPPED_READS),
     }
@@ -240,8 +279,16 @@ def merge(document):
     for label, events in document.get("dict", {}).items():
         for key, owners in events.items():
             _br_arg_derivation.DICT_EVENTS[label][key].update(owners)
+    for label, events in document.get("keys", {}).items():
+        for key, owners in events.items():
+            _br_arg_derivation.KEY_ONLY_EVENTS[label][key].update(owners)
     for label, owners in document.get("derived", {}).items():
         _br_arg_derivation.DERIVED_READS[label].update(owners)
+    for label, events in document.get("derived_keys", {}).items():
+        for key, owners in events.items():
+            _br_arg_derivation.DERIVED_KEY_READS[label][key].update(owners)
+    for label, owners in document.get("derived_order", {}).items():
+        _br_arg_derivation.DERIVED_ORDER_READS[label].update(owners)
     for label, owners in document.get("derivations", {}).items():
         _br_arg_derivation.DERIVATIONS[label].update(owners)
     _br_arg_derivation.UNMAPPED_READS.update(document.get("unmapped", ()))
@@ -271,7 +318,7 @@ HOOK_NEW = (
     '"required_args")'
 )
 READ_OLD = "for k in self.required_args:"
-READ_NEW = 'for k in _br_read_derived(self.required_args, "required_args"):'
+READ_NEW = 'for k in _br_read_derived(self.required_args, "required_args", self.args):'
 
 
 def arguments() -> argparse.Namespace:
