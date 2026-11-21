@@ -262,7 +262,7 @@ class LocalBindingRenameTest(unittest.TestCase):
                 {7},
             )
 
-    def test_bundled_typing_reflection_reader_is_retained(self) -> None:
+    def test_bundled_typing_reflection_reader_is_outcome_equivalent(self) -> None:
         path = "sqlglot/typing/__init__.py"
         original = selector.pinned_sources()[path]
         tree = ast.parse(original, filename=path, type_comments=True)
@@ -303,7 +303,16 @@ class LocalBindingRenameTest(unittest.TestCase):
                     set(range(1620)),
                     reflection_model=reflection,
                 ),
-                {1619},
+                set(),
+            )
+            self.assertEqual(
+                selector.selected_indices(
+                    patch_path,
+                    {},
+                    set(range(1620)),
+                    reflection_model=None,
+                ),
+                set(range(1620)),
             )
 
     def tearDown(self) -> None:

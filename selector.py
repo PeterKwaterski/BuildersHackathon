@@ -9,7 +9,7 @@ import keyword
 import re
 import sys
 import types
-from collections import deque
+from collections import Counter, deque
 from pathlib import Path
 
 from semantic import SemanticProof
@@ -79,6 +79,7 @@ _SOURCE_INDEXES = {}
 _IMPORT_DEFINITION_RANGES = {}
 _SOURCE_CODE = {}
 _INIT_SUBCLASS_ATTRIBUTES = None
+_TYPING_CODE_FINGERPRINTS = None
 
 # Proof families are independent kill switches.  Import and definition order
 # remain quarantined until their missing construction/namespace certificates
@@ -2909,6 +2910,137 @@ def code_reflection_indices(
     return selected
 
 
+def _nested_code_objects(root: types.CodeType) -> list[types.CodeType]:
+    result = []
+    pending = [root]
+    while pending:
+        code = pending.pop()
+        children = [
+            value for value in code.co_consts if isinstance(value, types.CodeType)
+        ]
+        result.extend(children)
+        pending.extend(children)
+    return result
+
+
+def _typing_test_code_fingerprint(code: types.CodeType) -> tuple:
+    """Exactly mirror tests/test_typing.py::_same_code."""
+    return (code.co_code, code.co_names, code.co_varnames, code.co_consts)
+
+
+def typing_reflection_outcome_equivalent(
+    change: dict,
+    path: str,
+    reflection_model: dict | None,
+    proof_family: str | None,
+    local_annotation: bool,
+) -> bool:
+    """Prove a semantic no-op cannot create redundant typing metadata.
+
+    The only pinned code-reflection reader compares annotator code by four
+    exact CodeType fields. Local annotations preserve the complete compiled
+    fingerprint. A same-width local rename may change ``co_varnames``; it is
+    safe only when every changed prospective fingerprint remains unique across
+    the complete pinned typing package, so it cannot newly equal a parent
+    annotator. This uses a superset of the functions the test can inspect.
+    """
+    if (
+        reflection_model is None
+        or not (
+            path == "sqlglot/typing/__init__.py"
+            or path.startswith("sqlglot/typing/")
+        )
+        or not path.endswith(".py")
+        or (proof_family != "local-binding-rename" and not local_annotation)
+        or code_reflection_indices(path, change["lines"], reflection_model, set())
+        != {1619}
+    ):
+        return False
+
+    original = pinned_sources().get(path)
+    prospective = patched_source(change, path)
+    if original is None or prospective is None:
+        return False
+    try:
+        original_root = compile(original, path, "exec", dont_inherit=True)
+        prospective_root = compile(prospective, path, "exec", dont_inherit=True)
+    except (SyntaxError, ValueError, TypeError, OverflowError, MemoryError):
+        return False
+
+    def keyed(root: types.CodeType) -> dict[tuple, types.CodeType] | None:
+        result = {}
+        for code in _nested_code_objects(root):
+            key = (code.co_qualname, code.co_name, code.co_firstlineno)
+            if key in result:
+                return None
+            result[key] = code
+        return result
+
+    original_codes = keyed(original_root)
+    prospective_codes = keyed(prospective_root)
+    if (
+        original_codes is None
+        or prospective_codes is None
+        or original_codes.keys() != prospective_codes.keys()
+    ):
+        return False
+    changed_keys = [
+        key
+        for key in original_codes
+        if _typing_test_code_fingerprint(original_codes[key])
+        != _typing_test_code_fingerprint(prospective_codes[key])
+    ]
+    if not changed_keys:
+        return True
+
+    observed = reflection_model["d"].get(path, ())
+    for key in changed_keys:
+        _qualname, name, first_line = key
+        if not any(
+            entry_name == name
+            and start == first_line
+            and state == "observed"
+            and readers == [1619]
+            and any(start <= line <= end for line in change["lines"])
+            for start, end, entry_name, state, readers in observed
+        ):
+            return False
+
+    global _TYPING_CODE_FINGERPRINTS
+    if _TYPING_CODE_FINGERPRINTS is None:
+        fingerprints = Counter()
+        for source_path, source in pinned_sources().items():
+            if not (
+                source_path == "sqlglot/typing/__init__.py"
+                or source_path.startswith("sqlglot/typing/")
+            ) or not source_path.endswith(".py"):
+                continue
+            try:
+                root = compile(source, source_path, "exec", dont_inherit=True)
+            except (SyntaxError, ValueError, TypeError, OverflowError, MemoryError):
+                return False
+            fingerprints.update(
+                _typing_test_code_fingerprint(code)
+                for code in _nested_code_objects(root)
+            )
+        _TYPING_CODE_FINGERPRINTS = fingerprints
+
+    prospective_fingerprints = _TYPING_CODE_FINGERPRINTS.copy()
+    for key in changed_keys:
+        prospective_fingerprints[
+            _typing_test_code_fingerprint(original_codes[key])
+        ] -= 1
+    for key in changed_keys:
+        prospective_fingerprints[
+            _typing_test_code_fingerprint(prospective_codes[key])
+        ] += 1
+    for key in changed_keys:
+        new = _typing_test_code_fingerprint(prospective_codes[key])
+        if prospective_fingerprints[new] != 1:
+            return False
+    return True
+
+
 def valid_code_reflection_model(model: object, pinned_sha: str, test_digest: str, n: int) -> bool:
     """Validate the complete bundled reflection profile before trusting any range."""
     if (
@@ -3264,14 +3396,25 @@ def selected_indices(
         ):
             selected.update(all_indices)
             continue
-        selected.update(
-            code_reflection_indices(path, change["lines"], reflection_model, all_indices)
+        reflection_indices = code_reflection_indices(
+            path, change["lines"], reflection_model, all_indices
         )
         if inert_comment_addition(change, path):
+            selected.update(reflection_indices)
             continue
-        if semantic_noop_edit(change, path) is not None:
+        semantic_noop = semantic_noop_edit(change, path)
+        local_annotation = local_annotation_only_edit(change, path)
+        if not typing_reflection_outcome_equivalent(
+            change,
+            path,
+            reflection_model,
+            semantic_noop,
+            local_annotation,
+        ):
+            selected.update(reflection_indices)
+        if semantic_noop is not None:
             continue
-        if local_annotation_only_edit(change, path):
+        if local_annotation:
             continue
         if proven_identity_equality(change, path, model):
             continue
