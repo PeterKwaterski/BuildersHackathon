@@ -24,11 +24,14 @@ from collect_guard_observations import (
     NONE_HOOK,
     TRUTH_HOOK,
     copy_tracked_tree,
+    executed_materialized_digest,
     generated_support_digest,
     generated_support_sources,
     git_tracked_paths,
     materialized_digest,
     sensitive_test_files,
+    synchronous_worker_tests,
+    tracked_inventory_digest,
 )
 from guard_profile_common import none_comparison, none_comparison_safe, truth_form, truth_state
 
@@ -438,6 +441,171 @@ assert captured
             self.assertEqual(copy_tracked_tree(source, work, paths), expected)
             self.assertFalse((work / "sqlglot/untracked.py").exists())
             self.assertEqual(sensitive_test_files(source, paths), ["tests/test_memory.py"])
+
+    def test_tracked_materialization_binds_gitlink_mode_oid_and_empty_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            work = Path(temporary) / "work"
+            source.mkdir()
+            subprocess.run(["git", "init", "-q", str(source)], check=True)
+            (source / "tracked.py").write_text("VALUE = 1\n")
+            subprocess.run(["git", "-C", str(source), "add", "tracked.py"], check=True)
+            gitlink_oid = "1" * 40
+            subprocess.run(
+                [
+                    "git", "-C", str(source), "update-index", "--add", "--cacheinfo",
+                    f"160000,{gitlink_oid},vendor",
+                ],
+                check=True,
+            )
+            (source / "vendor").mkdir()
+
+            entries = git_tracked_paths(source)
+            gitlink = next(entry for entry in entries if entry.relative == Path("vendor"))
+            self.assertEqual((gitlink.mode, gitlink.oid), ("160000", gitlink_oid))
+            self.assertRegex(tracked_inventory_digest(entries), r"^[0-9a-f]{64}$")
+            expected = materialized_digest(source, entries)
+            self.assertEqual(copy_tracked_tree(source, work, entries), expected)
+            self.assertTrue((work / "vendor").is_dir())
+            self.assertEqual(list((work / "vendor").iterdir()), [])
+
+            (source / "vendor/content").write_text("initialized\n")
+            with self.assertRaisesRegex(SystemExit, "initialized or contentful"):
+                materialized_digest(source, entries)
+            (source / "vendor/content").unlink()
+            (source / "vendor").rmdir()
+            with self.assertRaisesRegex(SystemExit, "missing tracked gitlink"):
+                materialized_digest(source, entries)
+            (source / "vendor").write_text("wrong type\n")
+            with self.assertRaisesRegex(SystemExit, "missing tracked gitlink"):
+                materialized_digest(source, entries)
+
+    def test_tracked_inventory_rejects_path_collisions(self):
+        oid = b"1" * 40
+        raw = b"100644 " + oid + b" 0\ta\0" + b"100644 " + oid + b" 0\ta/b\0"
+        with patch.object(subprocess, "check_output", return_value=raw):
+            with self.assertRaisesRegex(SystemExit, "tracked path collision"):
+                git_tracked_paths(Path("/unused"))
+
+    def test_materialized_digest_rejects_index_object_and_mode_drift(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            source.mkdir()
+            subprocess.run(["git", "init", "-q", str(source)], check=True)
+            path = source / "tracked.py"
+            path.write_text("VALUE = 1\n")
+            subprocess.run(["git", "-C", str(source), "add", "tracked.py"], check=True)
+            entries = git_tracked_paths(source)
+            executed_before = executed_materialized_digest(source, entries)
+
+            path.write_text("VALUE = 2\n")
+            with self.assertRaisesRegex(SystemExit, "tracked file object mismatch"):
+                materialized_digest(source, entries)
+            executed_after = executed_materialized_digest(source, entries)
+            self.assertNotEqual(executed_after, executed_before)
+            path.write_text("VALUE = 1\n")
+            path.chmod(0o755)
+            with self.assertRaisesRegex(SystemExit, "tracked executable mode mismatch"):
+                materialized_digest(source, entries)
+
+    def test_tracked_inventory_rejects_zero_oid_and_noncanonical_path(self):
+        with patch.object(
+            subprocess,
+            "check_output",
+            return_value=b"100644 " + b"0" * 40 + b" 0\ttracked.py\0",
+        ):
+            with self.assertRaisesRegex(SystemExit, "invalid tracked object ID"):
+                git_tracked_paths(Path("/unused"))
+        with patch.object(
+            subprocess,
+            "check_output",
+            return_value=b"100644 " + b"1" * 40 + b" 0\ta//b\0",
+        ):
+            with self.assertRaisesRegex(SystemExit, "unsafe tracked path"):
+                git_tracked_paths(Path("/unused"))
+
+    def test_tracked_inventory_rejects_unmerged_unsupported_and_duplicate_entries(self):
+        oid = b"1" * 40
+        cases = (
+            (b"100644 " + oid + b" 2\ta\0", "unmerged tracked entry"),
+            (b"100664 " + oid + b" 0\ta\0", "unsupported tracked mode"),
+            (
+                b"100644 " + oid + b" 0\ta\0" + b"100755 " + oid + b" 0\ta\0",
+                "duplicate tracked source inventory",
+            ),
+            (b"100644 " + oid + b" 0\ta", "malformed NUL-delimited"),
+            (b"100644 " + oid + b" 0\ta\0\0", "malformed NUL-delimited"),
+            (
+                b"100644 " + oid + b" 0\ta\0" + b"100644 " + b"2" * 64 + b" 0\tb\0",
+                "mixed Git object formats",
+            ),
+        )
+        for raw, message in cases:
+            with self.subTest(message=message), patch.object(
+                subprocess, "check_output", return_value=raw
+            ):
+                with self.assertRaisesRegex(SystemExit, message):
+                    git_tracked_paths(Path("/unused"))
+
+    def test_materialization_rechecks_gitlink_source_after_copy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            work = Path(temporary) / "work"
+            source.mkdir()
+            subprocess.run(["git", "init", "-q", str(source)], check=True)
+            oid = "1" * 40
+            subprocess.run(
+                [
+                    "git", "-C", str(source), "update-index", "--add", "--cacheinfo",
+                    f"160000,{oid},vendor",
+                ],
+                check=True,
+            )
+            gitlink = source / "vendor"
+            gitlink.mkdir()
+            entries = git_tracked_paths(source)
+            pristine = materialized_digest
+            source_checks = 0
+
+            def mutate_after_first_source_check(root, checked_entries):
+                nonlocal source_checks
+                result = pristine(root, checked_entries)
+                if root == source and source_checks == 0:
+                    source_checks += 1
+                    (gitlink / "late-content").write_text("race\n")
+                return result
+
+            with patch(
+                "collect_guard_observations.materialized_digest",
+                side_effect=mutate_after_first_source_check,
+            ):
+                with self.assertRaisesRegex(SystemExit, "initialized or contentful"):
+                    copy_tracked_tree(source, work, entries)
+
+    def test_executed_digest_admits_only_the_bound_synchronous_rewrite(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            work = Path(temporary) / "work"
+            (source / "tests").mkdir(parents=True)
+            (source / "tests/test_optimizer.py").write_text(
+                "from concurrent.futures import ProcessPoolExecutor, as_completed, wait\n"
+                "def parse_and_optimize(func, sql, read_dialect, **kwargs):\n"
+                "    return func(sql)\n"
+            )
+            (source / "tests/test_executor.py").write_text(
+                "from concurrent.futures import ProcessPoolExecutor\n"
+                "DIR_TPCH = 'tpch'\n"
+            )
+            subprocess.run(["git", "init", "-q", str(source)], check=True)
+            subprocess.run(["git", "-C", str(source), "add", "tests"], check=True)
+            entries = git_tracked_paths(source)
+            copy_tracked_tree(source, work, entries)
+            normal = executed_materialized_digest(work, entries)
+            synchronous_worker_tests(work)
+            synchronous = executed_materialized_digest(work, entries)
+            self.assertNotEqual(normal, synchronous)
+            with self.assertRaisesRegex(SystemExit, "tracked file object mismatch"):
+                materialized_digest(work, entries)
 
     def test_line_coverage_is_narrowed_only_by_exemptions(self):
         source = "def f(value):\n    if value:\n        return 1\n    return 0\n"

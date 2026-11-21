@@ -2,6 +2,14 @@
 
 Status: **SOURCE/COLLECT-READY; NO-SHIP**
 
+The first audit's collect-ready verdict was invalidated when source-light
+preflight found the pinned tree's uninitialized `sqlglot-integration-tests`
+Git link could not be materialized. An uncommitted repair now binds exact Git
+index modes/object IDs, permits only an empty mode-`160000` directory, and
+binds that inventory through collector and builder provenance. Focused tests
+pass. The independent follow-up in `GUARD_PROFILE_GITLINK_REAUDIT.md` found and
+fixed a synchronous-tree validation blocker and restored collect-ready status.
+
 This branch independently derives a conservative per-test observation model for
 simple guard-form changes.  It does not contain a profile artifact, public
 answer mapping, patch lookup table, or enabled selector shortcut.  The selector
@@ -42,8 +50,9 @@ rewrite production source.  A temporary import hook compiles instrumented ASTs
 in memory, preserving the source bytes seen by source-reading tests.  Each
 wrapper evaluates its operand once and returns the identical object.
 
-The trace is bound to the pinned Git commit and tree, the exact tracked-file
-materialization, the separately reproduced synchronous-worker materialization,
+The trace is bound to the pinned Git commit and tree, the exact mode/OID Git
+index inventory, the exact tracked-entry materialization (including the empty
+uninitialized Git link), the separately reproduced synchronous-worker materialization,
 ordered test-ID digest, collector, worker-transform and shared-classifier
 digests, generated-support digest, a sanitized deterministic environment,
 exact Python version, and declared immutable runtime-image identity. Import,
@@ -109,13 +118,14 @@ and not an artifact copied into it.
 
 - Python compilation of selector, collector, builder, shared inventory, tests,
   and all five generated support modules
-- 22 focused unit/adversarial tests covering state matrices, both singleton
+- 29 focused unit/adversarial tests covering state matrices, both singleton
   directions, operand side/syntax, whole-tree and directive rejection,
   malformed/unknown/unseen masks, exact-line subtraction, value identity and
   one-time evaluation, hostile/reflected protocols, custom metaclasses,
   mutable/native truth hazards, builtin monkeypatching, module/class contexts,
-  tracked materialization, generated-support tampering, and process-pool
-  pre-`atexit` flushing/quarantine
+  tracked materialization, Git-link mode/OID binding and fail-closed states,
+  path collisions, generated-support tampering, and process-pool pre-`atexit`
+  flushing/quarantine
 - deterministic source census above
 - `git diff --check`
 
@@ -126,9 +136,8 @@ while the shared machine was saturated, as required.
 
 Do not enable this feature until all of the following are complete:
 
-1. Preserve the independent adversarial audit verdict in
-   `GUARD_PROFILE_ADVERSARIAL_AUDIT.md`; any new collector/selector edit after
-   that audit requires focused re-review.
+1. Commit the independently re-audited Git-link/executed-tree repair so future
+   evidence binds one immutable source checkpoint.
 2. Fresh normal and synchronous-worker collection in the exact locked Python
    3.13/runtime image, with the complete pinned 1,620-test manifest.
 3. Two deterministic builds from the admitted inputs that are byte-identical.
@@ -138,4 +147,4 @@ Do not enable this feature until all of the following are complete:
    failing patch/test pair is retained and measuring the actual score impact.
 
 Until then `GUARD_PROFILE_SHA256 = ""` deliberately keeps the runtime path
-disabled.  The current verdict is therefore **COLLECT-READY / NO-SHIP**.
+disabled. The current verdict is therefore **COLLECT-READY / NO-SHIP**.

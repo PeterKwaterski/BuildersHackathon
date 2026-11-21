@@ -16,11 +16,13 @@ from pathlib import Path
 from collect_guard_observations import (
     canonical_digest,
     copy_tracked_tree,
+    executed_materialized_digest,
     generated_support_digest,
     git_tracked_paths,
     materialized_digest,
     sensitive_test_files,
     synchronous_worker_tests,
+    tracked_inventory_digest,
 )
 from guard_profile_common import STATE_NAMES, source_sites
 
@@ -69,7 +71,8 @@ def load_pairs(manifests: list[Path], traces: list[Path]) -> dict[str, tuple[dic
                 "collector_sha256", "common_sha256", "environment_sha256",
                 "executed_materialized_sha256", "instrumented", "materialized_sha256", "mode", "python",
                 "runtime_image", "sensitive_files_sha256", "source_sha",
-                "source_tree", "test_digest", "support_sha256", "worker_transform_sha256",
+                "source_tree", "test_digest", "support_sha256", "tracked_inventory_sha256",
+                "worker_transform_sha256",
             )
         }:
             raise SystemExit(f"trace/manifest metadata mismatch for {mode}")
@@ -108,6 +111,7 @@ def main() -> None:
     test_digest = hashlib.sha256("\0".join(test_ids).encode()).hexdigest()
     pairs = load_pairs(args.manifest, args.trace)
     tracked = git_tracked_paths(source)
+    expected_tracked_inventory = tracked_inventory_digest(tracked)
     expected_materialized = materialized_digest(source, tracked)
     expected_sensitive = canonical_digest(sensitive_test_files(source, tracked))
     with tempfile.TemporaryDirectory(prefix="blast-radius-guard-build-") as temporary:
@@ -115,8 +119,8 @@ def main() -> None:
         copy_tracked_tree(source, synchronous_work, tracked)
         synchronous_worker_tests(synchronous_work)
         expected_executed = {
-            "normal": expected_materialized,
-            "synchronous-worker": materialized_digest(synchronous_work, tracked),
+            "normal": executed_materialized_digest(source, tracked),
+            "synchronous-worker": executed_materialized_digest(synchronous_work, tracked),
         }
 
     metadata_values = defaultdict(set)
@@ -152,7 +156,8 @@ def main() -> None:
         for key in (
             "collector_sha256", "common_sha256", "environment_sha256", "instrumented",
             "materialized_sha256", "python", "runtime_image",
-            "sensitive_files_sha256", "support_sha256", "worker_transform_sha256",
+            "sensitive_files_sha256", "support_sha256", "tracked_inventory_sha256",
+            "worker_transform_sha256",
         ):
             metadata_values[key].add(manifest.get(key))
         if (
@@ -178,6 +183,7 @@ def main() -> None:
         or metadata_values["support_sha256"] != {generated_support_digest()}
         or metadata_values["materialized_sha256"] != {expected_materialized}
         or metadata_values["sensitive_files_sha256"] != {expected_sensitive}
+        or metadata_values["tracked_inventory_sha256"] != {expected_tracked_inventory}
         or metadata_values["worker_transform_sha256"] != {expected_worker_transform}
         or metadata_values["instrumented"] != {len(inventory)}
         or not all(

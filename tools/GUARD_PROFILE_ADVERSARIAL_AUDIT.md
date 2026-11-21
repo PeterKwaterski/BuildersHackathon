@@ -6,7 +6,33 @@ Scope: uncommitted `research/per-test-guard-profiles` source, based on selector
 commit `862545f`, including the selector gate, shared classifier/inventory,
 normal and synchronous collectors, builder admission, and focused tests. This
 audit did not run Docker, the full pytest suite, either full collection, the
-official collector, or the scorer.
+official collector, or the scorer. The verdict from that audit was invalidated
+by the concrete pinned-source materialization defect and repair below.
+
+## Post-audit blocker and repair
+
+The pinned tree contains the uninitialized Git link
+`sqlglot-integration-tests` at object
+`3000152841de3ae0c0fce2e6b383d61396363521`. The audited collector enumerated
+only tracked path names and accepted only files or symlinks, so it rejected
+this real index entry before collection could start. The prior
+**COLLECT-READY** verdict was therefore incorrect.
+
+The uncommitted repair now parses `git ls-files --stage -z`, binds every path
+to its exact mode and object ID, includes that inventory in a domain-separated
+digest, and includes mode and object ID in a separately domain-separated
+materialization digest. Regular files and symlinks must reproduce their Git
+blob object IDs and modes. Mode `160000` is the only permitted tracked
+directory and must exist as an empty, uninitialized directory; initialized,
+contentful, missing, wrong-type, unsupported-mode, unmerged, duplicate, and
+path-colliding entries fail closed. Copying reproduces the empty directory.
+The trace carries the tracked-inventory digest and the builder independently
+re-enumerates and validates both inventory and materialization.
+
+This repair changed audited collector, builder, and test code. Its independent
+follow-up review is recorded in `GUARD_PROFILE_GITLINK_REAUDIT.md`. That review
+found and fixed a synchronous-tree OID-validation blocker, expanded the focused
+suite to 29 tests, and restored the **COLLECT-READY** verdict.
 
 ## Findings and disposition
 
@@ -79,11 +105,11 @@ official collector, or the scorer.
 - External subprocess/exec/spawn use quarantines the owner; an instrumented
   child that disappears without a complete log fails admission.
 
-### Evidence integrity: pass for collection, external attestation still required
+### Evidence integrity: pass after independent Git-link re-audit
 
-- Inventory and execution trees contain only safe Git-tracked paths; tracked
-  changes, symlinks outside the tree, untracked contamination, and support
-  filename/marker collisions fail closed.
+- The original inventory claim missed the pinned Git link and blocked real
+  collection. The repaired inventory/materialization implementation and its
+  separate executed-tree digest passed the independent follow-up review.
 - The support digest binds tracker, plugin, classifier, import instrumenter,
   and sitecustomize. The synchronous-worker helper has a separate digest, and
   the builder independently reproduces and checks its post-transform tracked
@@ -120,11 +146,18 @@ source from collection.
   benefit for optimizer/executor tests but closes ownership and result-pickling
   ambiguity.
 
-## Verification performed
+## Post-repair light verification performed
 
 - `python3 -m py_compile` for selector, classifier, collector, builder, and tests
 - compilation of all five generated support modules
-- `python3 -m unittest -v tools.test_guard_profile`: **22/22 passed**
+- compilation of all five generated support modules
+- `python3 -m unittest -q tools.test_guard_profile`: **29/29 passed**
+- real pinned index: **365 entries** (`100644=360`, `100755=3`, `120000=1`,
+  `160000=1`), including the expected empty Git link
+- tracked-inventory SHA-256:
+  `d83639c3b69d4717f029ed1e6b9db88b6797b655a541909fb6c06a54fa8d80ad`
+- materialization SHA-256:
+  `62b25b3f9488552fee8b2af812ed0115abda46c6edeb915356cc1eae612eb905`
 - pinned-source inventory: **5,457 sites** (`truth=4,974`, `none=483`)
 - `git diff --check`: passed
 
@@ -133,15 +166,17 @@ reserved the machine while another collection was running.
 
 ## Exact blockers to shipping
 
-1. Run both complete 1,620-test traces in the verified locked Python 3.13 image:
+1. Commit the independently re-audited provenance repair before Docker smoke
+   or collection so every artifact binds one immutable source checkpoint.
+2. Run both complete 1,620-test traces in the verified locked Python 3.13 image:
    normal persistent workers and the independently reproduced synchronous tree.
-2. Require zero pytest failures, exact test membership, nonzero normal pool-task
+3. Require zero pytest failures, exact test membership, nonzero normal pool-task
    evidence, zero synchronous pool tasks, and complete child/task manifests.
-3. Build twice from the admitted files and require byte-identical gzip output;
+4. Build twice from the admitted files and require byte-identical gzip output;
    inspect state counts and provenance, especially unattributed/malformed sites.
-4. Add `guard_profile.json.gz`, set its exact raw SHA-256 in
+5. Add `guard_profile.json.gz`, set its exact raw SHA-256 in
    `GUARD_PROFILE_SHA256`, and rerun the 22 focused tests after that edit.
-5. Run the full locked Docker suite plus adversarial/replay validation proving
+6. Run the full locked Docker suite plus adversarial/replay validation proving
    every failing patch/test pair is retained, then measure score impact.
 
 Until all five blockers are cleared, the selector kill switch must stay empty

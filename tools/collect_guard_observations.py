@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 from collect_dict_access import synchronous_worker_tests, validate_source
@@ -28,6 +29,13 @@ from guard_profile_common import GUARD_NODES, label, none_comparison, source_sit
 PINNED_SHA = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
 TRUTH_HOOK = "_br_guard_truth_78c49f"
 NONE_HOOK = "_br_guard_none_78c49f"
+
+
+@dataclass(frozen=True)
+class TrackedEntry:
+    relative: Path
+    mode: str
+    oid: str
 
 
 def arguments() -> argparse.Namespace:
@@ -47,63 +55,158 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def git_tracked_paths(source: Path) -> list[Path]:
-    """Return the complete, safe Git-tracked inventory for materialization."""
+def git_tracked_paths(source: Path) -> list[TrackedEntry]:
+    """Return the complete, mode/OID-bound Git index inventory."""
 
     try:
-        raw_paths = subprocess.check_output(
-            ["git", "-C", str(source), "ls-files", "-z"],
-        ).split(b"\0")
+        raw_inventory = subprocess.check_output(
+            ["git", "-C", str(source), "ls-files", "--stage", "-z"],
+        )
     except (OSError, subprocess.CalledProcessError) as error:
         raise SystemExit("cannot enumerate the pinned Git tree") from error
-    result = []
-    for raw in raw_paths:
-        if not raw:
-            continue
+    if raw_inventory and not raw_inventory.endswith(b"\0"):
+        raise SystemExit("malformed NUL-delimited Git index inventory")
+    raw_entries = raw_inventory[:-1].split(b"\0") if raw_inventory else []
+    if any(not raw for raw in raw_entries):
+        raise SystemExit("malformed NUL-delimited Git index inventory")
+    result: list[TrackedEntry] = []
+    for raw in raw_entries:
         try:
-            text = raw.decode("utf-8")
+            metadata, raw_path = raw.split(b"\t", 1)
+            mode, oid, stage = metadata.decode("ascii").split(" ")
+            text = raw_path.decode("utf-8")
         except UnicodeDecodeError as error:
             raise SystemExit("non-UTF-8 path in pinned Git tree") from error
+        except (ValueError, UnicodeDecodeError) as error:
+            raise SystemExit("malformed Git index entry") from error
+        if stage != "0":
+            raise SystemExit(f"unmerged tracked entry: {text!r}")
+        if mode not in {"100644", "100755", "120000", "160000"}:
+            raise SystemExit(f"unsupported tracked mode {mode!r}: {text!r}")
+        if (
+            not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", oid)
+            or not oid.strip("0")
+        ):
+            raise SystemExit(f"invalid tracked object ID: {text!r}")
         relative = Path(text)
-        if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        if (
+            relative.is_absolute()
+            or not relative.parts
+            or ".." in relative.parts
+            or relative.as_posix() != text
+        ):
             raise SystemExit(f"unsafe tracked path: {text!r}")
-        path = source / relative
-        if not path.is_file() and not path.is_symlink():
-            raise SystemExit(f"unsupported tracked entry: {text!r}")
-        result.append(relative)
-    if not result or len(result) != len(set(result)):
+        result.append(TrackedEntry(relative, mode, oid))
+    paths = {entry.relative for entry in result}
+    if not result or len(result) != len(paths):
         raise SystemExit("empty or duplicate tracked source inventory")
-    return sorted(result, key=lambda path: path.as_posix())
-
-
-def materialized_digest(root: Path, paths: list[Path]) -> str:
-    digest = hashlib.sha256()
+    if len({len(entry.oid) for entry in result}) != 1:
+        raise SystemExit("mixed Git object formats in tracked source inventory")
     for relative in paths:
+        if any(parent in paths for parent in relative.parents if parent != Path(".")):
+            raise SystemExit(f"tracked path collision: {relative}")
+    return sorted(result, key=lambda entry: entry.relative.as_posix())
+
+
+def tracked_inventory_digest(entries: list[TrackedEntry]) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"guard-profile-tracked-inventory-v1\0")
+    for entry in entries:
+        digest.update(entry.relative.as_posix().encode())
+        digest.update(b"\0" + entry.mode.encode() + b"\0" + entry.oid.encode() + b"\0")
+    return digest.hexdigest()
+
+
+def _git_blob_oid(payload: bytes, oid: str) -> str:
+    constructor = hashlib.sha1 if len(oid) == 40 else hashlib.sha256
+    return constructor(f"blob {len(payload)}\0".encode() + payload).hexdigest()
+
+
+def _tree_digest(
+    root: Path,
+    entries: list[TrackedEntry],
+    *,
+    domain: bytes,
+    verify_index_objects: bool,
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(domain + b"\0")
+    for entry in entries:
+        relative, mode, oid = entry.relative, entry.mode, entry.oid
         path = root / relative
         digest.update(relative.as_posix().encode())
-        digest.update(b"\0")
-        if path.is_symlink():
+        digest.update(b"\0" + mode.encode() + b"\0" + oid.encode() + b"\0")
+        if mode == "160000":
+            if path.is_symlink() or not path.is_dir():
+                raise SystemExit(f"missing tracked gitlink: {relative}")
+            if any(path.iterdir()):
+                raise SystemExit(f"initialized or contentful tracked gitlink: {relative}")
+            digest.update(b"gitlink\0" + oid.encode())
+        elif mode == "120000":
+            if not path.is_symlink():
+                raise SystemExit(f"tracked symlink changed type: {relative}")
             target = os.readlink(path)
             target_path = Path(target)
             if target_path.is_absolute() or ".." in target_path.parts:
                 raise SystemExit(f"unsafe tracked symlink: {relative} -> {target}")
-            digest.update(b"link\0" + target.encode())
-        elif path.is_file():
-            digest.update(b"exec\0" if os.access(path, os.X_OK) else b"file\0")
-            digest.update(path.read_bytes())
+            payload = os.fsencode(target)
+            if verify_index_objects and _git_blob_oid(payload, oid) != oid:
+                raise SystemExit(f"tracked symlink object mismatch: {relative}")
+            digest.update(b"link\0" + payload)
         else:
-            raise SystemExit(f"missing tracked entry: {relative}")
+            if path.is_symlink() or not path.is_file():
+                raise SystemExit(f"tracked file changed type or is missing: {relative}")
+            executable = bool(path.stat().st_mode & 0o111)
+            if executable != (mode == "100755"):
+                raise SystemExit(f"tracked executable mode mismatch: {relative}")
+            payload = path.read_bytes()
+            if verify_index_objects and _git_blob_oid(payload, oid) != oid:
+                raise SystemExit(f"tracked file object mismatch: {relative}")
+            digest.update(b"exec\0" if executable else b"file\0")
+            digest.update(payload)
         digest.update(b"\0")
     return digest.hexdigest()
 
 
-def copy_tracked_tree(source: Path, destination: Path, paths: list[Path]) -> str:
+def materialized_digest(root: Path, entries: list[TrackedEntry]) -> str:
+    """Digest a pristine materialization and require every index object."""
+
+    return _tree_digest(
+        root,
+        entries,
+        domain=b"guard-profile-materialized-v2",
+        verify_index_objects=True,
+    )
+
+
+def executed_materialized_digest(root: Path, entries: list[TrackedEntry]) -> str:
+    """Digest an execution tree after the admitted synchronous transformation.
+
+    The original mode and object ID remain in the digest, while current bytes
+    are allowed to differ because ``synchronous_worker_tests`` intentionally
+    rewrites two tracked test files. Type, executable-mode, symlink-safety and
+    empty-gitlink checks remain mandatory.
+    """
+
+    return _tree_digest(
+        root,
+        entries,
+        domain=b"guard-profile-executed-materialization-v1",
+        verify_index_objects=False,
+    )
+
+
+def copy_tracked_tree(source: Path, destination: Path, entries: list[TrackedEntry]) -> str:
+    expected = materialized_digest(source, entries)
     destination.mkdir()
-    for relative in paths:
+    for entry in entries:
+        relative, mode = entry.relative, entry.mode
         original = source / relative
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        if original.is_symlink():
+        if mode == "160000":
+            target.mkdir()
+        elif mode == "120000":
             link = os.readlink(original)
             link_path = Path(link)
             if link_path.is_absolute() or ".." in link_path.parts:
@@ -111,19 +214,21 @@ def copy_tracked_tree(source: Path, destination: Path, paths: list[Path]) -> str
             target.symlink_to(link)
         else:
             shutil.copy2(original, target)
-    expected = materialized_digest(source, paths)
-    actual = materialized_digest(destination, paths)
+    actual = materialized_digest(destination, entries)
     if actual != expected:
         raise SystemExit("tracked source materialization changed content or modes")
+    if materialized_digest(source, entries) != expected:
+        raise SystemExit("tracked source changed during materialization")
     return actual
 
 
-def sensitive_test_files(source: Path, tracked: list[Path]) -> list[str]:
+def sensitive_test_files(source: Path, tracked: list[TrackedEntry]) -> list[str]:
     """Conservatively quarantine files that observe allocation/lifetime state."""
 
     sensitive_modules = {"gc", "resource", "tracemalloc", "weakref"}
     result = []
-    for relative in tracked:
+    for entry in tracked:
+        relative = entry.relative
         if not relative.as_posix().startswith("tests/") or relative.suffix != ".py":
             continue
         path = source / relative
@@ -438,6 +543,7 @@ def pytest_sessionfinish(session, exitstatus):
         "source_tree": os.environ["GUARD_SOURCE_TREE"],
         "support_sha256": os.environ["GUARD_SUPPORT_SHA256"],
         "test_digest": os.environ["GUARD_TEST_DIGEST"],
+        "tracked_inventory_sha256": os.environ["GUARD_TRACKED_INVENTORY_SHA256"],
         "worker_transform_sha256": os.environ["GUARD_WORKER_TRANSFORM_SHA256"],
     }
     trace = json.dumps(
@@ -663,6 +769,7 @@ def main() -> None:
         ["git", "-C", str(source), "rev-parse", "HEAD^{tree}"], text=True
     ).strip()
     tracked = git_tracked_paths(source)
+    tracked_inventory_sha256 = tracked_inventory_digest(tracked)
     sensitive_files = sensitive_test_files(source, tracked)
     sensitive_files_sha256 = canonical_digest(sensitive_files)
     tests = json.loads(args.tests.read_text())["tests"]
@@ -687,7 +794,7 @@ def main() -> None:
             (support / name).write_text(text)
         if args.synchronous_workers:
             synchronous_worker_tests(work)
-        executed_materialized_sha256 = materialized_digest(work, tracked)
+        executed_materialized_sha256 = executed_materialized_digest(work, tracked)
         instrumented = len(source_sites(source))
         reserved_support = set(support_sources)
         reserved_markers = {
@@ -698,7 +805,8 @@ def main() -> None:
             "_br_guard_instrument",
             "guard_profile_plugin",
         }
-        for relative in tracked:
+        for entry in tracked:
+            relative = entry.relative
             if relative.name in reserved_support:
                 raise SystemExit(f"generated support module collision: {relative}")
             if relative.suffix != ".py":
@@ -746,6 +854,7 @@ def main() -> None:
             "GUARD_SOURCE_TREE": source_tree,
             "GUARD_SUPPORT_SHA256": support_digest,
             "GUARD_TEST_DIGEST": test_digest,
+            "GUARD_TRACKED_INVENTORY_SHA256": tracked_inventory_sha256,
             "GUARD_TRACE": str(output),
             "GUARD_WORKER_TRANSFORM_SHA256": sha256(
                 Path(__file__).with_name("collect_dict_access.py")
