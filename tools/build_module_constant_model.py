@@ -160,12 +160,32 @@ def static_unsafe(source: Path, candidates: dict[tuple[str, str], str]) -> set[s
                 if label:
                     unsafe.add(label)
 
-        aliases = module_aliases.get(module, {})
+        aliases = dict(module_aliases.get(module, {}))
+        for local, imported in nested_modules.items():
+            previous = aliases.get(local)
+            if previous is not None and previous != imported:
+                unsafe.update(labels_by_module.get(previous, {}).values())
+            aliases[local] = imported
+
         parents = {
             child: parent
             for parent in ast.walk(tree)
             for child in ast.iter_child_nodes(parent)
         }
+
+        def module_target(node: ast.AST) -> str | None:
+            if isinstance(node, ast.Name):
+                return aliases.get(node.id)
+            if isinstance(node, ast.Attribute):
+                flattened = flatten_attribute(node)
+                if flattened:
+                    base, parts = flattened
+                    imported = aliases.get(base)
+                    target = ".".join((imported, *parts)) if imported else None
+                    if target in labels_by_module:
+                        return target
+            return None
+
         for node in ast.walk(tree):
             if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
                 flattened = flatten_attribute(node)
@@ -176,9 +196,11 @@ def static_unsafe(source: Path, candidates: dict[tuple[str, str], str]) -> set[s
                         label = qualified.get((".".join((imported, *parts[:-1])), parts[-1]))
                         if label:
                             unsafe.add(label)
-            if not isinstance(node, ast.Name) or not isinstance(node.ctx, ast.Load):
+            if not isinstance(node, (ast.Name, ast.Attribute)) or not isinstance(
+                node.ctx, ast.Load
+            ):
                 continue
-            imported = aliases.get(node.id)
+            imported = module_target(node)
             if not imported:
                 continue
             parent = parents.get(node)
@@ -195,8 +217,9 @@ def static_unsafe(source: Path, candidates: dict[tuple[str, str], str]) -> set[s
         # current module.
         for node in ast.walk(tree):
             if isinstance(node, ast.Attribute) and node.attr == "__dict__":
-                if isinstance(node.value, ast.Name) and node.value.id in aliases:
-                    unsafe.update(labels_by_module.get(aliases[node.value.id], {}).values())
+                target_module = module_target(node.value)
+                if target_module:
+                    unsafe.update(labels_by_module.get(target_module, {}).values())
             if not isinstance(node, ast.Call):
                 continue
             function = node.func.id if isinstance(node.func, ast.Name) else None
@@ -206,15 +229,13 @@ def static_unsafe(source: Path, candidates: dict[tuple[str, str], str]) -> set[s
                 unsafe.update(own.values())
             if function == "vars" and (not node.args):
                 unsafe.update(own.values())
-            if function == "vars" and node.args and isinstance(node.args[0], ast.Name):
-                target_module = aliases.get(node.args[0].id)
+            if function == "vars" and node.args:
+                target_module = module_target(node.args[0])
                 if target_module:
                     unsafe.update(labels_by_module.get(target_module, {}).values())
             if function not in {"getattr", "hasattr", "setattr", "delattr"} or len(node.args) < 2:
                 continue
-            target_module = None
-            if isinstance(node.args[0], ast.Name):
-                target_module = aliases.get(node.args[0].id)
+            target_module = module_target(node.args[0])
             if not target_module:
                 continue
             if isinstance(node.args[1], ast.Constant) and type(node.args[1].value) is str:

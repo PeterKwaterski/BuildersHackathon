@@ -1515,7 +1515,8 @@ def module_constant_edit(
     constant_model: dict,
 ) -> set[int] | None:
     """Narrow one immutable module-literal edit to its traced readers."""
-    entries = constant_model.get("d", {}).get(path)
+    data = constant_model.get("d", {})
+    entries = data.get(path) if isinstance(data, dict) else None
     source = pinned_sources().get(path)
     changed = patched_source(change, path)
     if (
@@ -1548,7 +1549,17 @@ def module_constant_edit(
     original_assignments = assignments(original_tree)
     changed_assignments = assignments(changed_tree)
     candidates = []
-    for start, end, name, value_dump, state, readers in entries:
+    for entry in entries:
+        if not isinstance(entry, list) or len(entry) != 6:
+            continue
+        start, end, name, value_dump, state, readers = entry
+        if (
+            type(start) is not int
+            or type(end) is not int
+            or type(name) is not str
+            or type(value_dump) is not str
+        ):
+            continue
         if state != "safe" or not any(start <= line <= end for line in change["lines"]):
             continue
         statement = original_assignments.get(name)
@@ -2032,10 +2043,12 @@ def main() -> None:
     ):
         attribute_model = {"d": {}}
     if (
-        constant_model.get("v") != 1
+        not isinstance(constant_model, dict)
+        or constant_model.get("v") != 1
         or constant_model.get("sha") != model.get("sha")
         or constant_model.get("n") != len(tests)
         or constant_model.get("t") != test_digest
+        or not isinstance(constant_model.get("d"), dict)
     ):
         constant_model = {"d": {}}
     if (
