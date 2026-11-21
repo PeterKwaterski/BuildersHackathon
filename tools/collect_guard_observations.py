@@ -249,6 +249,24 @@ def sensitive_test_files(source: Path, tracked: list[TrackedEntry]) -> list[str]
     return sorted(result)
 
 
+def sensitive_test_owners(test_ids: list[str], sensitive_files: list[str]) -> list[str]:
+    """Resolve allocation/lifetime-sensitive owners before pytest executes.
+
+    File sensitivity comes from the pinned source census above.  The name
+    fallback is intentionally resolved from the immutable test inventory here,
+    rather than toggling collector state while the test is running.
+    """
+
+    files = set(sensitive_files)
+    words = ("memory", "tracemalloc", "leak")
+    return sorted(
+        test_id
+        for test_id in test_ids
+        if test_id.split("::", 1)[0] in files
+        or any(word in test_id.lower() for word in words)
+    )
+
+
 def canonical_digest(value: object) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
@@ -274,6 +292,7 @@ from _br_guard_common import none_comparison_safe, truth_state
 
 CURRENT_TEST = os.environ.get("BR_PARENT_TEST")
 INITIAL_OWNER = CURRENT_TEST
+SENSITIVE_OWNERS = frozenset(json.loads(os.environ["GUARD_SENSITIVE_OWNERS"]))
 EVENTS = defaultdict(lambda: defaultdict(set))
 ESCAPED = set()
 ROOT_PID = int(os.environ.setdefault("GUARD_ROOT_PID", str(os.getpid())))
@@ -378,12 +397,19 @@ def record(label, category):
     EVENTS[label][category].add(owner())
 
 def observe_truth(label, value):
+    # This branch must stay first and allocation-free.  Sensitive owners are
+    # quarantined from source and test-inventory evidence before execution, so
+    # neither a tracemalloc query nor a retained event is needed here.
+    if CURRENT_TEST in SENSITIVE_OWNERS:
+        return value
     record(label, "seen")
     state = None if tracemalloc.is_tracing() else truth_state(value)
     record(label, state or "unknown")
     return value
 
 def observe_none(label, value):
+    if CURRENT_TEST in SENSITIVE_OWNERS:
+        return value
     record(label, "seen")
     if tracemalloc.is_tracing() or not none_comparison_safe(value):
         record(label, "unsafe-eq")
@@ -394,7 +420,8 @@ def owned_trace_start(*args, **kwargs):
     # A memory-observation test can distinguish allocations introduced by the
     # collector itself.  Quarantine the complete owner, even if tracing starts
     # before a particular guard is reached.
-    ESCAPED.add(owner())
+    if CURRENT_TEST not in SENSITIVE_OWNERS:
+        ESCAPED.add(owner())
     return _ORIGINAL_TRACE_START(*args, **kwargs)
 
 def audit(event, args):
@@ -457,7 +484,6 @@ import pytest
 import _br_guard_profile
 
 EXECUTED = set()
-SENSITIVE_FILES = set(json.loads(os.environ["GUARD_SENSITIVE_FILES"]))
 
 def sentries(directory, stage):
     result = {}
@@ -486,12 +512,6 @@ def pytest_runtest_protocol(item, nextitem):
     os.environ["BR_PARENT_TEST"] = item.nodeid
     if not _br_guard_profile.integrity():
         raise RuntimeError("guard-profile runtime hooks displaced before test")
-    test_file = item.nodeid.split("::", 1)[0]
-    if (
-        test_file in SENSITIVE_FILES
-        or any(word in item.nodeid.lower() for word in ("memory", "tracemalloc", "leak"))
-    ):
-        _br_guard_profile.ESCAPED.add(item.nodeid)
     try:
         yield
     finally:
@@ -517,7 +537,11 @@ def pytest_sessionfinish(session, exitstatus):
         and submitted == task_started == task_completed
         and set(submitted.values()) <= known
     )
-    escaped = set(_br_guard_profile.ESCAPED)
+    # The complete pre-execution quarantine is retained in every mode even if
+    # a sensitive hook was never reached.  It is kept separate from ESCAPED so
+    # fork-worker relabeling cannot remove or leak a sensitive owner.
+    escaped = set(_br_guard_profile.SENSITIVE_OWNERS)
+    escaped.update(_br_guard_profile.ESCAPED)
     escaped.update(external.values())
     for path in sorted(directory.glob("*.json")):
         payload = json.loads(path.read_text())
@@ -539,6 +563,7 @@ def pytest_sessionfinish(session, exitstatus):
         "executed_materialized_sha256": os.environ["GUARD_EXECUTED_MATERIALIZED_SHA256"],
         "materialized_sha256": os.environ["GUARD_MATERIALIZED_SHA256"],
         "sensitive_files_sha256": os.environ["GUARD_SENSITIVE_FILES_SHA256"],
+        "sensitive_owners_sha256": os.environ["GUARD_SENSITIVE_OWNERS_SHA256"],
         "source_sha": os.environ["GUARD_SOURCE_SHA"],
         "source_tree": os.environ["GUARD_SOURCE_TREE"],
         "support_sha256": os.environ["GUARD_SUPPORT_SHA256"],
@@ -774,6 +799,13 @@ def main() -> None:
     sensitive_files_sha256 = canonical_digest(sensitive_files)
     tests = json.loads(args.tests.read_text())["tests"]
     test_ids = [test["id"] for test in tests]
+    if (
+        any(type(test_id) is not str for test_id in test_ids)
+        or len(test_ids) != len(set(test_ids))
+    ):
+        raise SystemExit("test manifest IDs must be unique strings")
+    sensitive_owners = sensitive_test_owners(test_ids, sensitive_files)
+    sensitive_owners_sha256 = canonical_digest(sensitive_owners)
     test_digest = hashlib.sha256("\0".join(test_ids).encode()).hexdigest()
     mode = "synchronous-worker" if args.synchronous_workers else "normal"
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -850,6 +882,8 @@ def main() -> None:
             "GUARD_RUNTIME_IMAGE": args.runtime_image,
             "GUARD_SENSITIVE_FILES": json.dumps(sensitive_files, separators=(",", ":")),
             "GUARD_SENSITIVE_FILES_SHA256": sensitive_files_sha256,
+            "GUARD_SENSITIVE_OWNERS": json.dumps(sensitive_owners, separators=(",", ":")),
+            "GUARD_SENSITIVE_OWNERS_SHA256": sensitive_owners_sha256,
             "GUARD_SOURCE_SHA": revision,
             "GUARD_SOURCE_TREE": source_tree,
             "GUARD_SUPPORT_SHA256": support_digest,

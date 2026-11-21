@@ -1,11 +1,24 @@
 # Guard-profile Git-link provenance re-audit
 
-Verdict: **COLLECT-READY / NO-SHIP**
+Verdict: **INVALIDATED BY FULL-NORMAL MEMORY FAILURE / NO-SHIP**
 
 Scope: only the uncommitted provenance/materialization delta after Peter-only
 source checkpoint `56baea8463ccc0c7ec8d12bcfac0a50e8b24e402`. No Docker,
 full pytest, profile collection, model build, scorer, or sample answers were
 used.
+
+This provenance-only verdict was later invalidated by the first complete
+normal trace at clean checkpoint
+`42f37b0ecc0886215412cb6aa677388b594d39c5`. Its manifest SHA-256
+`39e9ba1732848cf52058e3d3530075e609be2b3ecde9d2d63defd05c8ac05f52`
+records exit status 1: the sole failure was the generator memory test retaining
+2,408 bytes under tracemalloc against a 1,024-byte limit. The paired trace
+SHA-256 is
+`5641cbc75af11f34fbeb996575ccb27bd77de9560be5e8185b93ec0df5cc97b0`.
+Both artifacts are rejected; no claim below admits them or authorizes a full
+rerun before the separate memory re-audit. The current repair, limited exact
+evidence, and independent **RE-AUDIT-READY** verdict are recorded in
+`GUARD_PROFILE_MEMORY_REAUDIT.md`.
 
 ## Independent findings
 

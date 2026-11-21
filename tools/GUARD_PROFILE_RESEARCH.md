@@ -1,6 +1,6 @@
 # Per-test guard profiles
 
-Status: **SOURCE/COLLECT-READY; NO-SHIP**
+Status: **MEMORY RE-AUDIT-READY; NO-COLLECT / NO-SHIP**
 
 The first audit's collect-ready verdict was invalidated when source-light
 preflight found the pinned tree's uninitialized `sqlglot-integration-tests`
@@ -9,6 +9,12 @@ index modes/object IDs, permits only an empty mode-`160000` directory, and
 binds that inventory through collector and builder provenance. Focused tests
 pass. The independent follow-up in `GUARD_PROFILE_GITLINK_REAUDIT.md` found and
 fixed a synchronous-tree validation blocker and restored collect-ready status.
+That verdict was subsequently invalidated by the first full normal trace: the
+guard hooks caused `TestGenerator.test_generator_memory` to retain 2,408 bytes
+under tracemalloc against a 1,024-byte limit. The failed exit-1 evidence is
+rejected. `GUARD_PROFILE_MEMORY_REAUDIT.md` documents the source-derived inert
+quarantine repair, independent LIGHT re-audit, and limited exact-image exit-0
+validation. A fresh full normal and synchronous pair is still required.
 
 This branch independently derives a conservative per-test observation model for
 simple guard-form changes.  It does not contain a profile artifact, public
@@ -64,10 +70,14 @@ inherited worker-start observations are relabeled unowned. Child documents are
 flushed at every task boundary because multiprocessing commonly bypasses
 Python `atexit`, and every pool submitter is conservatively quarantined because
 result serialization occurs after the owned wrapper returns. External
-processes, incomplete logs, unknown owners, tracemalloc use, and memory/leak
-tests are quarantined. Runtime hook/import-hook identity is checked at every
-test boundary. Normal and synchronous-worker runs must agree on shared
-provenance and must both be admitted.
+processes, incomplete logs, and unknown owners are quarantined. Allocation and
+lifetime-sensitive owners are derived from pinned source plus the exact test
+inventory before execution; their hooks return the identical operand before
+any tracemalloc query or event mutation. Their complete owner-set digest is
+provenance-bound, and the builder requires every owner to remain quarantined in
+both modes. Runtime hook/import-hook identity is checked at every test boundary.
+Normal and synchronous-worker runs must agree on shared provenance and must
+both be admitted.
 
 Truth classification intentionally excludes mutable builtins and exact
 `float`/`complex` values. A mutable container could change between the
@@ -114,37 +124,39 @@ while reducing simulated time from 366.631 to 142.194 seconds.  That is public
 self-reported aggregate evidence, not isolated validation of this implementation
 and not an artifact copied into it.
 
-## Light verification performed
+## Light and targeted verification performed
 
 - Python compilation of selector, collector, builder, shared inventory, tests,
   and all five generated support modules
-- 29 focused unit/adversarial tests covering state matrices, both singleton
+- 31 focused unit/adversarial tests covering state matrices, both singleton
   directions, operand side/syntax, whole-tree and directive rejection,
   malformed/unknown/unseen masks, exact-line subtraction, value identity and
   one-time evaluation, hostile/reflected protocols, custom metaclasses,
   mutable/native truth hazards, builtin monkeypatching, module/class contexts,
   tracked materialization, Git-link mode/OID binding and fail-closed states,
   path collisions, generated-support tampering, and process-pool pre-`atexit`
-  flushing/quarantine
+  flushing/quarantine, allocation-inert sensitive hooks, static quarantine
+  completeness in both modes, and sensitive-to-ordinary fork/task transitions
 - deterministic source census above
 - `git diff --check`
+- one limited locked-image normal run over the original generator-memory owner
+  plus the optimizer pool sanity target: **2 passed, 322 subtests passed**, hard
+  exit 0, 14/14 child logs, and 147 complete pool tasks
 
-No Docker run, full pytest run, profile collection, or scorer run was performed
-while the shared machine was saturated, as required.
+No replacement full trace, profile build, selector enablement, replay, or scorer
+run has been performed. The prior full-normal exit-1 evidence remains rejected.
 
 ## Admission sequence and blockers
 
 Do not enable this feature until all of the following are complete:
 
-1. Commit the independently re-audited Git-link/executed-tree repair so future
-   evidence binds one immutable source checkpoint.
-2. Fresh normal and synchronous-worker collection in the exact locked Python
+1. Fresh normal and synchronous-worker collection in the exact locked Python
    3.13/runtime image, with the complete pinned 1,620-test manifest.
-3. Two deterministic builds from the admitted inputs that are byte-identical.
-4. Pin the resulting raw artifact SHA-256 in `selector.py` and include the
+2. Two deterministic builds from the admitted inputs that are byte-identical.
+3. Pin the resulting raw artifact SHA-256 in `selector.py` and include the
    artifact in the repository.
-5. Run the full Docker suite and adversarial/replay validation, checking every
+4. Run the full Docker suite and adversarial/replay validation, checking every
    failing patch/test pair is retained and measuring the actual score impact.
 
 Until then `GUARD_PROFILE_SHA256 = ""` deliberately keeps the runtime path
-disabled. The current verdict is therefore **COLLECT-READY / NO-SHIP**.
+disabled. The current verdict is therefore **RE-AUDIT-READY / NO-COLLECT**.

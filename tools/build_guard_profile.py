@@ -21,6 +21,7 @@ from collect_guard_observations import (
     git_tracked_paths,
     materialized_digest,
     sensitive_test_files,
+    sensitive_test_owners,
     synchronous_worker_tests,
     tracked_inventory_digest,
 )
@@ -70,7 +71,7 @@ def load_pairs(manifests: list[Path], traces: list[Path]) -> dict[str, tuple[dic
             for key in (
                 "collector_sha256", "common_sha256", "environment_sha256",
                 "executed_materialized_sha256", "instrumented", "materialized_sha256", "mode", "python",
-                "runtime_image", "sensitive_files_sha256", "source_sha",
+                "runtime_image", "sensitive_files_sha256", "sensitive_owners_sha256", "source_sha",
                 "source_tree", "test_digest", "support_sha256", "tracked_inventory_sha256",
                 "worker_transform_sha256",
             )
@@ -80,6 +81,16 @@ def load_pairs(manifests: list[Path], traces: list[Path]) -> dict[str, tuple[dic
     if set(pairs) != {"normal", "synchronous-worker"}:
         raise SystemExit("both normal and synchronous-worker traces are required")
     return pairs
+
+
+def require_sensitive_quarantine(
+    pairs: dict[str, tuple[dict, dict]], sensitive_owners: set[str]
+) -> None:
+    """Require every collection mode to retain the precomputed quarantine."""
+
+    for mode, (_manifest, trace) in pairs.items():
+        if not sensitive_owners <= set(trace.get("escaped", ())):
+            raise SystemExit(f"{mode} trace dropped source-derived sensitive owners")
 
 
 def main() -> None:
@@ -113,7 +124,10 @@ def main() -> None:
     tracked = git_tracked_paths(source)
     expected_tracked_inventory = tracked_inventory_digest(tracked)
     expected_materialized = materialized_digest(source, tracked)
-    expected_sensitive = canonical_digest(sensitive_test_files(source, tracked))
+    sensitive_files = sensitive_test_files(source, tracked)
+    expected_sensitive = canonical_digest(sensitive_files)
+    sensitive_owners = set(sensitive_test_owners(test_ids, sensitive_files))
+    expected_sensitive_owners = canonical_digest(sorted(sensitive_owners))
     with tempfile.TemporaryDirectory(prefix="blast-radius-guard-build-") as temporary:
         synchronous_work = Path(temporary) / "sqlglot"
         copy_tracked_tree(source, synchronous_work, tracked)
@@ -156,7 +170,8 @@ def main() -> None:
         for key in (
             "collector_sha256", "common_sha256", "environment_sha256", "instrumented",
             "materialized_sha256", "python", "runtime_image",
-            "sensitive_files_sha256", "support_sha256", "tracked_inventory_sha256",
+            "sensitive_files_sha256", "sensitive_owners_sha256", "support_sha256",
+            "tracked_inventory_sha256",
             "worker_transform_sha256",
         ):
             metadata_values[key].add(manifest.get(key))
@@ -170,6 +185,7 @@ def main() -> None:
             type(owner) is not str for owner in trace["escaped"]
         ):
             raise SystemExit(f"invalid {mode} escaped owners")
+    require_sensitive_quarantine(pairs, sensitive_owners)
     if any(len(values) != 1 for values in metadata_values.values()):
         raise SystemExit("trace modes do not share one collector/runtime provenance")
 
@@ -183,6 +199,7 @@ def main() -> None:
         or metadata_values["support_sha256"] != {generated_support_digest()}
         or metadata_values["materialized_sha256"] != {expected_materialized}
         or metadata_values["sensitive_files_sha256"] != {expected_sensitive}
+        or metadata_values["sensitive_owners_sha256"] != {expected_sensitive_owners}
         or metadata_values["tracked_inventory_sha256"] != {expected_tracked_inventory}
         or metadata_values["worker_transform_sha256"] != {expected_worker_transform}
         or metadata_values["instrumented"] != {len(inventory)}

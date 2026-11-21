@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 
 import selector
+import build_guard_profile as guard_builder
 from collect_guard_observations import (
     INSTRUMENT_SUPPORT,
     Instrumenter,
@@ -30,6 +31,7 @@ from collect_guard_observations import (
     git_tracked_paths,
     materialized_digest,
     sensitive_test_files,
+    sensitive_test_owners,
     synchronous_worker_tests,
     tracked_inventory_digest,
 )
@@ -370,6 +372,105 @@ class GuardProfileTests(unittest.TestCase):
         changed["guard_profile_plugin.py"] += "\n# tampered\n"
         self.assertNotEqual(expected, generated_support_digest(changed))
 
+    def test_sensitive_owner_fast_path_is_inert_and_owner_changes_do_not_leak(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            support = root / "support"
+            children = root / "children"
+            support.mkdir()
+            children.mkdir()
+            for stage in ("submitted", "started", "completed", "escaped"):
+                (children / "pool" / stage).mkdir(parents=True)
+            sources = generated_support_sources()
+            for name in ("_br_guard_common.py", "_br_guard_profile.py"):
+                (support / name).write_text(sources[name])
+            script = r'''
+import gc
+import _br_guard_profile as tracker
+
+sensitive = "tests/test_memory.py::test_retained_memory"
+ordinary = "tests/test_safe.py::test_records"
+truth = "truth:sqlglot/x.py:1:0:1:1"
+none = "none:sqlglot/x.py:2:0:2:15"
+sentinel = object()
+
+tracker.CURRENT_TEST = sensitive
+events_before = tracker.document()
+escaped_before = set(tracker.ESCAPED)
+tracker.tracemalloc.start()
+before = tracker.tracemalloc.get_traced_memory()[0]
+for _ in range(1000):
+    assert tracker.observe_truth(truth, sentinel) is sentinel
+    assert tracker.observe_none(none, sentinel) is sentinel
+gc.collect()
+after = tracker.tracemalloc.get_traced_memory()[0]
+tracker.tracemalloc.stop()
+assert after - before < 1024, (before, after, after - before)
+assert tracker.document() == events_before
+assert tracker.ESCAPED == escaped_before
+
+tracker.CURRENT_TEST = ordinary
+assert tracker.observe_truth(truth, 1) == 1
+assert tracker.observe_none(none, None) is None
+assert tracker.document()[truth]["seen"] == [ordinary]
+assert tracker.document()[none]["seen"] == [ordinary]
+
+# Exercise real pool-task owner changes.  Quarantine is membership-based, not
+# a mutable disabled flag, so a sensitive task cannot suppress the next one.
+tracker.run_owned_task(
+    sensitive, "a" * 64, tracker.observe_truth, (truth, sentinel), {},
+)
+tracker.run_owned_task(
+    ordinary, "b" * 64, tracker.observe_truth, (truth, 1), {},
+)
+assert tracker.CURRENT_TEST is None
+
+# Exercise the actual at-fork reset shape: a child inherits a sensitive owner
+# before its first persistent-pool task, then transitions to an ordinary task.
+# The inherited interval must stay inert and must not suppress later evidence.
+tracker.CURRENT_TEST = sensitive
+tracker.register_child()
+assert tracker.INITIAL_OWNER == sensitive
+assert tracker.observe_truth(truth, sentinel) is sentinel
+tracker.run_owned_task(
+    ordinary, "c" * 64, tracker.observe_truth, (truth, 1), {},
+)
+assert tracker.CURRENT_TEST is None
+for categories in tracker.document().values():
+    for owners in categories.values():
+        assert sensitive not in owners
+assert ordinary in tracker.document()[truth]["seen"]
+'''
+            environment = os.environ.copy()
+            environment.update({
+                "BR_PARENT_TEST": "",
+                "GUARD_CHILD_DIR": str(children),
+                "GUARD_ROOT_PID": "1",
+                "GUARD_SENSITIVE_OWNERS": json.dumps(
+                    ["tests/test_memory.py::test_retained_memory"]
+                ),
+                "PYTHONPATH": str(support),
+            })
+            result = subprocess.run(
+                [sys.executable, "-c", script],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_both_trace_modes_must_retain_every_sensitive_owner(self):
+        owners = {"tests/test_memory.py::test_memory", "tests/test_gc.py::test_gc"}
+        pairs = {
+            "normal": ({}, {"escaped": sorted(owners)}),
+            "synchronous-worker": ({}, {"escaped": sorted(owners)}),
+        }
+        guard_builder.require_sensitive_quarantine(pairs, owners)
+        pairs["synchronous-worker"][1]["escaped"].pop()
+        with self.assertRaisesRegex(SystemExit, "synchronous-worker trace dropped"):
+            guard_builder.require_sensitive_quarantine(pairs, owners)
+
     def test_pool_task_flushes_before_atexit_and_submitter_is_quarantined(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -408,6 +509,7 @@ assert captured
                 "BR_PARENT_TEST": "",
                 "GUARD_CHILD_DIR": str(children),
                 "GUARD_ROOT_PID": "1",
+                "GUARD_SENSITIVE_OWNERS": "[]",
                 "PYTHONPATH": str(support),
             })
             result = subprocess.run(
@@ -441,6 +543,20 @@ assert captured
             self.assertEqual(copy_tracked_tree(source, work, paths), expected)
             self.assertFalse((work / "sqlglot/untracked.py").exists())
             self.assertEqual(sensitive_test_files(source, paths), ["tests/test_memory.py"])
+            self.assertEqual(
+                sensitive_test_owners(
+                    [
+                        "tests/test_safe.py::test_safe",
+                        "tests/test_safe.py::test_memory_budget",
+                        "tests/test_memory.py::test_other",
+                    ],
+                    ["tests/test_memory.py"],
+                ),
+                [
+                    "tests/test_memory.py::test_other",
+                    "tests/test_safe.py::test_memory_budget",
+                ],
+            )
 
     def test_tracked_materialization_binds_gitlink_mode_oid_and_empty_state(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -1,6 +1,6 @@
 # Guard-profile adversarial audit
 
-Verdict: **COLLECT-READY / NO-SHIP**
+Verdict: **INVALIDATED BY FULL-NORMAL MEMORY FAILURE / NO-SHIP**
 
 Scope: uncommitted `research/per-test-guard-profiles` source, based on selector
 commit `862545f`, including the selector gate, shared classifier/inventory,
@@ -8,6 +8,32 @@ normal and synchronous collectors, builder admission, and focused tests. This
 audit did not run Docker, the full pytest suite, either full collection, the
 official collector, or the scorer. The verdict from that audit was invalidated
 by the concrete pinned-source materialization defect and repair below.
+
+## Full-normal collection invalidation
+
+The first complete normal-mode run in the locked Python 3.13 image invalidated
+the later restored **COLLECT-READY** verdict. The suite reached all 1,620
+manifest owners, child and persistent-pool accounting were complete, and the
+only failure was
+`tests/test_generator.py::TestGenerator::test_generator_memory` for base
+`Dialects.DIALECT`: retained tracemalloc growth was 2,408 bytes, above the
+strict 1,024-byte bound. Pytest therefore exited 1. Hard exit-zero admission
+rejected the evidence, and the synchronous full trace was not launched.
+
+The rejected evidence is preserved outside this worktree:
+
+- manifest SHA-256:
+  `39e9ba1732848cf52058e3d3530075e609be2b3ecde9d2d63defd05c8ac05f52`
+- trace SHA-256:
+  `5641cbc75af11f34fbeb996575ccb27bd77de9560be5e8185b93ec0df5cc97b0`
+- collector SHA-256 recorded by that failed manifest:
+  `593791ebc7ffa1820f295ffe281dd6654da7f94e80e4f51c7b94cade9b3ef3f3`
+
+Those files are diagnostic only and must never be built, whitelisted, or
+treated as partial profile evidence. The source-derived quarantine repair and
+its limited exact-image validation are documented separately in
+`GUARD_PROFILE_MEMORY_REAUDIT.md`; neither authorizes a full trace before a
+separate re-audit decision.
 
 ## Post-audit blocker and repair
 
