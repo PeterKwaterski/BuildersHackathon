@@ -219,6 +219,11 @@ def validate_profile(profile: object) -> dict[str, Any]:
             "state_independent",
             "competition_risk",
             "call_graph_sha256",
+            "path",
+            "qualname",
+            "first_line",
+            "end_line",
+            "risk_cpu_s",
         }:
             raise RuleReplayError("owner certificate shape mismatch")
         if (
@@ -229,6 +234,21 @@ def validate_profile(profile: object) -> dict[str, Any]:
             or not all(isinstance(x, str) and x for x in owner["barriers"])
             or type(owner["state_independent"]) is not bool
             or type(owner["competition_risk"]) is not bool
+            or not isinstance(owner["path"], str)
+            or not owner["path"].startswith("sqlglot/optimizer/")
+            or not owner["path"].endswith(".py")
+            or not isinstance(owner["qualname"], str)
+            or not owner["qualname"]
+            or type(owner["first_line"]) is not int
+            or type(owner["end_line"]) is not int
+            or owner["first_line"] <= 0
+            or owner["end_line"] < owner["first_line"]
+            or not isinstance(owner["risk_cpu_s"], dict)
+            or set(owner["risk_cpu_s"]) != set(TARGET_COUNTS)
+            or any(
+                type(seconds) not in (int, float) or seconds < 0
+                for seconds in owner["risk_cpu_s"].values()
+            )
         ):
             raise RuleReplayError("owner certificate invalid")
 

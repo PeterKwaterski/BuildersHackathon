@@ -47,6 +47,9 @@ class RuleReplayTests(unittest.TestCase):
                 "rule": replay.RULES[3], "source_sha256": "c" * 64,
                 "barriers": ["persistent_worker_state"], "state_independent": False,
                 "competition_risk": True, "call_graph_sha256": "d" * 64,
+                "path": "sqlglot/optimizer/unnest_subqueries.py",
+                "qualname": "decorrelate", "first_line": 1, "end_line": 2,
+                "risk_cpu_s": {target: 1.0 for target in replay.TARGET_COUNTS},
             }},
             "spawn_obligations": {name: False for name in (
                 "parse", "pickle_roundtrip", "fresh_import", "initializer",
