@@ -35,6 +35,7 @@ COPY none_static_runtime.py /app/none_static_runtime.py
 COPY tpc_rule_replay.py /app/tpc_rule_replay.py
 COPY tpc_rule_fast.py /app/tpc_rule_fast.py
 COPY tpc_rule_fast_runtime.py /app/tpc_rule_fast_runtime.py
+COPY tpc_rule_fast_profile.json.gz /app/tpc_rule_fast_profile.json.gz
 COPY selector_model.json.gz /app/selector_model.json.gz
 COPY semantic_sources.json.gz /app/semantic_sources.json.gz
 COPY zero_reader_model.json.gz /app/zero_reader_model.json.gz
