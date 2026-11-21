@@ -23,4 +23,5 @@ COPY code_reflection_model.json.gz /app/code_reflection_model.json.gz
 COPY fresh_alias_profile.json.gz /app/fresh_alias_profile.json.gz
 COPY generator_dispatch_model.json.gz /app/generator_dispatch_model.json.gz
 COPY new_module_model.json.gz /app/new_module_model.json.gz
+COPY function_default_model.json.gz /app/function_default_model.json.gz
 CMD ["python", "/app/selector.py"]

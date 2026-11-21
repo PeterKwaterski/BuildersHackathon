@@ -23,6 +23,7 @@ from runtime_verify import verify_candidates
 DATA = Path("/data")
 MODEL = Path(__file__).with_name("selector_model.json.gz")
 SEMANTIC_SOURCES = Path(__file__).with_name("semantic_sources.json.gz")
+SEMANTIC_SOURCES_SHA256 = "f453c6266c20edcc9ba7127ebedde0bdf45d44633279352c2daafe1fa123da5f"
 ZERO_READER_MODEL = Path(__file__).with_name("zero_reader_model.json.gz")
 PREDICATE_PROFILE = Path(__file__).with_name("predicate_profile.json.gz")
 ARG_TYPE_DERIVATION_MODEL = Path(__file__).with_name(
@@ -36,6 +37,10 @@ CODE_REFLECTION_PROFILE_SHA256 = "f62a0b161fa6d372766d8e290ee6450b368c4deee9bfcf
 FRESH_ALIAS_PROFILE = Path(__file__).with_name("fresh_alias_profile.json.gz")
 GENERATOR_DISPATCH_MODEL = Path(__file__).with_name("generator_dispatch_model.json.gz")
 NEW_MODULE_MODEL = Path(__file__).with_name("new_module_model.json.gz")
+FUNCTION_DEFAULT_MODEL = Path(__file__).with_name("function_default_model.json.gz")
+# Filled only after all exact Python 3.13 traces build the final artifact.
+# An empty pin intentionally disables the profile.
+FUNCTION_DEFAULT_PROFILE_SHA256 = "fa12e481e8628e3234ae60a506892af6ba0d02309a63a76d4f738aed85430a18"
 GENERATOR_DISPATCH_INVENTORY_SHA256 = "3e3cb5a12da0fb01cd68f9b2fc789bc8d020523e015fea7016e04679c34d1dca"
 GENERATOR_DISPATCH_PROFILE_SHA256 = "8829e844dbd6870f2bca81cc7fb4f89f16ccdef7ecbba278748cdd850aeb1bfd"
 NEW_MODULE_PROFILE_SHA256 = "1b24ab53483bb1932d8139b80fa17e797a1974ee3078157a110c0f25b28f4e10"
@@ -189,8 +194,32 @@ def patch_changes(patch: Path) -> list[dict]:
 def pinned_sources() -> dict[str, str]:
     global _PINNED_SOURCES
     if _PINNED_SOURCES is None:
-        with gzip.open(SEMANTIC_SOURCES, "rt", encoding="utf-8") as source_file:
-            _PINNED_SOURCES = json.load(source_file)
+        try:
+            raw = SEMANTIC_SOURCES.read_bytes()
+            if hashlib.sha256(raw).hexdigest() != SEMANTIC_SOURCES_SHA256:
+                _PINNED_SOURCES = {}
+            else:
+                document = json.loads(gzip.decompress(raw).decode("utf-8"))
+                _PINNED_SOURCES = (
+                    document
+                    if isinstance(document, dict)
+                    and all(
+                        type(path) is str and type(source) is str
+                        for path, source in document.items()
+                    )
+                    else {}
+                )
+        except (
+            OSError,
+            EOFError,
+            UnicodeError,
+            json.JSONDecodeError,
+            ValueError,
+            TypeError,
+            RecursionError,
+            MemoryError,
+        ):
+            _PINNED_SOURCES = {}
     return _PINNED_SOURCES
 
 
@@ -204,6 +233,36 @@ def source_tree(path: str) -> ast.Module | None:
         except (SyntaxError, ValueError):
             _SOURCE_TREES[path] = None
     return _SOURCE_TREES[path]
+
+
+def valid_function_default_model(model: object) -> bool:
+    """Validate the exact offline-proved default payload by its canonical pin."""
+    if (
+        not isinstance(model, dict)
+        or set(model) != {"d", "n", "p", "sha", "t", "v"}
+        or not isinstance(model.get("d"), dict)
+        or type(model.get("n")) is not int
+        or model["n"] < 0
+        or type(model.get("p")) is not str
+        or len(model["p"]) != 64
+        or type(model.get("sha")) is not str
+        or type(model.get("t")) is not str
+        or model.get("v") != 1
+    ):
+        return False
+    try:
+        profile_digest = hashlib.sha256(
+            json.dumps(
+                model["d"], sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest()
+    except (TypeError, ValueError, OverflowError, MemoryError, RecursionError):
+        return False
+    return (
+        bool(FUNCTION_DEFAULT_PROFILE_SHA256)
+        and model["p"] == FUNCTION_DEFAULT_PROFILE_SHA256
+        and profile_digest == FUNCTION_DEFAULT_PROFILE_SHA256
+    )
 
 
 class _AstIndex:
@@ -2175,6 +2234,150 @@ def class_attribute_edit(
     return set(readers)
 
 
+def function_default_edit(
+    change: dict,
+    path: str,
+    default_model: dict,
+    hook_attributes: set[str] | None = None,
+) -> set[int] | None:
+    """Narrow a literal function-default edit to calls omitting that default."""
+    entries = default_model.get("d", {}).get(path)
+    changed_lines = change.get("lines", ())
+    if not entries or not any(
+        isinstance(entry, list)
+        and len(entry) == 8
+        and type(entry[0]) is int
+        and type(entry[1]) is int
+        and entry[6] == "safe"
+        and any(entry[0] <= line <= entry[1] for line in changed_lines)
+        for entry in entries
+    ):
+        return None
+    source = pinned_sources().get(path)
+    changed = patched_source(change, path)
+    if (
+        source is None
+        or changed is None
+        or path in PROCESS_SERIALIZATION_FILES
+        or any(COMMENT_DIRECTIVE.search(line) for line in change["payload"])
+    ):
+        return None
+    try:
+        original_tree = ast.parse(source, filename=path, type_comments=True)
+        changed_tree = ast.parse(changed, filename=path, type_comments=True)
+    except (SyntaxError, ValueError):
+        return None
+
+    def defaults(tree: ast.Module):
+        result = {}
+
+        def visit(body: list[ast.stmt], prefix: tuple[str, ...]) -> None:
+            for statement in body:
+                if isinstance(statement, ast.ClassDef):
+                    visit(statement.body, (*prefix, statement.name))
+                    continue
+                if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                qualname = ".".join((*prefix, statement.name))
+                positional = [*statement.args.posonlyargs, *statement.args.args]
+                aligned = [None] * (
+                    len(positional) - len(statement.args.defaults)
+                ) + list(statement.args.defaults)
+                values = [
+                    (argument.arg, default)
+                    for argument, default in zip(positional, aligned)
+                    if default is not None
+                ]
+                values.extend(
+                    (argument.arg, default)
+                    for argument, default in zip(
+                        statement.args.kwonlyargs, statement.args.kw_defaults
+                    )
+                    if default is not None
+                )
+                for name, default in values:
+                    key = (qualname, name)
+                    result[key] = (
+                        (statement, default) if key not in result else None
+                    )
+                visit(statement.body, (*prefix, statement.name, "<locals>"))
+
+        visit(tree.body, ())
+        return result
+
+    original_defaults = defaults(original_tree)
+    changed_defaults = defaults(changed_tree)
+    candidates = []
+    for start, end, function_line, qualname, name, value_dump, state, readers in entries:
+        if state != "safe" or not any(start <= line <= end for line in changed_lines):
+            continue
+        found = original_defaults.get((qualname, name))
+        changed_found = changed_defaults.get((qualname, name))
+        if (
+            found is None
+            or changed_found is None
+            or found[0].lineno != function_line
+            or found[1].lineno != start
+            or (found[1].end_lineno or found[1].lineno) != end
+            or ast.dump(found[1], include_attributes=False) != value_dump
+            or ast.dump(found[1], include_attributes=False)
+            == ast.dump(changed_found[1], include_attributes=False)
+        ):
+            continue
+        candidates.append(((qualname, name), found, readers))
+    if len(candidates) != 1:
+        return None
+    key, (_, original_default), readers = candidates[0]
+    changed_found = changed_defaults.get(key)
+    if changed_found is None:
+        return None
+    changed_default = changed_found[1]
+    try:
+        old_literal = ast.literal_eval(original_default)
+        new_literal = ast.literal_eval(changed_default)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return None
+
+    def safe_literal(value) -> bool:
+        return type(value) in (type(None), bool, int, float, complex, str, bytes) or (
+            type(value) is tuple and all(safe_literal(item) for item in value)
+        )
+
+    if (
+        not safe_literal(old_literal)
+        or not safe_literal(new_literal)
+        or type(old_literal) is not type(new_literal)
+        or old_literal == new_literal
+        or not isinstance(readers, list)
+        or any(
+            type(index) is not int
+            or index < 0
+            or index >= default_model.get("n", 0)
+            for index in readers
+        )
+    ):
+        return None
+
+    class Replace(ast.NodeTransformer):
+        def __init__(self, target: ast.expr):
+            self.target = target
+
+        def generic_visit(self, node):
+            if node is self.target:
+                return ast.Constant(value="__blast_radius_default__")
+            return super().generic_visit(node)
+
+    Replace(original_default).visit(original_tree)
+    Replace(changed_default).visit(changed_tree)
+    if ast.dump(original_tree, include_attributes=False) != ast.dump(
+        changed_tree, include_attributes=False
+    ) or ast.dump(original_tree, include_attributes=True) != ast.dump(
+        changed_tree, include_attributes=True
+    ):
+        return None
+    return set(readers)
+
+
 def module_constant_edit(
     change: dict,
     path: str,
@@ -2799,10 +3002,15 @@ def selected_indices(
     fresh_alias_model: dict | None = None,
     generator_dispatch_model: dict | None = None,
     new_module_model: dict | None = None,
+    default_model: dict | None = None,
 ) -> set[int]:
     selected: set[int] = set()
     changes = patch_changes(patch)
     if not changes:
+        return set(all_indices)
+    # Every narrow proof depends on the exact pinned source snapshot. If its
+    # raw artifact fails validation, even syntax-check fallback is unavailable.
+    if not pinned_sources():
         return set(all_indices)
     new_module_readers = (
         isolated_new_module_indices(changes, new_module_model)
@@ -2915,6 +3123,14 @@ def selected_indices(
             constant_indices = module_constant_edit(change, path, constant_model)
             if constant_indices is not None:
                 selected.update(constant_indices)
+                continue
+
+        if default_model is not None and len(changes) == 1:
+            default_indices = function_default_edit(
+                change, path, default_model, model.get("h")
+            )
+            if default_indices is not None:
+                selected.update(default_indices)
                 continue
 
         entry = model["f"].get(path)
@@ -3061,6 +3277,20 @@ def main() -> None:
         MemoryError,
     ):
         new_module_model = None
+    try:
+        with gzip.open(FUNCTION_DEFAULT_MODEL, "rt", encoding="utf-8") as default_file:
+            default_model = json.load(default_file)
+    except (
+        OSError,
+        EOFError,
+        UnicodeError,
+        json.JSONDecodeError,
+        ValueError,
+        TypeError,
+        RecursionError,
+        MemoryError,
+    ):
+        default_model = {"d": {}}
     test_digest = hashlib.sha256(
         "\0".join(test["id"] for test in tests).encode("utf-8")
     ).hexdigest()
@@ -3121,6 +3351,15 @@ def main() -> None:
         new_module_model, model.get("sha"), test_digest, len(tests)
     ):
         new_module_model = None
+    if (
+        not isinstance(default_model, dict)
+        or default_model.get("v") != 1
+        or default_model.get("sha") != model.get("sha")
+        or default_model.get("n") != len(tests)
+        or default_model.get("t") != test_digest
+        or not valid_function_default_model(default_model)
+    ):
+        default_model = {"d": {}}
     mapped_tests = [tests_by_id.get(test_id) for test_id in model["t"]]
     all_indices = {index for index, test in enumerate(mapped_tests) if test is not None}
     test_file_indices: dict[str, set[int]] = {}
@@ -3146,6 +3385,7 @@ def main() -> None:
             fresh_alias_model,
             generator_dispatch_model,
             new_module_model,
+            default_model,
         )
         selected = [
             mapped_tests[index]
