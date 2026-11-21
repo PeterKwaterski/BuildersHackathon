@@ -7,6 +7,7 @@ import io
 import json
 import base64
 import keyword
+import os
 import re
 import sys
 import tokenize
@@ -25,6 +26,12 @@ from tokenizer_keyword_runtime import (
     TokenizerKeywordContext,
     load_context as load_tokenizer_keyword_context,
     tokenizer_keyword_patch,
+)
+from tokenizer_key_rename_runtime import (
+    MODEL_SHA256 as TOKENIZER_KEY_RENAME_MODEL_SHA256,
+    TokenizerKeyRenameContext,
+    load_key_rename_context,
+    tokenizer_key_rename_patch,
 )
 
 DATA = Path("/data")
@@ -46,6 +53,9 @@ TOKENIZER_SETTING_FLOW_MODEL = Path(__file__).with_name(
 )
 TOKENIZER_KEYWORD_MODEL = Path(__file__).with_name(
     "tokenizer_keyword_model.json.gz"
+)
+TOKENIZER_KEY_RENAME_MODEL = Path(__file__).with_name(
+    "tokenizer_key_rename_model.json.gz"
 )
 MODULE_CONSTANT_MODEL = Path(__file__).with_name("module_constant_model.json.gz")
 CODE_REFLECTION_MODEL = Path(__file__).with_name("code_reflection_model.json.gz")
@@ -110,6 +120,8 @@ SEMANTIC_NOOP_DEFINITION_REORDER = False
 # pinned test manifest and locked pure-Python runtime. Every source-visible
 # discovery site retains its complete reader set; malformed evidence fails shut.
 NEW_MODULE_PROOF_ENABLED = True
+# Independent kill switch for the authenticated key-rename profile.
+TOKENIZER_KEY_RENAME_ENABLED = os.environ.get("BR_TOKENIZER_KEY_RENAME", "1") != "0"
 
 
 def split(tests: list[dict], worker_count: int) -> tuple[list[list[int]], int]:
@@ -3908,6 +3920,7 @@ def selected_indices(
     tokenizer_setting_flow_model: dict | None = None,
     tokenizer_keyword_context: TokenizerKeywordContext | None = None,
     guard_model: dict | None = None,
+    tokenizer_key_rename_context: TokenizerKeyRenameContext | None = None,
 ) -> set[int]:
     selected: set[int] = set()
     changes = patch_changes(patch)
@@ -3990,6 +4003,13 @@ def selected_indices(
             continue
         if local_annotation:
             continue
+        if reflection_model is not None and tokenizer_key_rename_context is not None:
+            tokenizer_key_rename_indices = tokenizer_key_rename_patch(
+                changes, tokenizer_key_rename_context
+            )
+            if tokenizer_key_rename_indices is not None:
+                selected.update(tokenizer_key_rename_indices)
+                continue
         if tokenizer_keyword_context is not None:
             tokenizer_keyword_indices = tokenizer_keyword_patch(
                 changes, tokenizer_keyword_context
@@ -4235,6 +4255,19 @@ def main() -> None:
         )
     except (OSError, MemoryError):
         tokenizer_keyword_context = None
+    tokenizer_key_rename_context = None
+    if TOKENIZER_KEY_RENAME_ENABLED:
+        try:
+            tokenizer_key_rename_raw = TOKENIZER_KEY_RENAME_MODEL.read_bytes()
+            tokenizer_key_rename_sources_raw = SEMANTIC_SOURCES.read_bytes()
+            tokenizer_key_rename_context = load_key_rename_context(
+                tokenizer_key_rename_raw,
+                TOKENIZER_KEY_RENAME_MODEL_SHA256,
+                tokenizer_key_rename_sources_raw,
+                SEMANTIC_SOURCES_SHA256,
+            )
+        except (OSError, MemoryError):
+            tokenizer_key_rename_context = None
     with gzip.open(MODULE_CONSTANT_MODEL, "rt", encoding="utf-8") as constant_model_file:
         constant_model = json.load(constant_model_file)
     with gzip.open(CODE_REFLECTION_MODEL, "rt", encoding="utf-8") as reflection_model_file:
@@ -4393,6 +4426,7 @@ def main() -> None:
             tokenizer_setting_flow_model,
             tokenizer_keyword_context,
             guard_model,
+            tokenizer_key_rename_context,
         )
         selected = [
             mapped_tests[index]
