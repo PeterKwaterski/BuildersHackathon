@@ -93,6 +93,63 @@ class GuardProfileTests(unittest.TestCase):
         with patch.object(selector, "_PINNED_SOURCES", {self.path: source}):
             return selector.guard_profile_exemptions(change, self.path, profile, set())
 
+    def test_guard_change_prefilter_covers_every_supported_form(self):
+        forms = (
+            "value",
+            "not value",
+            "value is None",
+            "value is not None",
+            "value is False",
+            "value is not False",
+            "value is True",
+            "value is not True",
+        )
+        for before in forms:
+            for after in forms:
+                if before == after:
+                    continue
+                with self.subTest(before=before, after=after):
+                    self.assertTrue(
+                        selector.guard_change_maybe_supported(
+                            {"payload": [f"if {before}:", f"if {after}:"]}
+                        )
+                    )
+
+        none_swaps = (
+            ("value is None", "value == None"),
+            ("value is not None", "value != None"),
+            ("None is value", "None == value"),
+            ("None is not value", "None != value"),
+        )
+        for before, after in none_swaps:
+            for old, new in ((before, after), (after, before)):
+                with self.subTest(old=old, new=new):
+                    self.assertTrue(
+                        selector.guard_change_maybe_supported(
+                            {"payload": [f"if {old}:", f"if {new}:"]}
+                        )
+                    )
+
+        near_misses = (
+            {},
+            {"payload": None},
+            {"payload": [None]},
+            {"payload": ["return island", "return notable"]},
+            {"payload": ["return NoneValue", "return Falsey + Trueish"]},
+            {"payload": ["value = other", "value <> other"]},
+        )
+        for candidate in near_misses:
+            with self.subTest(candidate=candidate):
+                self.assertFalse(selector.guard_change_maybe_supported(candidate))
+
+    def test_guard_change_prefilter_avoids_source_reconstruction(self):
+        source = "def f(value):\n    if value:\n        return 1\n    return 0\n"
+        change = self.change(source, "return 1", "return 2")
+        with patch.object(selector, "patched_source", side_effect=AssertionError):
+            self.assertIsNone(
+                self.exemptions(source, change, self.truth_profile(source))
+            )
+
     def test_truth_to_not_none_is_per_test(self):
         source = "def f(value):\n    if value:\n        return 1\n    return 0\n"
         result = self.exemptions(

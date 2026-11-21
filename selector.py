@@ -82,6 +82,7 @@ WORKER_COST_MS = 2_000
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 COMPARISON_OPERATOR = re.compile(r"\bis\s+not\b|\bis\b|==|!=")
 COMMENT_DIRECTIVE = re.compile(r"(?i)(coding\s*[:=]|type:|noqa|pragma|fmt:|pyright|mypy)")
+GUARD_CHANGE_TOKEN = re.compile(r"\b(?:not|is|None|False|True)\b|==|!=")
 RUNTIME_COMMENT_DIRECTIVE = re.compile(
     r"(?i)(?:type\s*:\s*ignore\b|noqa\b|pragma\b|fmt\s*:|pyright\b|mypy\b)"
 )
@@ -2534,6 +2535,15 @@ def valid_guard_profile(profile: dict | None, revision: str, digest: str, count:
     )
 
 
+def guard_change_maybe_supported(change: dict) -> bool:
+    """Cheap necessary lexical condition for every supported guard rewrite."""
+
+    payload = change.get("payload")
+    return isinstance(payload, list) and any(
+        type(line) is str and GUARD_CHANGE_TOKEN.search(line) for line in payload
+    )
+
+
 def guard_profile_exemptions(
     change: dict,
     path: str,
@@ -2543,12 +2553,13 @@ def guard_profile_exemptions(
     """Return tests proven insensitive to one exact guard-form change."""
 
     entries = profile.get("d", {}).get(path)
+    if not entries or not guard_change_maybe_supported(change):
+        return None
     source = pinned_sources().get(path)
     changed = patched_source(change, path)
     count = profile.get("n")
     if (
-        not entries
-        or source is None
+        source is None
         or changed is None
         or type(count) is not int
         or count <= 0
