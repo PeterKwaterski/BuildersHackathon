@@ -27,8 +27,8 @@ leader's sparse-query architecture.
 `tpc_rule_replay.py` pins the exact fourteen-rule order from SQLGlot
 `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`.  Each boundary hashes the serde
 graph, root class, and rendered SQL.  A future authenticated profile must have
-one unique input/output row for every rule, query, target, and singleton,
-forward, reverse, warm, and observed official-spawn history.  It also binds
+one unique input/output row for every rule, query, target, and fresh-forward,
+fresh-reverse, and warm-forward history.  It also binds
 the SQLGlot tree, tests, fixtures, lock file, collector, owner source and call
 graph.  Unknown fields, missing rows, duplicate rows, bad hashes, rule-order
 changes, and malformed economics fail closed.

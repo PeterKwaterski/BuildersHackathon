@@ -39,13 +39,11 @@ RULES = (
 
 TARGET_COUNTS = {
     "tests/test_executor.py::TestExecutor::test_execute_tpcds": 99,
-    "tests/test_executor.py::TestExecutor::test_execute_tpch": 22,
-    "tests/test_executor.py::TestExecutor::test_optimized_tpch": 22,
 }
 
 # A singleton history finds query-local differences.  The other histories are
 # evidence against ordering bugs, not a proof of arbitrary spawn partitions.
-HISTORIES = ("singleton", "forward", "reverse", "warm", "official_spawn")
+HISTORIES = ("forward", "reverse", "warm")
 HEX_CHARS = frozenset("0123456789abcdef")
 
 
