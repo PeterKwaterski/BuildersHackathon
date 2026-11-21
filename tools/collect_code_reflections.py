@@ -121,6 +121,190 @@ REFLECTIVE_INSPECT = {
 }
 REFLECTIVE_DIS = {"Bytecode", "code_info", "dis", "get_instructions", "show_code"}
 
+EXTERNAL_REFLECTIVE_CALLS = {
+    "Bytecode",
+    "FrameSummary",
+    "StackSummary",
+    "TracebackException",
+    "__getattribute__",
+    "_current_frames",
+    "_current_exceptions",
+    "_getframe",
+    "attrgetter",
+    "code_info",
+    "currentframe",
+    "dis",
+    "exception",
+    "findsource",
+    "extract_stack",
+    "extract_tb",
+    "format_exc",
+    "format_exception",
+    "format_list",
+    "format_tb",
+    "get_referents",
+    "get_referrers",
+    "get_instructions",
+    "getclosurevars",
+    "getframeinfo",
+    "getmembers",
+    "getmembers_static",
+    "getargvalues",
+    "getasyncgenlocals",
+    "getcoroutinelocals",
+    "getgeneratorlocals",
+    "getinnerframes",
+    "getouterframes",
+    "getsource",
+    "getsourcelines",
+    "getattr_static",
+    "register_callback",
+    "setprofile",
+    "settrace",
+    "show_code",
+    "print_exc",
+    "print_exception",
+    "stack",
+    "trace",
+    "walk_stack",
+    "walk_tb",
+}
+
+EXTERNAL_FRAME_ATTRIBUTES = {
+    "ag_frame",
+    "cr_frame",
+    "f_back",
+    "f_code",
+    "f_globals",
+    "f_locals",
+    "gi_frame",
+    "monitoring",
+    "tb_frame",
+    "tb_lasti",
+    "tb_lineno",
+    "tb_next",
+}
+
+
+def _constant_string(node: ast.AST) -> str | None:
+    """Evaluate only syntax whose string result is independent of execution."""
+
+    if isinstance(node, ast.Constant) and type(node.value) is str:
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _constant_string(node.left)
+        right = _constant_string(node.right)
+        return left + right if left is not None and right is not None else None
+    if isinstance(node, ast.JoinedStr):
+        values = [_constant_string(value) for value in node.values]
+        return "".join(values) if all(value is not None for value in values) else None
+    return None
+
+
+def unsupported_external_reflection(tree: ast.Module, path: Path) -> None:
+    """Reject uninstrumented ways a pinned test can observe local names.
+
+    Direct ``f.__code__`` reads remain supported: :class:`Instrumenter` records
+    their exact test owner.  This audit covers the dynamic and frame APIs which
+    cannot be made visible by rewriting an ``Attribute(__code__)`` node.
+    """
+
+    parents = {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+    aliases = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name in EXTERNAL_REFLECTIVE_CALLS or alias.name == "getattr":
+                    aliases.add(alias.asname or alias.name)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import) and any(
+            alias.name.split(".", 1)[0] in {"_testcapi", "cffi", "ctypes"}
+            for alias in node.names
+        ):
+            raise SystemExit(f"native reflection import at {path}:{node.lineno}")
+        if isinstance(node, ast.ImportFrom) and (node.module or "").split(".", 1)[0] in {
+            "_testcapi",
+            "cffi",
+            "ctypes",
+        }:
+            raise SystemExit(f"native reflection import at {path}:{node.lineno}")
+        if isinstance(node, ast.Name) and node.id in {
+            "__builtins__",
+            "compile",
+            "eval",
+            "exec",
+            "globals",
+            "locals",
+            "vars",
+        }:
+            raise SystemExit(f"dynamic builtin reflection at {path}:{node.lineno}")
+        if isinstance(node, ast.Attribute) and node.attr == "__dict__":
+            # The pinned dialect-import test removes one named cache entry; it
+            # cannot retrieve a function code object or frame through this map.
+            if ast.dump(node.value, include_attributes=False) != ast.dump(
+                ast.Attribute(
+                    value=ast.Name(id="sqlglot", ctx=ast.Load()),
+                    attr="dialects",
+                    ctx=ast.Load(),
+                ),
+                include_attributes=False,
+            ):
+                raise SystemExit(f"dynamic namespace reflection at {path}:{node.lineno}")
+        if isinstance(node, ast.Attribute) and (
+            node.attr == "getattr"
+            or node.attr in EXTERNAL_REFLECTIVE_CALLS - {"exception"}
+        ):
+            raise SystemExit(f"aliased external reflection at {path}:{node.lineno}")
+        if isinstance(node, ast.Attribute) and node.attr in EXTERNAL_FRAME_ATTRIBUTES:
+            raise SystemExit(f"unsupported frame reflection at {path}:{node.lineno}")
+        if isinstance(node, ast.Name) and node.id == "getattr":
+            parent = parents.get(node)
+            if not (isinstance(parent, ast.Call) and parent.func is node):
+                raise SystemExit(f"aliased dynamic getattr at {path}:{node.lineno}")
+        if isinstance(node, ast.Name) and node.id in aliases:
+            parent = parents.get(node)
+            if not (isinstance(parent, ast.Call) and parent.func is node):
+                raise SystemExit(f"re-aliased external reflection at {path}:{node.lineno}")
+        if not isinstance(node, ast.Call):
+            continue
+
+        if isinstance(node.func, ast.Name):
+            call_name = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            call_name = node.func.attr
+        else:
+            call_name = None
+        if call_name in EXTERNAL_REFLECTIVE_CALLS or call_name in aliases:
+            raise SystemExit(f"unsupported external reflection at {path}:{node.lineno}")
+        if call_name != "getattr":
+            continue
+        if len(node.args) < 2:
+            raise SystemExit(f"malformed dynamic getattr at {path}:{node.lineno}")
+        attribute = _constant_string(node.args[1])
+        if attribute is not None:
+            if attribute == "__code__" or attribute.startswith(("co_", "f_", "tb_")):
+                raise SystemExit(f"dynamic code/frame read at {path}:{node.lineno}")
+            continue
+
+        # The two variable-name lookups in the pinned tests are over a schema
+        # object and a mock logger.  Neither can receive a sqlglot function or
+        # code/frame object.  Every other unresolved attribute is fail-closed.
+        value = node.args[0]
+        allowed = {
+            ("tests/helpers.py", 28, "logger"),
+            ("tests/test_schema.py", 429, "schema"),
+        }
+        if (
+            not isinstance(value, ast.Name)
+            or (path.as_posix(), node.lineno, value.id) not in allowed
+        ):
+            raise SystemExit(f"unresolved dynamic getattr at {path}:{node.lineno}")
+
 
 def unsupported_reflection(tree: ast.Module, path: Path) -> None:
     """Fail if the pinned source uses a code-reading API we do not instrument."""
@@ -246,6 +430,8 @@ def main() -> None:
             for path in sorted((work / root_name).rglob("*.py")):
                 relative = path.relative_to(work).as_posix()
                 tree = ast.parse(path.read_text(), filename=relative, type_comments=True)
+                if root_name == "tests":
+                    unsupported_external_reflection(tree, Path(relative))
                 instrumented += instrument_file(path, tree)
 
         environment = os.environ.copy()

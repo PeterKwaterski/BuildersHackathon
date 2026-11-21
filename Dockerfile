@@ -10,6 +10,7 @@ RUN python -c "import tarfile; tarfile.open('/app/sqlglot-eb11aec.tar.xz').extra
     && python -m compileall -q --invalidation-mode checked-hash /opt/sqlglot/sqlglot /opt/sqlglot/tests
 COPY selector.py /app/selector.py
 COPY semantic.py /app/semantic.py
+COPY semantic_noops.py /app/semantic_noops.py
 COPY runtime_verify.py /app/runtime_verify.py
 COPY selector_model.json.gz /app/selector_model.json.gz
 COPY semantic_sources.json.gz /app/semantic_sources.json.gz

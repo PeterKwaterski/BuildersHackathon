@@ -12,7 +12,7 @@ import subprocess
 from collections import defaultdict
 from pathlib import Path
 
-from collect_code_reflections import unsupported_reflection
+from collect_code_reflections import unsupported_external_reflection, unsupported_reflection
 
 
 PINNED_SHA = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
@@ -81,6 +81,10 @@ def main() -> None:
             raise SystemExit(f"manifest {path} lacks subprocess accounting")
 
     source_profile, known_labels = candidates(source)
+    for path in sorted((source / "tests").rglob("*.py")):
+        relative = path.relative_to(source)
+        tree = ast.parse(path.read_text(), filename=relative.as_posix(), type_comments=True)
+        unsupported_external_reflection(tree, relative)
     documents = [json.loads(path.read_text()) for path in args.trace]
     unknown_labels = set().union(*(set(document) for document in documents)) - known_labels
     if unknown_labels:

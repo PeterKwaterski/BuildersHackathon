@@ -11,6 +11,11 @@ from collections import deque
 from pathlib import Path
 
 from semantic import SemanticProof
+from semantic_noops import (
+    external_import_reorder,
+    local_binding_rename,
+    plain_definition_reorder,
+)
 from runtime_verify import verify_candidates
 
 DATA = Path("/data")
@@ -25,6 +30,7 @@ CLASS_ATTRIBUTE_MODEL = Path(__file__).with_name("class_attribute_model.json.gz"
 MODULE_CONSTANT_MODEL = Path(__file__).with_name("module_constant_model.json.gz")
 CODE_REFLECTION_MODEL = Path(__file__).with_name("code_reflection_model.json.gz")
 CODE_REFLECTION_RANGES_SHA256 = "c84e754efedb3fbaa3323a6ceb381e180c46dd385f295a5b2b44e22ec7401338"
+CODE_REFLECTION_PROFILE_SHA256 = "f62a0b161fa6d372766d8e290ee6450b368c4deee9bfcfd306f5aa184392298c"
 FRESH_ALIAS_PROFILE = Path(__file__).with_name("fresh_alias_profile.json.gz")
 GENERATOR_DISPATCH_MODEL = Path(__file__).with_name("generator_dispatch_model.json.gz")
 GENERATOR_DISPATCH_INVENTORY_SHA256 = "3e3cb5a12da0fb01cd68f9b2fc789bc8d020523e015fea7016e04679c34d1dca"
@@ -34,6 +40,7 @@ WORKER_COST_MS = 2_000
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 COMPARISON_OPERATOR = re.compile(r"\bis\s+not\b|\bis\b|==|!=")
 COMMENT_DIRECTIVE = re.compile(r"(?i)(coding\s*[:=]|type:|noqa|pragma|fmt:|pyright|mypy)")
+ASCII_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 PROCESS_SERIALIZATION_FILES = {"sqlglot/serde.py"}
 _SEMANTIC_PROOF = None
 _PINNED_SOURCES = None
@@ -42,6 +49,13 @@ _SOURCE_INDEXES = {}
 _IMPORT_DEFINITION_RANGES = {}
 _SOURCE_CODE = {}
 _INIT_SUBCLASS_ATTRIBUTES = None
+
+# Proof families are independent kill switches.  Import and definition order
+# remain quarantined until their missing construction/namespace certificates
+# exist; see tools/SEMANTIC_NOOP_PROOFS.md.
+SEMANTIC_NOOP_LOCAL_RENAME = True
+SEMANTIC_NOOP_IMPORT_REORDER = False
+SEMANTIC_NOOP_DEFINITION_REORDER = False
 
 
 def split(tests: list[dict], worker_count: int) -> tuple[list[list[int]], int]:
@@ -260,6 +274,45 @@ def semantic_code_fingerprint(code: types.CodeType) -> tuple:
         code.co_linetable,
         tuple(code.co_positions()),
     )
+
+
+def semantic_noop_edit(change: dict, path: str) -> str | None:
+    """Return the independently enabled semantic no-op proof family."""
+
+    original = pinned_sources().get(path)
+    if original is None or not path.endswith(".py"):
+        return None
+    changed = None
+    if SEMANTIC_NOOP_LOCAL_RENAME and len(change["removed"]) == len(change["added"]):
+        possible = False
+        for old_line, new_line in zip(change["removed"], change["added"]):
+            old_names = [(match.span(), match.group()) for match in ASCII_IDENTIFIER.finditer(old_line)]
+            new_names = [(match.span(), match.group()) for match in ASCII_IDENTIFIER.finditer(new_line)]
+            if [span for span, _name in old_names] != [span for span, _name in new_names]:
+                break
+            old_masked = ASCII_IDENTIFIER.sub("", old_line)
+            new_masked = ASCII_IDENTIFIER.sub("", new_line)
+            if old_masked != new_masked:
+                break
+            possible |= old_names != new_names
+        else:
+            if possible:
+                changed = patched_source(change, path)
+                if changed is not None and local_binding_rename(original, changed, path):
+                    return "local-binding-rename"
+    if not (SEMANTIC_NOOP_IMPORT_REORDER or SEMANTIC_NOOP_DEFINITION_REORDER):
+        return None
+    if changed is None:
+        changed = patched_source(change, path)
+    if changed is None:
+        return None
+    if SEMANTIC_NOOP_IMPORT_REORDER and external_import_reorder(original, changed, path):
+        return "external-import-reorder"
+    if SEMANTIC_NOOP_DEFINITION_REORDER and plain_definition_reorder(
+        original, changed, path
+    ):
+        return "plain-definition-reorder"
+    return None
 
 
 def local_annotation_only_edit(change: dict, path: str) -> bool:
@@ -2447,9 +2500,16 @@ def valid_code_reflection_model(model: object, pinned_sha: str, test_digest: str
     ranges_digest = hashlib.sha256(
         json.dumps(ranges, separators=(",", ":")).encode()
     ).hexdigest()
+    try:
+        profile_digest = hashlib.sha256(
+            json.dumps(model["d"], sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    except (TypeError, ValueError, OverflowError, RecursionError, MemoryError):
+        return False
     return (
         model.get("p") == CODE_REFLECTION_RANGES_SHA256
         and ranges_digest == CODE_REFLECTION_RANGES_SHA256
+        and profile_digest == CODE_REFLECTION_PROFILE_SHA256
     )
 
 
@@ -2580,6 +2640,8 @@ def selected_indices(
             code_reflection_indices(path, change["lines"], reflection_model, all_indices)
         )
         if inert_comment_addition(change, path):
+            continue
+        if semantic_noop_edit(change, path) is not None:
             continue
         if local_annotation_only_edit(change, path):
             continue
