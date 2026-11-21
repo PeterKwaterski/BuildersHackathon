@@ -10,6 +10,7 @@ import types
 from pathlib import Path
 
 from semantic import SemanticProof
+from runtime_verify import verify_candidates
 
 DATA = Path("/data")
 MODEL = Path(__file__).with_name("selector_model.json.gz")
@@ -326,6 +327,104 @@ def local_annotation_only_edit(change: dict, path: str) -> bool:
                 _SOURCE_CODE[path]
             ) == semantic_code_fingerprint(changed_code)
     return False
+
+
+def runtime_body_patch_source(change: dict, path: str) -> str | None:
+    """Return patched source only for a binding-stable function-body edit.
+
+    The warm verifier intentionally preloads a common test substrate.  Limiting
+    it to an unloaded module's function body ensures that importing the patched
+    module has the same construction side effects as the pinned module; only
+    calls or reflection performed by the exact candidate test can distinguish
+    the new code.
+    """
+    source = pinned_sources().get(path)
+    changed = patched_source(change, path)
+    changed_lines = change["lines"]
+    if (
+        source is None
+        or changed is None
+        or len(change["removed"]) != 1
+        or len(change["added"]) != 1
+        or not changed_lines
+        or any(COMMENT_DIRECTIVE.search(line) for line in change["payload"])
+        or any(import_definition_line(path, line) for line in changed_lines)
+        or not all(
+            precise_coverage_line(path, line, change)
+            and preserves_function_bindings(change, path, line)
+            for line in changed_lines
+        )
+    ):
+        return None
+    try:
+        original_tree = ast.parse(source, filename=path, type_comments=True)
+        changed_tree = ast.parse(changed, filename=path, type_comments=True)
+    except (SyntaxError, ValueError):
+        return None
+
+    candidates = [
+        node
+        for node in ast.walk(original_tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and all(
+            node.lineno <= line <= (node.end_lineno or node.lineno)
+            for line in changed_lines
+        )
+    ]
+    if not candidates:
+        return None
+    target = min(
+        candidates,
+        key=lambda node: ((node.end_lineno or node.lineno) - node.lineno, node.col_offset),
+    )
+    body_start = min((statement.lineno for statement in target.body), default=target.end_lineno)
+    if target.decorator_list or any(line < body_start for line in changed_lines):
+        return None
+
+    def locate(root: ast.AST, wanted: ast.AST):
+        pending = [(root, ())]
+        while pending:
+            node, node_path = pending.pop()
+            if node is wanted:
+                return node_path
+            children = []
+            for field, value in ast.iter_fields(node):
+                if isinstance(value, ast.AST):
+                    children.append((value, (*node_path, (field, None))))
+                elif isinstance(value, list):
+                    children.extend(
+                        (item, (*node_path, (field, index)))
+                        for index, item in enumerate(value)
+                        if isinstance(item, ast.AST)
+                    )
+            pending.extend(reversed(children))
+        return None
+
+    def follow(root: ast.AST, node_path):
+        node = root
+        for field, index in node_path:
+            value = getattr(node, field, None)
+            if index is None:
+                node = value
+            elif isinstance(value, list) and index < len(value):
+                node = value[index]
+            else:
+                return None
+            if not isinstance(node, ast.AST):
+                return None
+        return node
+
+    target_path = locate(original_tree, target)
+    changed_target = follow(changed_tree, target_path) if target_path is not None else None
+    if not isinstance(changed_target, type(target)) or changed_target.name != target.name:
+        return None
+    target.body = [ast.Pass()]
+    changed_target.body = [ast.Pass()]
+    if ast.dump(original_tree, include_attributes=False) != ast.dump(
+        changed_tree, include_attributes=False
+    ):
+        return None
+    return changed
 
 
 def patch_local_expression_line(change: dict, path: str, line: int) -> bool:
@@ -2466,7 +2565,28 @@ def main() -> None:
             reflection_model,
             fresh_alias_model,
         )
-        selected = [mapped_tests[index] for index in indices if mapped_tests[index] is not None]
+        selected = [
+            mapped_tests[index]
+            for index in sorted(indices)
+            if mapped_tests[index] is not None
+        ]
+        changes = patch_changes(patch)
+        verification_sources = []
+        if changes and all(
+            change["old"] == change["new"]
+            and isinstance(change["old"], str)
+            and change["old"].startswith("sqlglot/")
+            and change["old"].endswith(".py")
+            for change in changes
+        ):
+            for change in changes:
+                changed_source = runtime_body_patch_source(change, change["old"])
+                if changed_source is None:
+                    verification_sources = []
+                    break
+                verification_sources.append((change["old"], changed_source))
+        if verification_sources:
+            selected = verify_candidates(verification_sources, selected)
         selected.extend(unmapped_tests)
         selection_count += len(selected)
         workers = best_split(selected)

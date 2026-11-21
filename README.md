@@ -44,16 +44,29 @@ make check    # the output's format only
 
 `sample/answers.json` lists the tests each sample commit breaks and the kind of change it is. The practice and final commits are hidden, and so is everything your program prints when it runs on them. A rejected submission tells you which rule it broke and nothing more, so reproduce problems here.
 
-The current exact-image sample result is **97.830 simulated seconds with zero
-misses**. Seven recent selector-body measurements in the scorer container had a
-1.103-second median; process startup is additional and the board measures the
-complete container. Model collection used the pinned Python 3.13 image and the
-locked dependencies. Ordinary coverage is merged with a coverage-only
-synchronous process-pool pass so both serialization paths and
+The current exact-image sample result is **95.673 simulated seconds with zero
+misses**. The static selector selects 102 tests at 97.830 seconds; the restricted
+warm verifier removes three observed passing tests and selects 99. Process CPU
+is charged separately, so both simulated time and process-tree CPU are measured
+before accepting a verifier change. Model collection used the pinned Python
+3.13 image and the locked dependencies. Ordinary coverage is merged with a
+coverage-only synchronous process-pool pass so both serialization paths and
 optimizer/executor bodies are represented. `tools/build_model.py` compacts
 those answer-independent inputs into `selector_model.json.gz`; runtime test IDs
 are resolved against `/data/tests.json` rather than assuming fixed test
 numbers.
+
+`runtime_verify.py` adds a fail-closed dynamic proof after ordinary static
+selection. For a small, cheap candidate set it forks from a pinned warm parent,
+imports an exact patched-source overlay, and runs the requested unittest methods.
+Only binding-stable one-line function-body edits in modules absent from the warm
+parent are eligible. Candidate test modules must reproduce the warm parent's
+import order: the shared dialect Validator is either the test module itself or
+its literal first top-level statement. Checked-hash bytecode prevents stale
+source execution. Import/setup errors, subtest attribution uncertainty,
+timeouts, process leaks, source-restore failures, process-pool tests, and every
+unsupported shape retain the complete static selection. The design and audit
+gates are documented in `tools/RUNTIME_VERIFY.md`.
 
 At runtime, a general semantic analyzer derives identity/equality equivalence
 from the committed pinned source. It is used only when a one-line patch changes
