@@ -15,6 +15,7 @@ DATA = Path("/data")
 MODEL = Path(__file__).with_name("selector_model.json.gz")
 SEMANTIC_SOURCES = Path(__file__).with_name("semantic_sources.json.gz")
 ZERO_READER_MODEL = Path(__file__).with_name("zero_reader_model.json.gz")
+PREDICATE_PROFILE = Path(__file__).with_name("predicate_profile.json.gz")
 MAX_WORKERS = 8
 WORKER_COST_MS = 2_000
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -866,6 +867,162 @@ def zero_reader_dict_edit(
     return not import_expression_hazard(change, path, hook_attributes)
 
 
+def profile_equivalent_predicate_edit(
+    change: dict,
+    path: str,
+    predicate_model: dict,
+    hook_attributes: set[str] | None = None,
+) -> bool:
+    """Prove the changed ordering operator is equivalent on the raw profile."""
+    entries = predicate_model.get("d", {}).get(path)
+    source = pinned_sources().get(path)
+    changed = patched_source(change, path)
+    if (
+        not entries
+        or source is None
+        or changed is None
+        or path in PROCESS_SERIALIZATION_FILES
+        or any(COMMENT_DIRECTIVE.search(line) for line in change["payload"])
+    ):
+        return False
+    try:
+        original_tree = ast.parse(source, filename=path, type_comments=True)
+        changed_tree = ast.parse(changed, filename=path, type_comments=True)
+    except (SyntaxError, ValueError):
+        return False
+
+    def node_paths(tree: ast.AST):
+        pending = [(tree, ())]
+        while pending:
+            node, path_parts = pending.pop()
+            yield node, path_parts
+            children = []
+            for field, value in ast.iter_fields(node):
+                if isinstance(value, ast.AST):
+                    children.append((value, (*path_parts, (field, None))))
+                elif isinstance(value, list):
+                    children.extend(
+                        (item, (*path_parts, (field, index)))
+                        for index, item in enumerate(value)
+                        if isinstance(item, ast.AST)
+                    )
+            pending.extend(reversed(children))
+
+    def follow(tree: ast.AST, path_parts):
+        node = tree
+        for field, index in path_parts:
+            value = getattr(node, field, None)
+            if index is None:
+                node = value
+            elif isinstance(value, list) and index < len(value):
+                node = value[index]
+            else:
+                return None
+            if not isinstance(node, ast.AST):
+                return None
+        return node
+
+    positions = {
+        (node.lineno, node.col_offset, node.end_lineno, node.end_col_offset): (
+            node,
+            node_path,
+        )
+        for node, node_path in node_paths(original_tree)
+        if isinstance(node, ast.Compare)
+    }
+    candidates = []
+    for entry in entries:
+        if len(entry) != 7:
+            continue
+        start, column, end, end_column, source_operator, state, observations = entry
+        if not any(start <= line <= end for line in change["lines"]):
+            continue
+        found = positions.get((start, column, end, end_column))
+        if found is None:
+            continue
+        original_compare, compare_path = found
+        changed_compare = follow(changed_tree, compare_path)
+        if (
+            isinstance(changed_compare, ast.Compare)
+            and len(original_compare.ops) == 1
+            and len(changed_compare.ops) == 1
+            and type(original_compare.ops[0]).__name__ == source_operator
+        ):
+            candidates.append(
+                (
+                    original_compare,
+                    changed_compare,
+                    compare_path,
+                    source_operator,
+                    state,
+                    observations,
+                )
+            )
+    if len(candidates) != 1:
+        return False
+
+    original_compare, changed_compare, _, old_operator, state, observations = candidates[0]
+    new_operator = type(changed_compare.ops[0]).__name__
+    if len(original_compare.ops) != 1 or len(changed_compare.ops) != 1:
+        return False
+    if len(original_compare.comparators) != 1 or len(changed_compare.comparators) != 1:
+        return False
+    if type(original_compare.ops[0]).__name__ != old_operator:
+        return False
+    if type(changed_compare.ops[0]).__name__ != new_operator:
+        return False
+    adjacent = {
+        ("Lt", "LtE"),
+        ("LtE", "Lt"),
+        ("Gt", "GtE"),
+        ("GtE", "Gt"),
+    }
+    if (old_operator, new_operator) not in adjacent:
+        return False
+    outcome_index = {"Lt": 0, "LtE": 1, "Gt": 2, "GtE": 3, "Eq": 4, "NotEq": 5}
+    if (
+        state != "safe"
+        or not isinstance(observations, list)
+        or not observations
+        or any(
+            not isinstance(outcome, list)
+            or len(outcome) != len(outcome_index)
+            or any(type(value) is not bool for value in outcome)
+            or outcome[outcome_index[old_operator]]
+            != outcome[outcome_index[new_operator]]
+            for outcome in observations
+        )
+    ):
+        return False
+
+    def literal(node: ast.AST) -> bool:
+        try:
+            ast.literal_eval(node)
+        except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+            return False
+        return True
+
+    if not (
+        literal(original_compare.left)
+        or literal(original_compare.comparators[0])
+    ):
+        return False
+
+    # The certificate is usable only when normalizing the one approved
+    # operator makes the complete executable trees identical.  Operands,
+    # evaluation order, surrounding expressions, bindings and type comments
+    # therefore cannot change under this shortcut.
+    original_compare.ops[0] = ast.Eq()
+    changed_compare.ops[0] = ast.Eq()
+    if ast.dump(original_tree, include_attributes=False) != ast.dump(
+        changed_tree, include_attributes=False
+    ):
+        return False
+    return preserves_function_bindings(
+        change, path, original_compare.lineno
+    ) and not import_expression_hazard(change, path, hook_attributes)
+
+
 def path_dependency_cone(
     paths: tuple[str | None, ...],
     model: dict,
@@ -907,6 +1064,7 @@ def selected_indices(
     all_indices: set[int],
     test_file_indices: dict[str, set[int]] | None = None,
     zero_model: dict | None = None,
+    predicate_model: dict | None = None,
 ) -> set[int]:
     selected: set[int] = set()
     changes = patch_changes(patch)
@@ -966,6 +1124,11 @@ def selected_indices(
 
         if zero_model is not None and zero_reader_dict_edit(
             change, path, zero_model, model.get("h")
+        ):
+            continue
+
+        if predicate_model is not None and profile_equivalent_predicate_edit(
+            change, path, predicate_model, model.get("h")
         ):
             continue
 
@@ -1072,16 +1235,26 @@ def main() -> None:
     model["h"] = set(model.get("h", ()))
     with gzip.open(ZERO_READER_MODEL, "rt", encoding="utf-8") as zero_model_file:
         zero_model = json.load(zero_model_file)
+    with gzip.open(PREDICATE_PROFILE, "rt", encoding="utf-8") as predicate_model_file:
+        predicate_model = json.load(predicate_model_file)
+    test_digest = hashlib.sha256(
+        "\0".join(test["id"] for test in tests).encode("utf-8")
+    ).hexdigest()
     if (
         zero_model.get("v") != 1
         or zero_model.get("sha") != model.get("sha")
         or zero_model.get("n") != len(tests)
         or zero_model.get("t")
-        != hashlib.sha256(
-            "\0".join(test["id"] for test in tests).encode("utf-8")
-        ).hexdigest()
+        != test_digest
     ):
         zero_model = {"d": {}}
+    if (
+        predicate_model.get("v") != 2
+        or predicate_model.get("sha") != model.get("sha")
+        or predicate_model.get("n") != len(tests)
+        or predicate_model.get("t") != test_digest
+    ):
+        predicate_model = {"d": {}}
     mapped_tests = [tests_by_id.get(test_id) for test_id in model["t"]]
     all_indices = {index for index, test in enumerate(mapped_tests) if test is not None}
     test_file_indices: dict[str, set[int]] = {}
@@ -1094,7 +1267,12 @@ def main() -> None:
     selection_count = 0
     for patch in sorted((DATA / "commits").glob("*.patch")):
         indices = selected_indices(
-            patch, model, all_indices, test_file_indices, zero_model
+            patch,
+            model,
+            all_indices,
+            test_file_indices,
+            zero_model,
+            predicate_model,
         )
         selected = [mapped_tests[index] for index in indices if mapped_tests[index] is not None]
         selected.extend(unmapped_tests)

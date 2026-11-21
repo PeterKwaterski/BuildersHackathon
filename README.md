@@ -44,7 +44,7 @@ make check    # the output's format only
 
 `sample/answers.json` lists the tests each sample commit breaks and the kind of change it is. The practice and final commits are hidden, and so is everything your program prints when it runs on them. A rejected submission tells you which rule it broke and nothing more, so reproduce problems here.
 
-The current exact-image sample result is **118.952 simulated seconds with zero
+The current exact-image sample result is **116.416 simulated seconds with zero
 misses**. Seven recent selector-body measurements in the scorer container had a
 1.103-second median; process startup is additional and the board measures the
 complete container. Model collection used the pinned Python 3.13 image and the
@@ -81,6 +81,16 @@ old/new values, and a whole-file AST that becomes identical when the changed
 value is replaced by a sentinel. Every uncertainty falls back to the ordinary
 assignment dependency cone. The certificate is derived from pinned sources and
 tests and contains no sample commit, patch, or answer information.
+
+`tools/collect_predicate_values.py` and
+`tools/build_predicate_profile.py` reproduce the still narrower ordering
+predicate execution profile documented in `tools/PREDICATE_PROFILE.md`. It
+contains every instrumented source site and all six observed boolean outcomes;
+unsafe, unobserved, incomplete, or unattributed sites explicitly force fallback.
+It is not filtered by a candidate edit and contains no replacement operators or
+test ownership. Runtime use requires an adjacent operator pair whose old and new
+outcomes match across the raw profile, plus whole-file AST equality after normalizing only that operator,
+plus the ordinary compile, directive, import and function-binding gates.
 
 ## Submit
 
