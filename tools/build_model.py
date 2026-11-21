@@ -30,6 +30,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--fixture-access", type=Path, action="append", default=[])
     parser.add_argument("--fixture-map", type=Path, action="append", default=[])
     parser.add_argument("--dependency-map", type=Path, action="append", default=[])
+    parser.add_argument("--sources-output", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -139,13 +140,16 @@ def main() -> None:
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 continue
+            start = min(
+                [node.lineno, *(decorator.lineno for decorator in node.decorator_list)]
+            )
             end = node.end_lineno or node.lineno
             indices: set[int] = set()
-            for line in range(node.lineno, end + 1):
+            for line in range(start, end + 1):
                 indices.update(numbered.get(line, ()))
             if indices:
                 kind = "c" if isinstance(node, ast.ClassDef) else "f"
-                scopes.append((node.lineno, end, kind, indices))
+                scopes.append((start, end, kind, indices))
         scopes_by_file[relative] = scopes
 
         parents: dict[ast.AST, ast.AST] = {}
@@ -219,8 +223,6 @@ def main() -> None:
         import_ranges.extend([line, line] for line in sorted(empty_lines - nested_lines))
         if import_ranges:
             entry["i"] = import_ranges
-        if definitions.get(relative):
-            entry["d"] = definitions[relative]
         files[relative] = entry
 
     fixtures: dict[str, set[int]] = defaultdict(set)
@@ -267,11 +269,6 @@ def main() -> None:
         "q": {
             dialect: intern(indices) for dialect, indices in sorted(dialects.items()) if indices
         },
-        "y": {
-            name: intern(indices)
-            for name, indices in sorted(symbol_references.items())
-            if indices
-        },
     }
     encoded = json.dumps(model, sort_keys=True, separators=(",", ":")).encode()
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -282,6 +279,19 @@ def main() -> None:
         f"wrote {args.output}: {len(encoded)} raw bytes, "
         f"{args.output.stat().st_size} compressed bytes, {len(sets)} unique test sets"
     )
+    if args.sources_output:
+        sources = {
+            path.relative_to(source).as_posix(): path.read_text()
+            for path in sorted((source / "sqlglot").rglob("*.py"))
+        }
+        source_bytes = json.dumps(sources, sort_keys=True, separators=(",", ":")).encode()
+        with args.sources_output.open("wb") as raw_output:
+            with gzip.GzipFile(fileobj=raw_output, mode="wb", mtime=0) as compressed:
+                compressed.write(source_bytes)
+        print(
+            f"wrote {args.sources_output}: {len(source_bytes)} raw bytes, "
+            f"{args.sources_output.stat().st_size} compressed bytes"
+        )
 
 
 if __name__ == "__main__":

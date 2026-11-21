@@ -44,13 +44,23 @@ make check    # the output's format only
 
 `sample/answers.json` lists the tests each sample commit breaks and the kind of change it is. The practice and final commits are hidden, and so is everything your program prints when it runs on them. A rejected submission tells you which rule it broke and nothing more, so reproduce problems here.
 
-The current exact-image sample result is **188.749 simulated seconds with zero
-misses**. Model collection used the pinned Python 3.13 image and the locked
+The current exact-image sample result is **137.148 simulated seconds with zero
+misses**. Three instrumented container runs used a median 2.657 CPU seconds,
+for a local middle total of **139.805 seconds**. Model collection used the
+pinned Python 3.13 image and the locked
 dependencies. Ordinary coverage is merged with a coverage-only synchronous
 process-pool pass so both serialization paths and optimizer/executor bodies are
 represented. `tools/build_model.py` compacts those answer-independent inputs
 into `selector_model.json.gz`; runtime test IDs are resolved against
 `/data/tests.json` rather than assuming fixed test numbers.
+
+At runtime, a general semantic analyzer derives identity/equality equivalence
+from the committed pinned source. It is used only when a one-line patch changes
+`is` to `==` (or the negative equivalents) and complete assignment flow proves
+an Enum singleton or an object-identity class. Ordinary added comments are
+skipped only when applying their full unified diff produces the same Python AST
+(including type comments); directives and compile errors stay conservative.
+These are source analyses, not sample-patch or answer lookups.
 
 ## Submit
 
