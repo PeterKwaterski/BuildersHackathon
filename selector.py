@@ -149,7 +149,115 @@ def source_tree(path: str) -> ast.Module | None:
     return _SOURCE_TREES[path]
 
 
-def precise_coverage_line(path: str, line: int) -> bool:
+def patch_local_expression_line(change: dict, path: str, line: int) -> bool:
+    """Prove a patch is wholly contained by one expression on ``line``.
+
+    Replacing the containing expression in both complete module trees must
+    make them identical. This rejects edits to multiline boolean connectors
+    and other changes that can make an uncovered continuation line reachable.
+    """
+    changed = patched_source(change, path)
+    original = pinned_sources().get(path)
+    if changed is None or original is None:
+        return False
+    try:
+        original_tree = ast.parse(original, filename=path, type_comments=True)
+        changed_tree = ast.parse(changed, filename=path, type_comments=True)
+    except (SyntaxError, ValueError):
+        return False
+
+    def node_paths(tree: ast.AST):
+        pending = [(tree, ())]
+        while pending:
+            node, node_path = pending.pop()
+            yield node, node_path
+            children = []
+            for field, value in ast.iter_fields(node):
+                if isinstance(value, ast.AST):
+                    children.append((value, (*node_path, (field, None))))
+                elif isinstance(value, list):
+                    children.extend(
+                        (item, (*node_path, (field, index)))
+                        for index, item in enumerate(value)
+                        if isinstance(item, ast.AST)
+                    )
+            pending.extend(reversed(children))
+
+    def follow(tree: ast.AST, node_path):
+        node = tree
+        for field, index in node_path:
+            value = getattr(node, field, None)
+            if index is None:
+                node = value
+            elif isinstance(value, list) and index < len(value):
+                node = value[index]
+            else:
+                return None
+            if not isinstance(node, ast.AST):
+                return None
+        return node
+
+    def replace(tree: ast.AST, node_path, replacement: ast.expr):
+        if not node_path:
+            return None
+        parent = follow(tree, node_path[:-1])
+        if parent is None:
+            return None
+        field, index = node_path[-1]
+        value = getattr(parent, field, None)
+        if index is None and isinstance(value, ast.AST):
+            setattr(parent, field, replacement)
+            return parent, field, None, value
+        if isinstance(value, list) and index is not None and index < len(value):
+            previous = value[index]
+            value[index] = replacement
+            return parent, field, index, previous
+        return None
+
+    def restore(state):
+        parent, field, index, previous = state
+        if index is None:
+            setattr(parent, field, previous)
+        else:
+            getattr(parent, field)[index] = previous
+
+    candidates = [
+        (node, node_path)
+        for node, node_path in node_paths(original_tree)
+        if isinstance(node, ast.expr)
+        and node.lineno == (node.end_lineno or node.lineno) == line
+    ]
+    for _, node_path in candidates:
+        changed_expression = follow(changed_tree, node_path)
+        if (
+            not isinstance(changed_expression, ast.expr)
+            or changed_expression.lineno
+            != (changed_expression.end_lineno or changed_expression.lineno)
+        ):
+            continue
+        original_state = replace(
+            original_tree, node_path, ast.Constant(value="__blast_radius_expression__")
+        )
+        changed_state = replace(
+            changed_tree, node_path, ast.Constant(value="__blast_radius_expression__")
+        )
+        if original_state is None or changed_state is None:
+            if original_state is not None:
+                restore(original_state)
+            if changed_state is not None:
+                restore(changed_state)
+            continue
+        equivalent = ast.dump(original_tree, include_attributes=False) == ast.dump(
+            changed_tree, include_attributes=False
+        )
+        restore(original_state)
+        restore(changed_state)
+        if equivalent:
+            return True
+    return False
+
+
+def precise_coverage_line(path: str, line: int, change: dict | None = None) -> bool:
     """Whether executing a line necessarily reaches the changed expression."""
     tree = source_tree(path)
     if tree is None:
@@ -228,10 +336,12 @@ def precise_coverage_line(path: str, line: int) -> bool:
         header_expressions.extend((statement.target, statement.iter))
     elif isinstance(statement, (ast.With, ast.AsyncWith)):
         header_expressions.extend(item.context_expr for item in statement.items)
-    return any(
+    if any(
         expression.lineno == (expression.end_lineno or expression.lineno) == line
         for expression in header_expressions
-    )
+    ):
+        return True
+    return change is not None and patch_local_expression_line(change, path, line)
 
 
 def import_definition_line(path: str, line: int) -> bool:
@@ -1923,7 +2033,7 @@ def selected_indices(
         for line in changed_lines:
             if (
                 change["removed"]
-                and precise_coverage_line(path, line)
+                and precise_coverage_line(path, line, change)
                 and preserves_function_bindings(change, path, line)
             ):
                 set_id = line_sets.get(line)
