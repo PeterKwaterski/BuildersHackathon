@@ -89,6 +89,13 @@ def main() -> None:
             raise SystemExit(f"inadmissible manifest {path}: {len(missing)} missing")
         if not isinstance(manifest.get("child_logs"), int) or manifest["child_logs"] <= 0:
             raise SystemExit(f"manifest {path} lacks subprocess accounting")
+        if (
+            manifest.get("snapshot_trusted") is not True
+            or manifest.get("unittest") is not True
+            or manifest.get("clean_import") is not True
+            or manifest.get("snapshot_mode") != "pytest"
+        ):
+            raise SystemExit(f"manifest {path} lacks a trusted pytest-mode snapshot")
 
     documents = [json.loads(path.read_text()) for path in args.trace]
     source_entries = call_dumps(source)
@@ -125,6 +132,12 @@ def main() -> None:
             state = "unsafe-type"
         elif any(observation.get("bindings") != [True] for observation in observations):
             state = "unsafe-binding"
+        elif any(
+            not observation.get("modes")
+            or not set(observation["modes"]).issubset({"pytest", "child"})
+            for observation in observations
+        ):
+            state = "unsafe-snapshot"
         else:
             state = "safe"
         readers = sorted(test_index[owner] for owner in owners if owner in test_index)

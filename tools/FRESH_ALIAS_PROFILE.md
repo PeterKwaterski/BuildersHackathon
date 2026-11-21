@@ -13,6 +13,17 @@ still have their canonical bindings. Real subprocesses inherit the owning node
 and write child logs. A second complete suite run makes optimizer and executor
 worker paths synchronous.
 
+The tracker itself is loaded by `sitecustomize` without importing sqlglot. The
+pytest plugin captures an immutable canonical snapshot after pytest is loaded
+but before test collection, and the manifest requires a clean import with
+sqlglot's `UNITTEST` mode enabled. Fresh attributed child interpreters capture
+their own clean child-mode snapshot with the expected `UNITTEST` value; forked
+children inherit the parent's snapshot. Every event records its snapshot mode.
+The binding check covers the exported functions and their internal classes,
+helpers, constructors, copy/deepcopy, parent-setting methods, and `arg_types`.
+The collector also runs deliberate exported-function, global-class, and
+constructor monkeypatch negatives before admitting a suite run.
+
 ```sh
 python tools/collect_fresh_alias_profile.py \
   --source /path/to/sqlglot --python /path/to/python3.13 \
@@ -36,7 +47,8 @@ python tools/build_fresh_alias_profile.py \
 The builder pins the source revision, ordered test digest, two successful full
 manifests, and child-process accounting. A site is safe only when both traces
 observed canonical bindings and only exact `str` arguments under attributed
-tests. In every other state runtime selection falls back.
+tests using trusted pytest/child snapshots. In every other state runtime
+selection falls back.
 
 At runtime a cheap lexical gate first requires one `copy=True`/`copy=False`
 token change on an otherwise identical removed/added line. The authoritative
