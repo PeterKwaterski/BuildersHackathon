@@ -31,6 +31,10 @@ SEMANTIC_SOURCES = Path(__file__).with_name("semantic_sources.json.gz")
 SEMANTIC_SOURCES_SHA256 = "f453c6266c20edcc9ba7127ebedde0bdf45d44633279352c2daafe1fa123da5f"
 ZERO_READER_MODEL = Path(__file__).with_name("zero_reader_model.json.gz")
 PREDICATE_PROFILE = Path(__file__).with_name("predicate_profile.json.gz")
+GUARD_PROFILE = Path(__file__).with_name("guard_profile.json.gz")
+# Filled only after two independently admitted Python 3.13 trace modes produce
+# the final deterministic artifact. An empty pin deliberately disables it.
+GUARD_PROFILE_SHA256 = ""
 ARG_TYPE_DERIVATION_MODEL = Path(__file__).with_name(
     "arg_type_derivation_model.json.gz"
 )
@@ -2336,6 +2340,312 @@ def profile_equivalent_predicate_edit(
     ) and not import_expression_hazard(change, path, hook_attributes)
 
 
+GUARD_RESULTS = {
+    "truth": (False, True, False, False, True),
+    "not": (True, False, True, True, False),
+    "is_none": (False, False, True, False, False),
+    "not_none": (True, True, False, True, True),
+    "is_false": (False, False, False, True, False),
+    "not_false": (True, True, True, False, True),
+    "is_true": (False, False, False, False, True),
+    "not_true": (True, True, True, True, False),
+}
+GUARD_OPERANDS = (ast.Name, ast.Attribute, ast.Call, ast.Subscript)
+
+
+def _truth_guard_form(node: ast.AST) -> tuple[str, ast.expr] | None:
+    if isinstance(node, GUARD_OPERANDS):
+        return "truth", node
+    if (
+        isinstance(node, ast.UnaryOp)
+        and isinstance(node.op, ast.Not)
+        and isinstance(node.operand, GUARD_OPERANDS)
+    ):
+        return "not", node.operand
+    if (
+        not isinstance(node, ast.Compare)
+        or len(node.ops) != 1
+        or len(node.comparators) != 1
+        or not isinstance(node.ops[0], (ast.Is, ast.IsNot))
+    ):
+        return None
+    operand, constant = node.left, node.comparators[0]
+    if not isinstance(operand, GUARD_OPERANDS) or not isinstance(constant, ast.Constant):
+        return None
+    if constant.value is None:
+        suffix = "none"
+    elif type(constant.value) is bool:
+        suffix = "true" if constant.value else "false"
+    else:
+        return None
+    return ("is_" if isinstance(node.ops[0], ast.Is) else "not_") + suffix, operand
+
+
+def _none_guard_form(node: ast.AST) -> tuple[str, ast.expr, str] | None:
+    if (
+        not isinstance(node, ast.Compare)
+        or len(node.ops) != 1
+        or len(node.comparators) != 1
+        or not isinstance(node.ops[0], (ast.Is, ast.IsNot, ast.Eq, ast.NotEq))
+    ):
+        return None
+    left, right = node.left, node.comparators[0]
+    if isinstance(right, ast.Constant) and right.value is None:
+        return type(node.ops[0]).__name__, left, "left"
+    if isinstance(left, ast.Constant) and left.value is None:
+        return type(node.ops[0]).__name__, right, "right"
+    return None
+
+
+def valid_guard_profile(profile: dict | None, revision: str, digest: str, count: int) -> bool:
+    if (
+        not isinstance(profile, dict)
+        or profile.get("v") != 1
+        or profile.get("sha") != revision
+        or profile.get("t") != digest
+        or profile.get("n") != count
+        or not isinstance(profile.get("tree"), str)
+        or not isinstance(profile.get("d"), dict)
+        or not isinstance(profile.get("provenance"), dict)
+    ):
+        return False
+    return all(
+        isinstance(path, str)
+        and isinstance(entries, list)
+        and all(isinstance(entry, list) for entry in entries)
+        for path, entries in profile["d"].items()
+    )
+
+
+def guard_profile_exemptions(
+    change: dict,
+    path: str,
+    profile: dict,
+    hook_attributes: set[str] | None = None,
+) -> set[int] | None:
+    """Return tests proven insensitive to one exact guard-form change."""
+
+    entries = profile.get("d", {}).get(path)
+    source = pinned_sources().get(path)
+    changed = patched_source(change, path)
+    count = profile.get("n")
+    if (
+        not entries
+        or source is None
+        or changed is None
+        or type(count) is not int
+        or count <= 0
+        or path in PROCESS_SERIALIZATION_FILES
+        or any(COMMENT_DIRECTIVE.search(line) for line in change["payload"])
+    ):
+        return None
+    try:
+        original_tree = ast.parse(source, filename=path, type_comments=True)
+        changed_tree = ast.parse(changed, filename=path, type_comments=True)
+    except (SyntaxError, ValueError):
+        return None
+
+    def walk_paths(root: ast.AST):
+        pending = [(root, ())]
+        while pending:
+            node, node_path = pending.pop()
+            yield node, node_path
+            children = []
+            for field, value in ast.iter_fields(node):
+                if isinstance(value, ast.AST):
+                    children.append((value, (*node_path, (field, None))))
+                elif isinstance(value, list):
+                    children.extend(
+                        (item, (*node_path, (field, index)))
+                        for index, item in enumerate(value)
+                        if isinstance(item, ast.AST)
+                    )
+            pending.extend(reversed(children))
+
+    def follow(root: ast.AST, node_path):
+        node = root
+        for field, index in node_path:
+            value = getattr(node, field, None)
+            if index is None:
+                node = value
+            elif isinstance(value, list) and 0 <= index < len(value):
+                node = value[index]
+            else:
+                return None
+            if not isinstance(node, ast.AST):
+                return None
+        return node
+
+    truth_nodes = {
+        (node.test.lineno, node.test.col_offset, node.test.end_lineno, node.test.end_col_offset):
+        (node, node_path)
+        for node, node_path in walk_paths(original_tree)
+        if isinstance(node, (ast.If, ast.While, ast.IfExp))
+    }
+    none_nodes = {
+        (node.lineno, node.col_offset, node.end_lineno, node.end_col_offset):
+        (node, node_path)
+        for node, node_path in walk_paths(original_tree)
+        if isinstance(node, ast.Compare)
+    }
+
+    def masks(values, expected):
+        if len(values) != expected or any(type(value) is not str for value in values):
+            return None
+        try:
+            parsed = [int(value, 16) for value in values]
+        except ValueError:
+            return None
+        limit = 1 << count
+        return parsed if all(0 <= value < limit for value in parsed) else None
+
+    candidates = []
+    for entry in entries:
+        if len(entry) < 12:
+            continue
+        start, column, end, end_column, kind, source_form, operand_dump, side, state = entry[:9]
+        if (
+            any(type(value) is not int for value in (start, column, end, end_column))
+            or not any(start <= line <= end for line in change["lines"])
+            or state != "safe"
+            or type(source_form) is not str
+            or type(operand_dump) is not str
+        ):
+            continue
+        position = (start, column, end, end_column)
+        if kind == "truth":
+            found = truth_nodes.get(position)
+            parsed_masks = masks(entry[9:], 7)
+        elif kind == "none":
+            found = none_nodes.get(position)
+            parsed_masks = masks(entry[9:], 3)
+        else:
+            continue
+        if found is not None and parsed_masks is not None:
+            candidates.append((kind, source_form, operand_dump, side, found, parsed_masks))
+    accepted = []
+    for kind, source_form, operand_dump, side, (original_node, node_path), parsed in candidates:
+        changed_node = follow(changed_tree, node_path)
+        if kind == "truth":
+            if not isinstance(changed_node, type(original_node)):
+                continue
+            before = _truth_guard_form(original_node.test)
+            after = _truth_guard_form(changed_node.test)
+            if (
+                before is None
+                or after is None
+                or before[0] != source_form
+                or before[0] == after[0]
+                or ast.dump(before[1], include_attributes=False) != operand_dump
+                or ast.dump(before[1], include_attributes=False)
+                != ast.dump(after[1], include_attributes=False)
+                or ast.get_source_segment(source, before[1]) is None
+                or ast.get_source_segment(source, before[1])
+                != ast.get_source_segment(changed, after[1])
+            ):
+                continue
+            original_test, changed_test = original_node.test, changed_node.test
+            original_node.test = ast.Constant("__blast_radius_guard__")
+            changed_node.test = ast.Constant("__blast_radius_guard__")
+            equivalent = ast.dump(original_tree, include_attributes=False) == ast.dump(
+                changed_tree, include_attributes=False
+            )
+            original_node.test, changed_node.test = original_test, changed_test
+            if not equivalent:
+                continue
+            seen, unknown, *states = parsed
+            if (
+                unknown & ~seen
+                or any(state_mask & ~seen for state_mask in states)
+                or seen != unknown | states[0] | states[1] | states[2] | states[3] | states[4]
+            ):
+                continue
+            safe = seen & ~unknown
+            for old_result, new_result, state_mask in zip(
+                GUARD_RESULTS[before[0]], GUARD_RESULTS[after[0]], states
+            ):
+                if old_result != new_result:
+                    safe &= ~state_mask
+        else:
+            if not isinstance(changed_node, ast.Compare):
+                continue
+            before = _none_guard_form(original_node)
+            after = _none_guard_form(changed_node)
+            if (
+                before is None
+                or after is None
+                or before[0] != source_form
+                or before[2] != side
+                or before[2] != after[2]
+                or ast.dump(before[1], include_attributes=False) != operand_dump
+                or ast.dump(before[1], include_attributes=False)
+                != ast.dump(after[1], include_attributes=False)
+                or ast.get_source_segment(source, before[1]) is None
+                or ast.get_source_segment(source, before[1])
+                != ast.get_source_segment(changed, after[1])
+            ):
+                continue
+            operators = {before[0], after[0]}
+            if operators == {"Is", "Eq"}:
+                unsafe_index = 1
+                replacement = ast.Is()
+            elif operators == {"IsNot", "NotEq"}:
+                unsafe_index = 2
+                replacement = ast.IsNot()
+            else:
+                continue
+            original_operator, changed_operator = original_node.ops[0], changed_node.ops[0]
+            original_node.ops[0] = replacement
+            changed_node.ops[0] = type(replacement)()
+            equivalent = ast.dump(original_tree, include_attributes=False) == ast.dump(
+                changed_tree, include_attributes=False
+            )
+            original_node.ops[0], changed_node.ops[0] = original_operator, changed_operator
+            if not equivalent:
+                continue
+            seen, unsafe_eq, unsafe_ne = parsed
+            if unsafe_eq & ~seen or unsafe_ne & ~seen:
+                continue
+            safe = seen & ~parsed[unsafe_index]
+        accepted.append({index for index in range(count) if safe & (1 << index)})
+    if len(accepted) != 1:
+        return None
+    first_line = min(change["lines"], default=0)
+    if not preserves_function_bindings(change, path, first_line) or import_expression_hazard(
+        change, path, hook_attributes
+    ):
+        return None
+    return accepted[0]
+
+
+def guard_profile_indices(
+    change: dict,
+    path: str,
+    profile: dict,
+    model: dict,
+    hook_attributes: set[str] | None = None,
+) -> set[int] | None:
+    """Apply per-test exemptions to the ordinary exact-line dependency set."""
+
+    exemptions = guard_profile_exemptions(change, path, profile, hook_attributes)
+    if not exemptions:
+        return None
+    entry = model.get("f", {}).get(path)
+    if entry is None:
+        return None
+    line_sets = {line: set_id for line, set_id in entry.get("l", ())}
+    candidates = set()
+    for line in change["lines"]:
+        if (
+            not precise_coverage_line(path, line, change)
+            or not preserves_function_bindings(change, path, line)
+            or line not in line_sets
+        ):
+            return None
+        candidates.update(mapped_set(model, line_sets[line]))
+    return candidates - exemptions
+
+
 def tokenizer_setting_flow_edit(
     change: dict,
     path: str,
@@ -3469,6 +3779,7 @@ def selected_indices(
     default_model: dict | None = None,
     tokenizer_setting_flow_model: dict | None = None,
     tokenizer_keyword_context: TokenizerKeywordContext | None = None,
+    guard_model: dict | None = None,
 ) -> set[int]:
     selected: set[int] = set()
     changes = patch_changes(patch)
@@ -3593,6 +3904,14 @@ def selected_indices(
             change, path, predicate_model, model.get("h")
         ):
             continue
+
+        if guard_model is not None and len(changes) == 1:
+            guard_indices = guard_profile_indices(
+                change, path, guard_model, model, model.get("h")
+            )
+            if guard_indices is not None:
+                selected.update(guard_indices)
+                continue
 
         if derivation_model is not None:
             derived_indices = derived_arg_types_edit(
@@ -3738,6 +4057,22 @@ def main() -> None:
         zero_model = json.load(zero_model_file)
     with gzip.open(PREDICATE_PROFILE, "rt", encoding="utf-8") as predicate_model_file:
         predicate_model = json.load(predicate_model_file)
+    try:
+        guard_raw = GUARD_PROFILE.read_bytes()
+        if not GUARD_PROFILE_SHA256 or hashlib.sha256(guard_raw).hexdigest() != GUARD_PROFILE_SHA256:
+            raise ValueError("guard profile is not pinned")
+        guard_model = json.loads(gzip.decompress(guard_raw))
+    except (
+        OSError,
+        EOFError,
+        UnicodeError,
+        json.JSONDecodeError,
+        ValueError,
+        TypeError,
+        RecursionError,
+        MemoryError,
+    ):
+        guard_model = None
     with gzip.open(ARG_TYPE_DERIVATION_MODEL, "rt", encoding="utf-8") as derivation_model_file:
         derivation_model = json.load(derivation_model_file)
     with gzip.open(CLASS_ATTRIBUTE_MODEL, "rt", encoding="utf-8") as attribute_model_file:
@@ -3833,6 +4168,8 @@ def main() -> None:
         or predicate_model.get("t") != test_digest
     ):
         predicate_model = {"d": {}}
+    if not valid_guard_profile(guard_model, model.get("sha"), test_digest, len(tests)):
+        guard_model = None
     if (
         derivation_model.get("v") != 2
         or derivation_model.get("sha") != model.get("sha")
@@ -3922,6 +4259,7 @@ def main() -> None:
             default_model,
             tokenizer_setting_flow_model,
             tokenizer_keyword_context,
+            guard_model,
         )
         selected = [
             mapped_tests[index]
