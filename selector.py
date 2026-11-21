@@ -21,6 +21,8 @@ ARG_TYPE_DERIVATION_MODEL = Path(__file__).with_name(
 )
 CLASS_ATTRIBUTE_MODEL = Path(__file__).with_name("class_attribute_model.json.gz")
 MODULE_CONSTANT_MODEL = Path(__file__).with_name("module_constant_model.json.gz")
+CODE_REFLECTION_MODEL = Path(__file__).with_name("code_reflection_model.json.gz")
+CODE_REFLECTION_RANGES_SHA256 = "c84e754efedb3fbaa3323a6ceb381e180c46dd385f295a5b2b44e22ec7401338"
 FRESH_ALIAS_PROFILE = Path(__file__).with_name("fresh_alias_profile.json.gz")
 MAX_WORKERS = 8
 WORKER_COST_MS = 2_000
@@ -1899,6 +1901,89 @@ def path_dependency_cone(
     return selected, known
 
 
+def line_in_function(path: str, line: int) -> bool:
+    """Whether a source line is contained by any Python function code object."""
+    tree = source_tree(path)
+    return bool(
+        tree
+        and any(
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+            and min(
+                [
+                    node.lineno,
+                    *(decorator.lineno for decorator in node.decorator_list),
+                ]
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                else [node.lineno]
+            )
+            <= line
+            <= (node.end_lineno or node.lineno)
+            for node in ast.walk(tree)
+        )
+    )
+
+
+def code_reflection_indices(
+    path: str,
+    lines: set[int],
+    reflection_model: dict | None,
+    all_indices: set[int],
+) -> set[int]:
+    """Return readers which observe containing function code without calling it."""
+    if reflection_model is None:
+        return set(all_indices) if any(line_in_function(path, line) for line in lines) else set()
+    selected = set()
+    for start, end, _name, state, readers in reflection_model["d"].get(path, ()):
+        if state != "unobserved" and any(start <= line <= end for line in lines):
+            selected.update(readers)
+    return selected
+
+
+def valid_code_reflection_model(model: object, pinned_sha: str, test_digest: str, n: int) -> bool:
+    """Validate the complete bundled reflection profile before trusting any range."""
+    if (
+        not isinstance(model, dict)
+        or model.get("v") != 1
+        or model.get("sha") != pinned_sha
+        or model.get("t") != test_digest
+        or model.get("n") != n
+        or not isinstance(model.get("d"), dict)
+    ):
+        return False
+    ranges = []
+    for path in sorted(model["d"]):
+        entries = model["d"][path]
+        if type(path) is not str or not isinstance(entries, list):
+            return False
+        for entry in entries:
+            if not isinstance(entry, list) or len(entry) != 5:
+                return False
+            start, end, name, state, readers = entry
+            if (
+                type(start) is not int
+                or type(end) is not int
+                or start <= 0
+                or end < start
+                or type(name) is not str
+                or state not in {"observed", "unobserved", "import-read"}
+                or not isinstance(readers, list)
+                or any(type(index) is not int or index < 0 or index >= n for index in readers)
+                or readers != sorted(set(readers))
+                or (state == "unobserved" and readers)
+                or (state == "observed" and not readers)
+                or (state == "import-read" and readers != list(range(n)))
+            ):
+                return False
+            ranges.append([path, start, end, name])
+    ranges_digest = hashlib.sha256(
+        json.dumps(ranges, separators=(",", ":")).encode()
+    ).hexdigest()
+    return (
+        model.get("p") == CODE_REFLECTION_RANGES_SHA256
+        and ranges_digest == CODE_REFLECTION_RANGES_SHA256
+    )
+
+
 def selected_indices(
     patch: Path,
     model: dict,
@@ -1909,6 +1994,7 @@ def selected_indices(
     derivation_model: dict | None = None,
     attribute_model: dict | None = None,
     constant_model: dict | None = None,
+    reflection_model: dict | None = None,
     fresh_alias_model: dict | None = None,
 ) -> set[int]:
     selected: set[int] = set()
@@ -1949,6 +2035,9 @@ def selected_indices(
         ):
             selected.update(all_indices)
             continue
+        selected.update(
+            code_reflection_indices(path, change["lines"], reflection_model, all_indices)
+        )
         if inert_comment_addition(change, path):
             continue
         if proven_identity_equality(change, path, model):
@@ -2118,6 +2207,8 @@ def main() -> None:
         attribute_model = json.load(attribute_model_file)
     with gzip.open(MODULE_CONSTANT_MODEL, "rt", encoding="utf-8") as constant_model_file:
         constant_model = json.load(constant_model_file)
+    with gzip.open(CODE_REFLECTION_MODEL, "rt", encoding="utf-8") as reflection_model_file:
+        reflection_model = json.load(reflection_model_file)
     with gzip.open(FRESH_ALIAS_PROFILE, "rt", encoding="utf-8") as fresh_alias_file:
         fresh_alias_model = json.load(fresh_alias_file)
     test_digest = hashlib.sha256(
@@ -2152,6 +2243,10 @@ def main() -> None:
         or attribute_model.get("t") != test_digest
     ):
         attribute_model = {"d": {}}
+    if not valid_code_reflection_model(
+        reflection_model, model.get("sha"), test_digest, len(tests)
+    ):
+        reflection_model = None
     if (
         not isinstance(constant_model, dict)
         or constant_model.get("v") != 1
@@ -2189,6 +2284,7 @@ def main() -> None:
             derivation_model,
             attribute_model,
             constant_model,
+            reflection_model,
             fresh_alias_model,
         )
         selected = [mapped_tests[index] for index in indices if mapped_tests[index] is not None]

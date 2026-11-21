@@ -44,7 +44,7 @@ make check    # the output's format only
 
 `sample/answers.json` lists the tests each sample commit breaks and the kind of change it is. The practice and final commits are hidden, and so is everything your program prints when it runs on them. A rejected submission tells you which rule it broke and nothing more, so reproduce problems here.
 
-The current exact-image sample result is **97.819 simulated seconds with zero
+The current exact-image sample result is **97.830 simulated seconds with zero
 misses**. Seven recent selector-body measurements in the scorer container had a
 1.103-second median; process startup is additional and the board measures the
 complete container. Model collection used the pinned Python 3.13 image and the
@@ -135,6 +135,14 @@ module-qualified reads in normal and synchronous-worker runs. Only an
 otherwise identical same-type immutable literal edit at a safely observed
 assignment selects its exact readers; mutable values, import-time reads,
 rebinding, unresolved reflection/imports, or stale provenance force fallback.
+
+`tools/collect_code_reflections.py` and
+`tools/build_code_reflection_model.py` reproduce the unfiltered function-code
+reflection profile documented in `tools/CODE_REFLECTION_PROFILE.md`. It adds
+tests that inspect a function's code object even when they never execute the
+changed body. Both normal and synchronous-worker traces are required, nested
+function ranges compose conservatively, and stale or malformed provenance
+falls back to all tests for function changes.
 
 ## Submit
 
