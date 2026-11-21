@@ -30,6 +30,9 @@ ARG_TYPE_DERIVATION_MODEL = Path(__file__).with_name(
     "arg_type_derivation_model.json.gz"
 )
 CLASS_ATTRIBUTE_MODEL = Path(__file__).with_name("class_attribute_model.json.gz")
+TOKENIZER_SETTING_FLOW_MODEL = Path(__file__).with_name(
+    "tokenizer_setting_flow_model.json.gz"
+)
 MODULE_CONSTANT_MODEL = Path(__file__).with_name("module_constant_model.json.gz")
 CODE_REFLECTION_MODEL = Path(__file__).with_name("code_reflection_model.json.gz")
 CODE_REFLECTION_RANGES_SHA256 = "c84e754efedb3fbaa3323a6ceb381e180c46dd385f295a5b2b44e22ec7401338"
@@ -42,6 +45,18 @@ MAX_NODES_TEST_ID = "tests/test_parser.py::TestParser::test_max_nodes"
 # Filled only after all exact Python 3.13 traces build the final artifact.
 # An empty pin intentionally disables the profile.
 FUNCTION_DEFAULT_PROFILE_SHA256 = "f729c7f9c1eb6a30646b513006ad6829b159ca118e42714e07082bda966d2968"
+TOKENIZER_SETTING_FLOW_PROFILE_SHA256 = "1ef2cde294620c5767403894a6684900c88442ba30227da7b026349c1e56a056"
+TOKENIZER_SETTING_SELECTOR_MODEL_SHA256 = "d61c504e9a4a1006217e6702e1c6f05c04846b3dd5a09ec5572523fd8b2cb382"
+TOKENIZER_SETTING_CLASS_MODEL_SHA256 = "55eb6911b5d72408c7cd947adc08b07e6b41542a8da1ee86d908f74a1b0b6fd4"
+TOKENIZER_SETTING_BUILDER_SHA256 = "cd45fe8eace881ac34ade5b5ceb26b2fd5a684c10d330d3ed438e2cdd3517e7a"
+TOKENIZER_SETTING_TRACE_SHA256 = {
+    "normal": "4afe4afc075b26f4e947de92cfb5a9598ab1bea22c30f137d76ada1cc7c35ecf",
+    "synchronous-worker": "709a17acaf46f8516553f94577dac156e04f17ad0a5e7f88ab7bffa77f749868",
+}
+TOKENIZER_SETTING_MANIFEST_SHA256 = {
+    "normal": "ac04ff11895a8eaa24979d5bcddd83845c0aff961beff50b31548b72bb70f9ca",
+    "synchronous-worker": "63107844c3db71a3befb864fa2f34fbeff918604a835042fa31e7cea9eceef31",
+}
 GENERATOR_DISPATCH_INVENTORY_SHA256 = "3e3cb5a12da0fb01cd68f9b2fc789bc8d020523e015fea7016e04679c34d1dca"
 GENERATOR_DISPATCH_PROFILE_SHA256 = "8829e844dbd6870f2bca81cc7fb4f89f16ccdef7ecbba278748cdd850aeb1bfd"
 NEW_MODULE_PROFILE_SHA256 = "1b24ab53483bb1932d8139b80fa17e797a1974ee3078157a110c0f25b28f4e10"
@@ -264,6 +279,57 @@ def valid_function_default_model(model: object) -> bool:
         and model["p"] == FUNCTION_DEFAULT_PROFILE_SHA256
         and profile_digest == FUNCTION_DEFAULT_PROFILE_SHA256
     )
+
+
+def valid_tokenizer_setting_flow_model(
+    model: object, pinned_sha: str, test_digest: str, n: int
+) -> bool:
+    """Validate the complete narrow Tokenizer-to-core field certificate."""
+    if (
+        not isinstance(model, dict)
+        or set(model) != {"b", "c", "d", "m", "n", "p", "r", "s", "sha", "t", "v"}
+        or model.get("v") != 1
+        or model.get("sha") != pinned_sha
+        or model.get("t") != test_digest
+        or model.get("n") != n
+        or model.get("s") != TOKENIZER_SETTING_SELECTOR_MODEL_SHA256
+        or model.get("c") != TOKENIZER_SETTING_CLASS_MODEL_SHA256
+        or model.get("b") != TOKENIZER_SETTING_BUILDER_SHA256
+        or model.get("r") != TOKENIZER_SETTING_TRACE_SHA256
+        or model.get("m") != TOKENIZER_SETTING_MANIFEST_SHA256
+        or not isinstance(model.get("d"), dict)
+    ):
+        return False
+    try:
+        profile_digest = hashlib.sha256(
+            json.dumps(model["d"], sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    except (TypeError, ValueError, OverflowError, MemoryError, RecursionError):
+        return False
+    if (
+        profile_digest != TOKENIZER_SETTING_FLOW_PROFILE_SHA256
+        or model.get("p") != TOKENIZER_SETTING_FLOW_PROFILE_SHA256
+    ):
+        return False
+    for path, entries in model["d"].items():
+        if type(path) is not str or not isinstance(entries, list):
+            return False
+        for entry in entries:
+            if not isinstance(entry, list) or len(entry) != 7:
+                return False
+            start, end, qualname, name, value_dump, field, readers = entry
+            if (
+                type(start) is not int
+                or type(end) is not int
+                or start <= 0
+                or end < start
+                or any(type(value) is not str for value in (qualname, name, value_dump, field))
+                or not isinstance(readers, list)
+                or readers != sorted(set(readers))
+                or any(type(index) is not int or index < 0 or index >= n for index in readers)
+            ):
+                return False
+    return True
 
 
 class _AstIndex:
@@ -2150,6 +2216,107 @@ def profile_equivalent_predicate_edit(
     ) and not import_expression_hazard(change, path, hook_attributes)
 
 
+def tokenizer_setting_flow_edit(
+    change: dict,
+    path: str,
+    flow_model: dict,
+) -> set[int] | None:
+    """Narrow one certified Tokenizer setting to its core-field readers."""
+    entries = flow_model.get("d", {}).get(path)
+    source = pinned_sources().get(path)
+    changed = patched_source(change, path)
+    if (
+        not entries
+        or source is None
+        or changed is None
+        or path in PROCESS_SERIALIZATION_FILES
+        or any(COMMENT_DIRECTIVE.search(line) for line in change["payload"])
+    ):
+        return None
+    try:
+        original_tree = ast.parse(source, filename=path, type_comments=True)
+        changed_tree = ast.parse(changed, filename=path, type_comments=True)
+    except (SyntaxError, ValueError):
+        return None
+
+    def assignments(tree: ast.Module):
+        result = {}
+
+        def visit(body: list[ast.stmt], owners: tuple[str, ...]) -> None:
+            for statement in body:
+                if not isinstance(statement, ast.ClassDef):
+                    continue
+                owner = (*owners, statement.name)
+                for item in statement.body:
+                    if isinstance(item, ast.Assign):
+                        targets = item.targets
+                    elif isinstance(item, ast.AnnAssign):
+                        targets = [item.target]
+                    else:
+                        continue
+                    if len(targets) == 1 and isinstance(targets[0], ast.Name):
+                        key = (owner, targets[0].id)
+                        result[key] = item if key not in result else None
+                visit(statement.body, owner)
+
+        visit(tree.body, ())
+        return result
+
+    original_assignments = assignments(original_tree)
+    changed_assignments = assignments(changed_tree)
+    candidates = []
+    for start, end, qualname, name, value_dump, _field, readers in entries:
+        if not any(start <= line <= end for line in change["lines"]):
+            continue
+        key = (tuple(qualname.split(".")), name)
+        statement = original_assignments.get(key)
+        if (
+            statement is not None
+            and statement.lineno == start
+            and (statement.end_lineno or statement.lineno) == end
+            and ast.dump(statement.value, include_attributes=False) == value_dump
+        ):
+            candidates.append((key, statement, readers))
+    if len(candidates) != 1:
+        return None
+    key, original_statement, readers = candidates[0]
+    changed_statement = changed_assignments.get(key)
+    if changed_statement is None:
+        return None
+    try:
+        old_literal = ast.literal_eval(original_statement.value)
+        new_literal = ast.literal_eval(changed_statement.value)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return None
+
+    def safe_literal(value) -> bool:
+        return type(value) in (type(None), bool, int, float, complex, str, bytes) or (
+            type(value) is tuple and all(safe_literal(item) for item in value)
+        )
+
+    if (
+        not safe_literal(old_literal)
+        or not safe_literal(new_literal)
+        or type(old_literal) is not type(new_literal)
+        or old_literal == new_literal
+        or not isinstance(readers, list)
+        or any(
+            type(index) is not int
+            or index < 0
+            or index >= flow_model.get("n", 0)
+            for index in readers
+        )
+    ):
+        return None
+    original_statement.value = ast.Constant(value=None)
+    changed_statement.value = ast.Constant(value=None)
+    if ast.dump(original_tree, include_attributes=False) != ast.dump(
+        changed_tree, include_attributes=False
+    ):
+        return None
+    return set(readers)
+
+
 def class_attribute_edit(
     change: dict,
     path: str,
@@ -3026,6 +3193,7 @@ def selected_indices(
     generator_dispatch_model: dict | None = None,
     new_module_model: dict | None = None,
     default_model: dict | None = None,
+    tokenizer_setting_flow_model: dict | None = None,
 ) -> set[int]:
     selected: set[int] = set()
     changes = patch_changes(patch)
@@ -3132,6 +3300,14 @@ def selected_indices(
             )
             if derived_indices is not None:
                 selected.update(derived_indices)
+                continue
+
+        if tokenizer_setting_flow_model is not None and len(changes) == 1:
+            tokenizer_indices = tokenizer_setting_flow_edit(
+                change, path, tokenizer_setting_flow_model
+            )
+            if tokenizer_indices is not None:
+                selected.update(tokenizer_indices)
                 continue
 
         if attribute_model is not None:
@@ -3266,6 +3442,20 @@ def main() -> None:
         derivation_model = json.load(derivation_model_file)
     with gzip.open(CLASS_ATTRIBUTE_MODEL, "rt", encoding="utf-8") as attribute_model_file:
         attribute_model = json.load(attribute_model_file)
+    try:
+        tokenizer_raw = TOKENIZER_SETTING_FLOW_MODEL.read_bytes()
+        tokenizer_setting_flow_model = json.loads(gzip.decompress(tokenizer_raw))
+    except (
+        OSError,
+        EOFError,
+        UnicodeError,
+        json.JSONDecodeError,
+        ValueError,
+        TypeError,
+        RecursionError,
+        MemoryError,
+    ):
+        tokenizer_setting_flow_model = None
     with gzip.open(MODULE_CONSTANT_MODEL, "rt", encoding="utf-8") as constant_model_file:
         constant_model = json.load(constant_model_file)
     with gzip.open(CODE_REFLECTION_MODEL, "rt", encoding="utf-8") as reflection_model_file:
@@ -3346,6 +3536,16 @@ def main() -> None:
         or attribute_model.get("t") != test_digest
     ):
         attribute_model = {"d": {}}
+    if (
+        hashlib.sha256(MODEL.read_bytes()).hexdigest()
+        != TOKENIZER_SETTING_SELECTOR_MODEL_SHA256
+        or hashlib.sha256(CLASS_ATTRIBUTE_MODEL.read_bytes()).hexdigest()
+        != TOKENIZER_SETTING_CLASS_MODEL_SHA256
+        or not valid_tokenizer_setting_flow_model(
+            tokenizer_setting_flow_model, model.get("sha"), test_digest, len(tests)
+        )
+    ):
+        tokenizer_setting_flow_model = None
     if not valid_code_reflection_model(
         reflection_model, model.get("sha"), test_digest, len(tests)
     ):
@@ -3409,6 +3609,7 @@ def main() -> None:
             generator_dispatch_model,
             new_module_model,
             default_model,
+            tokenizer_setting_flow_model,
         )
         selected = [
             mapped_tests[index]
