@@ -1,5 +1,6 @@
 import copy
 import unittest
+from unittest import mock
 
 import selector
 import tpc_rule_fast as fast
@@ -61,11 +62,20 @@ class FastRuleTests(unittest.TestCase):
             profile, owner_id, ("other",), 10.0, enabled=True
         ))
 
-    def test_empty_selector_pin_is_identity(self):
+    def test_selector_pin_loads_and_kill_switch_is_identity(self):
         selected = [{"id": fast.TARGET, "number": 1, "seconds": 18.0}]
-        self.assertEqual(selector.TPC_RULE_FAST_PROFILE_SHA256, "")
-        self.assertIsNone(selector.load_tpc_rule_fast_profile())
-        self.assertIs(selector.apply_tpc_rule_fast_risk(selected, [], None), selected)
+        self.assertEqual(
+            selector.TPC_RULE_FAST_PROFILE_SHA256,
+            "d6248cb7c44b9c0a5dfe9ca30bf58030fd5a8eb8ba3f6e254ee584db21d69797",
+        )
+        self.assertIsNotNone(selector.load_tpc_rule_fast_profile())
+        with mock.patch.object(selector, "TPC_RULE_FAST_ENABLED", False):
+            self.assertIs(
+                selector.apply_tpc_rule_fast_risk(
+                    selected, [], selector.load_tpc_rule_fast_profile()
+                ),
+                selected,
+            )
 
 
 if __name__ == "__main__":

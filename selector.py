@@ -91,7 +91,8 @@ NEW_MODULE_INVENTORY_SHA256 = "b30749cd488217746916b61c0eb138d46ab9f3543b32e0dbb
 TPC_RULE_REPLAY_PROFILE = Path(__file__).with_name("tpc_rule_replay_profile.json.gz")
 TPC_RULE_REPLAY_PROFILE_SHA256 = ""
 TPC_RULE_FAST_PROFILE = Path(__file__).with_name("tpc_rule_fast_profile.json.gz")
-TPC_RULE_FAST_PROFILE_SHA256 = ""
+TPC_RULE_FAST_PROFILE_SHA256 = "d6248cb7c44b9c0a5dfe9ca30bf58030fd5a8eb8ba3f6e254ee584db21d69797"
+TPC_RULE_FAST_ENABLED = os.environ.get("BR_TPC_RULE_FAST", "1") != "0"
 MAX_WORKERS = 8
 WORKER_COST_MS = 2_000
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -4322,7 +4323,13 @@ def apply_tpc_rule_fast_risk(
             return selected
         retained = [test for test in selected if test.get("id") not in targets]
         saving = (best_cost_ms(selected) - best_cost_ms(retained)) / 1_000
-        fast_plan = plan_tpc_rule_fast(profile, evidence.owner_id, targets, saving)
+        fast_plan = plan_tpc_rule_fast(
+            profile,
+            evidence.owner_id,
+            targets,
+            saving,
+            enabled=TPC_RULE_FAST_ENABLED,
+        )
         if fast_plan is None or not verify_fast_boundaries(sources, profile, fast_plan):
             return selected
         return retained
