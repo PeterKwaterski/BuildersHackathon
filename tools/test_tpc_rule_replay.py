@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import io
 import unittest
 
@@ -18,6 +19,44 @@ class FakeExpression:
 
 
 class RuleReplayTests(unittest.TestCase):
+    @staticmethod
+    def valid_profile():
+        digest = "a" * 64
+        rows = []
+        for target, count in replay.TARGET_COUNTS.items():
+            for history in replay.HISTORIES:
+                for query in range(1, count + 1):
+                    for rule in replay.RULES:
+                        rows.append({
+                            "target": target, "history": history, "query": query,
+                            "rule": rule, "input": digest, "output": digest, "cpu_ns": 1,
+                        })
+        owner_id = "b" * 64
+        profile = {
+            "format": replay.PROFILE_FORMAT,
+            "identity": {name: digest for name in (
+                "sqlglot_tree", "tests_tree", "fixture_tree", "requirements_lock",
+                "collector_source",
+            )},
+            "rule_order": list(replay.RULES),
+            "coverage": {target: {"queries": count, "histories": list(replay.HISTORIES)}
+                         for target, count in replay.TARGET_COUNTS.items()},
+            "boundary_rows_sha256": replay.canonical_digest(rows),
+            "boundary_rows": rows,
+            "owners": {owner_id: {
+                "rule": replay.RULES[3], "source_sha256": "c" * 64,
+                "barriers": ["persistent_worker_state"], "state_independent": False,
+                "competition_risk": True, "call_graph_sha256": "d" * 64,
+            }},
+            "spawn_obligations": {name: False for name in (
+                "parse", "pickle_roundtrip", "fresh_import", "initializer",
+                "persistent_worker_predecessors", "table_reader_state",
+                "stdout_warnings_exceptions", "native_state",
+            )},
+        }
+        profile["collection_sha256"] = replay.canonical_digest(profile)
+        return profile, owner_id
+
     def test_boundary_binds_metadata_and_rendering(self):
         left = FakeExpression(1, {"line": 1})
         right = FakeExpression(1, {"line": 2})
@@ -89,6 +128,55 @@ class RuleReplayTests(unittest.TestCase):
             returned = noisy_rule(expression)
         self.assertEqual(replay.boundary_digest(expression), replay.boundary_digest(returned))
         self.assertEqual(output.getvalue(), "observable\n")
+
+    def test_risk_plan_is_separately_gated_and_labeled(self):
+        profile, owner_id = self.valid_profile()
+        patch = replay.PatchEvidence(owner_id, "c" * 64, replay.RULES[3])
+        target = next(iter(replay.TARGET_COUNTS))
+        self.assertIsNone(replay.plan_competition_risk_replay(
+            profile, patch, [target], 18.0, 4.0
+        ))
+        plan = replay.plan_competition_risk_replay(
+            profile, patch, [target], 18.0, 4.0, enabled=True
+        )
+        self.assertEqual(plan["tier"], "competition-risk")
+        self.assertIs(plan["proof"], False)
+        self.assertEqual(plan["unclosed_barriers"], ("persistent_worker_state",))
+
+    def test_risk_verifier_requires_complete_exact_slice(self):
+        profile, owner_id = self.valid_profile()
+        target = next(iter(replay.TARGET_COUNTS))
+        patch = replay.PatchEvidence(owner_id, "c" * 64, replay.RULES[3])
+        plan = replay.plan_competition_risk_replay(
+            profile, patch, [target], 18.0, 4.0, enabled=True
+        )
+        prospective = [
+            {key: row[key] for key in ("target", "history", "query", "rule", "input", "output")}
+            for row in profile["boundary_rows"]
+            if row["target"] == target and row["rule"] == replay.RULES[3]
+        ]
+        self.assertTrue(replay.verify_competition_risk_boundaries(profile, plan, prospective))
+        self.assertFalse(replay.verify_competition_risk_boundaries(profile, plan, prospective[:-1]))
+        tampered = copy.deepcopy(prospective)
+        tampered[0]["output"] = "e" * 64
+        self.assertFalse(replay.verify_competition_risk_boundaries(profile, plan, tampered))
+
+    def test_risk_tier_can_match_boundaries_despite_hidden_state(self):
+        profile, owner_id = self.valid_profile()
+        target = next(iter(replay.TARGET_COUNTS))
+        patch = replay.PatchEvidence(owner_id, "c" * 64, replay.RULES[3])
+        plan = replay.plan_competition_risk_replay(
+            profile, patch, [target], 18.0, 4.0, enabled=True
+        )
+        prospective = [
+            {key: row[key] for key in ("target", "history", "query", "rule", "input", "output")}
+            for row in profile["boundary_rows"]
+            if row["target"] == target and row["rule"] == replay.RULES[3]
+        ]
+        hidden_state = {"mutations": 1}
+        self.assertTrue(replay.verify_competition_risk_boundaries(profile, plan, prospective))
+        self.assertEqual(hidden_state["mutations"], 1)
+        self.assertIs(plan["proof"], False)
 
 
 if __name__ == "__main__":

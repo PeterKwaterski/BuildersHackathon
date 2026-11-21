@@ -18,6 +18,7 @@ from typing import Any
 
 PROFILE_FORMAT = "tpc-rule-replay-v1"
 ENABLE_ENV = "BR_TPC_RULE_REPLAY"
+RISK_ENABLE_ENV = "BR_TPC_RULE_REPLAY_RISK"
 
 RULES = (
     "sqlglot.optimizer.qualify.qualify",
@@ -216,6 +217,7 @@ def validate_profile(profile: object) -> dict[str, Any]:
             "source_sha256",
             "barriers",
             "state_independent",
+            "competition_risk",
             "call_graph_sha256",
         }:
             raise RuleReplayError("owner certificate shape mismatch")
@@ -226,6 +228,7 @@ def validate_profile(profile: object) -> dict[str, Any]:
             or not isinstance(owner["barriers"], list)
             or not all(isinstance(x, str) and x for x in owner["barriers"])
             or type(owner["state_independent"]) is not bool
+            or type(owner["competition_risk"]) is not bool
         ):
             raise RuleReplayError("owner certificate invalid")
 
@@ -312,4 +315,117 @@ def plan_strong_replay(
         "projected_net": packed_saving - projected_cpu,
         "profile": checked["collection_sha256"],
     }
+
+
+RISK_RULES = frozenset((RULES[0], RULES[3]))
+
+
+def plan_competition_risk_replay(
+    profile: object,
+    patch: PatchEvidence,
+    selected_targets: Sequence[str],
+    packed_saving: float,
+    projected_cpu: float,
+    *,
+    minimum_margin: float = 2.0,
+    enabled: bool | None = None,
+) -> dict[str, Any] | None:
+    """Plan an explicitly empirical qualify/unnest replay.
+
+    Unlike :func:`plan_strong_replay`, this lane does not claim that equal rule
+    boundaries prove absence of process state effects.  The tier and every
+    unclosed barrier remain in the returned plan so callers cannot confuse it
+    with a strong certificate.
+    """
+
+    if enabled is None:
+        enabled = os.environ.get(RISK_ENABLE_ENV) == "1"
+    if not enabled:
+        return None
+    try:
+        checked = validate_profile(profile)
+    except (RuleReplayError, KeyError, TypeError):
+        return None
+    targets = tuple(sorted(set(selected_targets)))
+    if not targets or not set(targets) <= set(TARGET_COUNTS):
+        return None
+    if (
+        patch.rule not in RISK_RULES
+        or not _is_digest(patch.owner_id)
+        or not _is_digest(patch.source_sha256)
+        or type(packed_saving) not in (int, float)
+        or type(projected_cpu) not in (int, float)
+        or type(minimum_margin) not in (int, float)
+        or projected_cpu < 0
+        or minimum_margin < 0
+        or packed_saving <= projected_cpu + minimum_margin
+    ):
+        return None
+    owner = checked["owners"].get(patch.owner_id)
+    if (
+        not owner
+        or owner["source_sha256"] != patch.source_sha256
+        or owner["rule"] != patch.rule
+        or owner["competition_risk"] is not True
+    ):
+        return None
+    return {
+        "tier": "competition-risk",
+        "proof": False,
+        "owner_id": patch.owner_id,
+        "rule": patch.rule,
+        "targets": targets,
+        "histories": HISTORIES,
+        "unclosed_barriers": tuple(owner["barriers"]),
+        "projected_net": packed_saving - projected_cpu,
+        "minimum_margin": minimum_margin,
+        "profile": checked["collection_sha256"],
+    }
+
+
+def verify_competition_risk_boundaries(
+    profile: object,
+    plan: Mapping[str, Any],
+    prospective_rows: object,
+) -> bool:
+    """Compare a complete prospective rule slice with authenticated baseline."""
+
+    try:
+        checked = validate_profile(profile)
+        if (
+            plan.get("tier") != "competition-risk"
+            or plan.get("proof") is not False
+            or plan.get("profile") != checked["collection_sha256"]
+            or plan.get("rule") not in RISK_RULES
+            or tuple(plan.get("histories", ())) != HISTORIES
+            or not isinstance(prospective_rows, list)
+        ):
+            return False
+        rule = plan["rule"]
+        targets = tuple(plan["targets"])
+        expected = {
+            (row["target"], row["history"], row["query"]): (row["input"], row["output"])
+            for row in checked["boundary_rows"]
+            if row["rule"] == rule and row["target"] in targets
+        }
+        if len(expected) != sum(TARGET_COUNTS[target] for target in targets) * len(HISTORIES):
+            return False
+        actual: dict[tuple[str, str, int], tuple[str, str]] = {}
+        for row in prospective_rows:
+            if not isinstance(row, dict) or set(row) != {
+                "target", "history", "query", "rule", "input", "output"
+            }:
+                return False
+            key = (row["target"], row["history"], row["query"])
+            if (
+                row["rule"] != rule
+                or not _is_digest(row["input"])
+                or not _is_digest(row["output"])
+                or key in actual
+            ):
+                return False
+            actual[key] = (row["input"], row["output"])
+        return actual == expected
+    except (RuleReplayError, KeyError, TypeError, ValueError):
+        return False
 

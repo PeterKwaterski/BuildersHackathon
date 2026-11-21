@@ -60,8 +60,10 @@ persistent-worker history fails.  Exact output also misses observable stdout.
   skeleton can form a plan only at this tier, only with the explicit kill
   switch, and only when projected CPU is below packed saving.
 * **Competition-risk:** empirical equality across the five histories without a
-  complete state theorem.  This may be useful for measuring upside, but it is
-  not represented as a passing plan and must not be silently promoted.
+  complete state theorem.  This has its own `BR_TPC_RULE_REPLAY_RISK` switch,
+  plan function, explicit `proof: false` label, retained barrier list, and
+  exact prospective-slice comparator.  It cannot be silently promoted to the
+  strong tier.
 
 The current complex owners mutate expression/scope structures and call broad
 helper graphs.  None has a strong certificate.  The next useful experiment is
@@ -69,4 +71,17 @@ to collect exact per-rule CPU and boundary digests for all 99 TPC-DS queries,
 then measure a fresh-process prospective `qualify`/`unnest_subqueries`
 boundary replay.  This quantifies the competition-risk lane; it does not close
 the worker-state proof.
+
+Exact uncontended CPU collection command (JSON stays outside the repository):
+
+```sh
+PYTHONPATH=. python tools/benchmark_tpc_rule_boundaries.py \
+  --tree /home/silverdisk/BuildersHackathon-tokenizer-poison-source-standalone \
+  --repeats 7 > /tmp/tpc-rule-cpu.json
+sha256sum tools/benchmark_tpc_rule_boundaries.py /tmp/tpc-rule-cpu.json
+```
+
+Adding `--snapshots` measures the deliberately expensive complete boundary
+serialization separately.  It should be run after the rule-only collection,
+not mixed into the replay economics.
 
