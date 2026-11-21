@@ -76,6 +76,9 @@ WORKER_COST_MS = 2_000
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 COMPARISON_OPERATOR = re.compile(r"\bis\s+not\b|\bis\b|==|!=")
 COMMENT_DIRECTIVE = re.compile(r"(?i)(coding\s*[:=]|type:|noqa|pragma|fmt:|pyright|mypy)")
+RUNTIME_COMMENT_DIRECTIVE = re.compile(
+    r"(?i)(?:type\s*:\s*ignore\b|noqa\b|pragma\b|fmt\s*:|pyright\b|mypy\b)"
+)
 ASCII_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 NEW_MODULE_PATH = re.compile(
     r"sqlglot(?:/[A-Za-z_][A-Za-z0-9_]*)*/[A-Za-z_][A-Za-z0-9_]*\.py\Z"
@@ -444,6 +447,45 @@ def semantic_code_fingerprint(code: types.CodeType) -> tuple:
         code.co_exceptiontable,
         code.co_linetable,
         tuple(code.co_positions()),
+    )
+
+
+def positionless_code_fingerprint(code: types.CodeType) -> tuple:
+    """Return every executable CodeType field except source coordinates.
+
+    A comment-only insertion can shift line tables without changing Python
+    execution.  Those positions remain observable to tests which enter the
+    containing function (and are therefore retained by ordinary scope
+    coverage) or explicitly read its code object (retained by the independent
+    reflection profile).  This fingerprint proves the directive changed no
+    opcode, constant, binding, exception edge, closure, or nested code object.
+    """
+
+    def constant(value):
+        if isinstance(value, types.CodeType):
+            return ("code", positionless_code_fingerprint(value))
+        if isinstance(value, tuple):
+            return ("tuple", tuple(constant(item) for item in value))
+        if isinstance(value, frozenset):
+            return ("frozenset", tuple(sorted((constant(item) for item in value), key=repr)))
+        return (type(value).__qualname__, repr(value))
+
+    return (
+        code.co_name,
+        code.co_qualname,
+        code.co_argcount,
+        code.co_posonlyargcount,
+        code.co_kwonlyargcount,
+        code.co_nlocals,
+        code.co_stacksize,
+        code.co_flags,
+        code.co_code,
+        tuple(constant(item) for item in code.co_consts),
+        code.co_names,
+        code.co_varnames,
+        code.co_freevars,
+        code.co_cellvars,
+        code.co_exceptiontable,
     )
 
 
@@ -1276,6 +1318,54 @@ def comment_only_addition(change: dict) -> bool:
         and not change["removed"]
         and all(line.strip().startswith("#") for line in change["added"] if line.strip())
     )
+
+
+def runtime_inert_directive_comment(change: dict, path: str) -> bool:
+    """Admit only comment directives with bytecode-identical execution.
+
+    Encoding declarations remain global because they can change how Python
+    decodes the complete file.  The supported lint/type/format directives are
+    runtime comments; a default AST comparison and a recursively complete
+    position-free code comparison independently require that to be true for
+    this exact patch.  Ordinary scope and reflection ownership still run after
+    this gate, retaining every test that can observe shifted source positions.
+    """
+
+    # The pinned typing regression reads every ``sqlglot/typing`` source file
+    # directly before parsing it.  That source-observer family is intentionally
+    # outside the code-reflection artifact, so keep those paths broad.
+    if (
+        not comment_only_addition(change)
+        or not path.endswith(".py")
+        or path == "sqlglot/typing/__init__.py"
+        or path.startswith("sqlglot/typing/")
+    ):
+        return False
+    comments = [line.strip() for line in change["added"] if line.strip()]
+    if (
+        not comments
+        or any(not line.startswith("#") for line in comments)
+        or any(re.search(r"(?i)coding\s*[:=]", line) for line in comments)
+        or any(RUNTIME_COMMENT_DIRECTIVE.search(line) is None for line in comments)
+    ):
+        return False
+    original = pinned_sources().get(path)
+    prospective = patched_source(change, path)
+    if original is None or prospective is None:
+        return False
+    try:
+        original_tree = ast.parse(original, filename=path, type_comments=False)
+        prospective_tree = ast.parse(prospective, filename=path, type_comments=False)
+        original_code = compile(original, path, "exec", dont_inherit=True)
+        prospective_code = compile(prospective, path, "exec", dont_inherit=True)
+        return (
+            ast.dump(original_tree, include_attributes=False)
+            == ast.dump(prospective_tree, include_attributes=False)
+            and positionless_code_fingerprint(original_code)
+            == positionless_code_fingerprint(prospective_code)
+        )
+    except (SyntaxError, ValueError, TypeError, OverflowError, MemoryError, RecursionError):
+        return False
 
 
 def patched_source(change: dict, path: str) -> str | None:
@@ -2919,6 +3009,29 @@ def code_reflection_indices(
     return selected
 
 
+def file_code_reflection_indices(
+    path: str,
+    reflection_model: dict | None,
+    all_indices: set[int],
+) -> set[int]:
+    """Retain every reader of code objects whose positions can shift.
+
+    Inserting a source line can change position metadata for functions after
+    the insertion even when no executable field changes.  The ordinary range
+    lookup covers the containing function only, so directive-comment proofs
+    conservatively retain every observed code-object reader in the file.
+    Missing evidence fails closed for the complete candidate set.
+    """
+
+    if reflection_model is None:
+        return set(all_indices)
+    selected = set()
+    for _start, _end, _name, state, readers in reflection_model["d"].get(path, ()):
+        if state != "unobserved":
+            selected.update(readers)
+    return selected
+
+
 def _nested_code_objects(root: types.CodeType) -> list[types.CodeType]:
     result = []
     pending = [root]
@@ -3401,14 +3514,21 @@ def selected_indices(
             # Python parses the whole module before any test can import it.
             selected.update(all_indices)
             continue
+        directive_comment_proved = False
         if comment_only_addition(change) and any(
             COMMENT_DIRECTIVE.search(line) for line in change["added"]
         ):
-            selected.update(all_indices)
-            continue
+            if reflection_model is None or not runtime_inert_directive_comment(change, path):
+                selected.update(all_indices)
+                continue
+            directive_comment_proved = True
         reflection_indices = code_reflection_indices(
             path, change["lines"], reflection_model, all_indices
         )
+        if directive_comment_proved:
+            reflection_indices.update(
+                file_code_reflection_indices(path, reflection_model, all_indices)
+            )
         if inert_comment_addition(change, path):
             selected.update(reflection_indices)
             continue

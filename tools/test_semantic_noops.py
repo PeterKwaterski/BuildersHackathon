@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -44,6 +45,147 @@ def change_for(original: str, changed: str) -> dict:
         changes = selector.patch_changes(path)
     assert len(changes) == 1
     return changes[0]
+
+
+class RuntimeDirectiveCommentTest(unittest.TestCase):
+    def setUp(self) -> None:
+        selector._PINNED_SOURCES = None
+        selector._SOURCE_TREES.clear()
+        selector._SOURCE_INDEXES.clear()
+
+    def test_positionless_certificate_accepts_runtime_directives(self) -> None:
+        original = "def f(value):\n    return value + 1\n"
+        for directive in (
+            "    # type: ignore\n",
+            "    # noqa: F401\n",
+            "    # pragma: no cover\n",
+            "    # fmt: off\n",
+            "    # pyright: ignore\n",
+            "    # mypy: ignore-errors\n",
+        ):
+            with self.subTest(directive=directive):
+                edit = change_for(original, "def f(value):\n" + directive + "    return value + 1\n")
+                self.assertTrue(selector.runtime_inert_directive_comment(edit, PATH))
+
+    def test_certificate_rejects_encoding_code_and_non_directive_comments(self) -> None:
+        original = "def f(value):\n    return value + 1\n"
+        changed_sources = (
+            "# coding: utf-8\n" + original,
+            "def f(value):\n    # ordinary comment\n    return value + 1\n",
+            "def f(value):\n    value += 1  # noqa\n    return value + 1\n",
+        )
+        for changed in changed_sources:
+            with self.subTest(changed=changed):
+                edit = change_for(original, changed)
+                self.assertFalse(selector.runtime_inert_directive_comment(edit, PATH))
+
+    def test_certificate_rejects_class_firstline_changes(self) -> None:
+        original = "class A:\n    pass\n\nclass B:\n    pass\n"
+        changed = "class A:\n    # noqa\n    pass\n\nclass B:\n    pass\n"
+        edit = change_for(original, changed)
+        self.assertFalse(selector.runtime_inert_directive_comment(edit, PATH))
+
+    def test_certificate_rejects_source_observed_typing_package(self) -> None:
+        original = "def f(value):\n    return value + 1\n"
+        changed = "def f(value):\n    # noqa\n    return value + 1\n"
+        edit = change_for(original, changed)
+        typing_path = "sqlglot/typing/fake.py"
+        edit["old"] = typing_path
+        edit["new"] = typing_path
+        selector._PINNED_SOURCES = {typing_path: original}
+        self.assertFalse(selector.runtime_inert_directive_comment(edit, typing_path))
+
+    def test_type_ignore_changes_only_type_comment_ast(self) -> None:
+        original = "def f(value):\n    return value + 1\n"
+        changed = "def f(value):\n    # type: ignore\n    return value + 1\n"
+        edit = change_for(original, changed)
+        self.assertTrue(selector.runtime_inert_directive_comment(edit, PATH))
+        self.assertEqual(
+            ast.dump(ast.parse(original, type_comments=False), include_attributes=False),
+            ast.dump(ast.parse(changed, type_comments=False), include_attributes=False),
+        )
+        self.assertNotEqual(
+            ast.dump(ast.parse(original, type_comments=True), include_attributes=False),
+            ast.dump(ast.parse(changed, type_comments=True), include_attributes=False),
+        )
+
+    def test_fingerprint_resource_failure_falls_back(self) -> None:
+        original = "def f(value):\n    return value + 1\n"
+        changed = "def f(value):\n    # noqa\n    return value + 1\n"
+        edit = change_for(original, changed)
+        with mock.patch.object(
+            selector, "positionless_code_fingerprint", side_effect=RecursionError
+        ):
+            self.assertFalse(selector.runtime_inert_directive_comment(edit, PATH))
+
+    def test_selector_retains_scope_and_reflection_owners_not_global_fallback(self) -> None:
+        original = (
+            "def f(value):\n    return value + 1\n\n"
+            "def g(value):\n    return value - 1\n"
+        )
+        changed = (
+            "def f(value):\n    # type: ignore\n    return value + 1\n\n"
+            "def g(value):\n    return value - 1\n"
+        )
+        selector._PINNED_SOURCES = {PATH: original}
+        patch = "diff --git a/{0} b/{0}\n".format(PATH) + "".join(
+            difflib.unified_diff(
+                original.splitlines(True),
+                changed.splitlines(True),
+                fromfile="a/" + PATH,
+                tofile="b/" + PATH,
+            )
+        )
+        model = {
+            "a": {},
+            "f": {
+                PATH: {
+                    "f": 2,
+                    "i": [],
+                    "l": [[2, 0], [5, 1]],
+                    "s": [[1, 2, "f", 0], [4, 5, "f", 1]],
+                }
+            },
+            "h": set(),
+            "q": {},
+            "r": {},
+            "x": {},
+            "z": [[9], [10], [7, 9, 10, 11]],
+        }
+        reflection = {
+            "d": {
+                PATH: [
+                    [1, 2, "f", "observed", [7]],
+                    [4, 5, "g", "observed", [10]],
+                ]
+            }
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            patch_path = Path(temporary, "change.patch")
+            patch_path.write_text(patch)
+            self.assertEqual(
+                selector.selected_indices(
+                    patch_path,
+                    model,
+                    {7, 9, 10, 11},
+                    reflection_model=reflection,
+                ),
+                {7, 9, 10},
+            )
+            self.assertEqual(
+                selector.selected_indices(
+                    patch_path,
+                    model,
+                    {7, 9, 10, 11},
+                    reflection_model=None,
+                ),
+                {7, 9, 10, 11},
+            )
+
+    def tearDown(self) -> None:
+        selector._PINNED_SOURCES = None
+        selector._SOURCE_TREES.clear()
+        selector._SOURCE_INDEXES.clear()
 
 
 class LocalBindingRenameTest(unittest.TestCase):
