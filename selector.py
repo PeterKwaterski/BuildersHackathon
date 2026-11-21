@@ -178,6 +178,41 @@ def precise_coverage_line(path: str, line: int) -> bool:
     )
     if not isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
         return False
+    if (
+        definition.body
+        and definition.body[0] is statement
+        and isinstance(statement, ast.Expr)
+        and isinstance(statement.value, ast.Constant)
+        and isinstance(statement.value.value, str)
+    ):
+        # A function docstring is observable through ``__doc__`` even though
+        # executing the function never produces a coverage event for it.
+        return False
+    if path not in _SOURCE_CODE:
+        try:
+            _SOURCE_CODE[path] = compile(
+                pinned_sources()[path], path, "exec", dont_inherit=True
+            )
+        except (SyntaxError, ValueError, OverflowError):
+            return False
+    first_line = min(
+        [definition.lineno, *(decorator.lineno for decorator in definition.decorator_list)]
+    )
+    matches = []
+    pending = [_SOURCE_CODE[path]]
+    while pending:
+        code = pending.pop()
+        if code.co_name == definition.name and code.co_firstlineno == first_line:
+            matches.append(code)
+        pending.extend(
+            constant for constant in code.co_consts if isinstance(constant, types.CodeType)
+        )
+    if len(matches) != 1 or not any(
+        code_line == line for _, _, code_line in matches[0].co_lines()
+    ):
+        # Constant-folded statements and other non-emitting source lines can
+        # be semantically observable after a patch despite having no coverage.
+        return False
     if statement.lineno == (statement.end_lineno or statement.lineno) == line:
         return True
     header_expressions = []
@@ -743,6 +778,175 @@ def mapped_set(model: dict, set_id: int) -> set[int]:
     return set(model["z"][set_id])
 
 
+def deferred_factory_shape(value: ast.AST, tree: ast.Module, path: str) -> tuple | None:
+    """Recognize a call that only allocates and returns a closure.
+
+    Literal arguments are evaluated before the call, while the factory itself
+    may only define one undecorated, default-free nested function and return it.
+    With deferred annotations this executes no user expression and has no
+    observable effect unless the resulting dictionary value is read.
+    """
+    if not (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and not any(isinstance(argument, ast.Starred) for argument in value.args)
+        and all(keyword.arg is not None for keyword in value.keywords)
+    ):
+        return None
+    for argument in [*value.args, *(keyword.value for keyword in value.keywords)]:
+        try:
+            ast.literal_eval(argument)
+        except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+            return None
+
+    def effective_bindings(module: ast.Module, name: str) -> tuple[list[ast.AST], bool]:
+        """Inventory every possible binding of a factory name conservatively."""
+        bindings: list[ast.AST] = []
+        dynamic = False
+        for node in ast.walk(module):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if node.name == name:
+                    bindings.append(node)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    if alias.name == "*":
+                        dynamic = True
+                    bound = alias.asname or (
+                        alias.name.split(".", 1)[0]
+                        if isinstance(node, ast.Import)
+                        else alias.name
+                    )
+                    if bound == name:
+                        bindings.append(alias)
+            elif isinstance(node, ast.Name) and isinstance(
+                node.ctx, (ast.Store, ast.Del)
+            ):
+                if node.id == name:
+                    bindings.append(node)
+            elif isinstance(node, ast.Attribute) and isinstance(
+                node.ctx, (ast.Store, ast.Del)
+            ):
+                if node.attr == name:
+                    bindings.append(node)
+            elif isinstance(node, ast.ExceptHandler) and node.name == name:
+                bindings.append(node)
+            elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name == name:
+                bindings.append(node)
+            elif isinstance(node, ast.MatchMapping) and node.rest == name:
+                bindings.append(node)
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                if node.func.id in {"exec", "globals", "locals"}:
+                    dynamic = True
+                elif (
+                    node.func.id == "setattr"
+                    and len(node.args) >= 2
+                    and isinstance(node.args[1], ast.Constant)
+                    and node.args[1].value == name
+                ):
+                    dynamic = True
+        return bindings, dynamic
+
+    definition_tree = tree
+    definition_name = value.func.id
+    definitions = [
+        statement
+        for statement in definition_tree.body
+        if isinstance(statement, ast.FunctionDef)
+        and statement.name == definition_name
+    ]
+    selected_binding: ast.AST | None = definitions[0] if len(definitions) == 1 else None
+    selected_binding_line = (
+        selected_binding.lineno if isinstance(selected_binding, ast.FunctionDef) else None
+    )
+    if not definitions:
+        imports = [
+            (statement, alias)
+            for statement in tree.body
+            if isinstance(statement, ast.ImportFrom)
+            and statement.level == 0
+            and statement.module
+            for alias in statement.names
+            if (alias.asname or alias.name) == value.func.id
+        ]
+        if len(imports) != 1:
+            return None
+        statement, alias = imports[0]
+        selected_binding = alias
+        selected_binding_line = statement.lineno
+        imported_path = f"{statement.module.replace('.', '/')}.py"
+        imported_source = pinned_sources().get(imported_path)
+        if imported_source is None:
+            return None
+        try:
+            definition_tree = ast.parse(
+                imported_source, filename=imported_path, type_comments=True
+            )
+        except (SyntaxError, ValueError):
+            return None
+        definition_name = alias.name
+        definitions = [
+            item
+            for item in definition_tree.body
+            if isinstance(item, ast.FunctionDef)
+            and item.name == definition_name
+        ]
+    if len(definitions) != 1:
+        return None
+    factory = definitions[0]
+    call_bindings, call_dynamic = effective_bindings(tree, value.func.id)
+    definition_bindings, definition_dynamic = effective_bindings(
+        definition_tree, definition_name
+    )
+    if (
+        call_dynamic
+        or definition_dynamic
+        or selected_binding is None
+        or selected_binding_line is None
+        or selected_binding_line >= value.lineno
+        or len(call_bindings) != 1
+        or call_bindings[0] is not selected_binding
+        or len(definition_bindings) != 1
+        or definition_bindings[0] is not factory
+    ):
+        return None
+    if factory.decorator_list or len(factory.body) != 2:
+        return None
+    nested, returned = factory.body
+    if not (
+        isinstance(nested, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and not nested.decorator_list
+        and not getattr(nested, "type_params", ())
+        and not nested.args.defaults
+        and not any(default is not None for default in nested.args.kw_defaults)
+        and isinstance(returned, ast.Return)
+        and isinstance(returned.value, ast.Name)
+        and returned.value.id == nested.name
+    ):
+        return None
+    deferred_annotations = any(
+        isinstance(statement, ast.ImportFrom)
+        and statement.module == "__future__"
+        and any(alias.name == "annotations" for alias in statement.names)
+        for statement in definition_tree.body
+    )
+    if not deferred_annotations:
+        annotations = [
+            nested.returns,
+            *(argument.annotation for argument in nested.args.posonlyargs),
+            *(argument.annotation for argument in nested.args.args),
+            *(argument.annotation for argument in nested.args.kwonlyargs),
+            nested.args.vararg.annotation if nested.args.vararg else None,
+            nested.args.kwarg.annotation if nested.args.kwarg else None,
+        ]
+        if any(annotation is not None for annotation in annotations):
+            return None
+    return (
+        definition_name,
+        len(value.args),
+        tuple(keyword.arg for keyword in value.keywords),
+    )
+
+
 def zero_reader_dict_edit(
     change: dict,
     path: str,
@@ -815,21 +1019,23 @@ def zero_reader_dict_edit(
         return False
     original_dict = original_statement.value
     changed_dict = changed_statement.value
-    if any(item is None for item in (*original_dict.keys, *changed_dict.keys)):
-        return False
     if len(original_dict.keys) != len(changed_dict.keys):
         return False
     original_key_dumps = [
-        ast.dump(item, include_attributes=False) for item in original_dict.keys
+        ast.dump(item, include_attributes=False) if item is not None else None
+        for item in original_dict.keys
     ]
     changed_key_dumps = [
-        ast.dump(item, include_attributes=False) for item in changed_dict.keys
+        ast.dump(item, include_attributes=False) if item is not None else None
+        for item in changed_dict.keys
     ]
     if original_key_dumps != changed_key_dumps:
         return False
 
     runtime_keys = []
     for key_node in original_dict.keys:
+        if key_node is None:
+            continue
         try:
             runtime_key = ast.literal_eval(key_node)
             hash(runtime_key)
@@ -849,14 +1055,24 @@ def zero_reader_dict_edit(
     ]
     if not changed_values:
         return False
+    all_changed_values_are_deferred_factories = True
     for index in changed_values:
-        if original_key_dumps[index] not in zero_keys:
+        if original_key_dumps[index] is None or original_key_dumps[index] not in zero_keys:
             return False
         try:
             ast.literal_eval(original_dict.values[index])
             ast.literal_eval(changed_dict.values[index])
         except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
-            return False
+            original_shape = deferred_factory_shape(
+                original_dict.values[index], original_tree, path
+            )
+            changed_shape = deferred_factory_shape(
+                changed_dict.values[index], changed_tree, path
+            )
+            if original_shape is None or original_shape != changed_shape:
+                return False
+        else:
+            all_changed_values_are_deferred_factories = False
         original_dict.values[index] = ast.Constant(value=None)
         changed_dict.values[index] = ast.Constant(value=None)
 
@@ -864,7 +1080,9 @@ def zero_reader_dict_edit(
         changed_tree, include_attributes=False
     ):
         return False
-    return not import_expression_hazard(change, path, hook_attributes)
+    return all_changed_values_are_deferred_factories or not import_expression_hazard(
+        change, path, hook_attributes
+    )
 
 
 def profile_equivalent_predicate_edit(
@@ -1159,11 +1377,12 @@ def selected_indices(
         for line in changed_lines:
             if (
                 change["removed"]
-                and line in line_sets
                 and precise_coverage_line(path, line)
                 and preserves_function_bindings(change, path, line)
             ):
-                selected.update(mapped_set(model, line_sets[line]))
+                set_id = line_sets.get(line)
+                if set_id is not None:
+                    selected.update(mapped_set(model, set_id))
                 continue
             containing = [scope for scope in scopes if scope[0] <= line <= scope[1]]
             if containing:
