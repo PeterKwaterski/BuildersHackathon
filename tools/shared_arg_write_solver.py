@@ -1066,9 +1066,12 @@ class OwnershipAnalyzer:
                                     getattr(builtins, statement.exc.func.id), BaseException
                                 )
                                 and all(
-                                    self._expression_safe(
-                                        info, argument, aliases, values, domain, fields
+                                    (
+                                        effect := self._expression_safe(
+                                            info, argument, aliases, values, domain, fields
+                                        )
                                     ).safe
+                                    and not effect.identity
                                     for argument in statement.exc.args
                                 )
                             ):
@@ -1105,9 +1108,32 @@ class OwnershipAnalyzer:
 
         body = info.node.body if not isinstance(info.node, ast.Lambda) else []
         safe = bool(body) and visit_block(body)
+
+        def normal_fallthrough(statements: list[ast.stmt]) -> bool:
+            falls = True
+            for statement in statements:
+                if not falls:
+                    break
+                if isinstance(statement, (ast.Return, ast.Raise)):
+                    falls = False
+                elif isinstance(statement, ast.If):
+                    falls = normal_fallthrough(statement.body) or (
+                        normal_fallthrough(statement.orelse) if statement.orelse else True
+                    )
+                elif isinstance(statement, ast.Match):
+                    # Exhaustiveness is difficult to establish source-only.
+                    falls = True
+                elif isinstance(statement, (ast.Try, ast.TryStar, ast.With, ast.AsyncWith)):
+                    falls = True
+                else:
+                    # Loops can execute zero times; all other handled
+                    # statements continue normally.
+                    falls = True
+            return falls
+
         result = OwnershipResult(
             safe,
-            safe and bool(returns) and all(returns),
+            safe and bool(returns) and all(returns) and not normal_fallthrough(body),
             frozenset(written),
         )
         self.active.remove(key)

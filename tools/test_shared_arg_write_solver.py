@@ -138,6 +138,7 @@ class SharedArgumentSolverTests(unittest.TestCase):
             "saved.append(instance)\n",
             "unknown([instance])\n",
             "getattr(instance, 'value')\n",
+            "raise ValueError(instance)\n",
             "try:\n        unknown(instance)\n    except Exception:\n        pass\n",
             "alias = instance\n    for _ in ():\n        alias = None\n    unknown(alias)\n",
             "if saved:\n        alias = instance\n    else:\n        alias = None\n    unknown(alias)\n",
@@ -179,6 +180,20 @@ class SharedArgumentSolverTests(unittest.TestCase):
             "    item.set('key', True)\n"
         )[1]
         self.assertEqual(descriptor["stats"]["contained_fresh_receiver_calls"], 0)
+        partial_return = self.solve(
+            "class Box:\n"
+            "    def __init__(self):\n"
+            "        self.value = None\n"
+            "    def set(self, key, value):\n"
+            "        self.value = value\n"
+            "def identity(instance, flag):\n"
+            "    if flag:\n"
+            "        return instance\n"
+            "def candidate(flag):\n"
+            "    item = identity(Box(), flag)\n"
+            "    item.set('key', True)\n"
+        )[1]
+        self.assertEqual(partial_return["stats"]["contained_fresh_receiver_calls"], 0)
     def test_alias_and_container_escape(self):
         _, _, functions = self.solve(
             "def sink(value):\n"
