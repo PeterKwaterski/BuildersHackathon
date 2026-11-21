@@ -122,6 +122,29 @@ class FormattingEquivalenceTests(unittest.TestCase):
     def test_executable_change_is_rejected(self):
         self.assertFalse(self.proved("def f():\n    return 1\n", "def f():\n    return 2\n"))
 
+    def test_non_whitespace_change_rejects_before_full_source_work(self):
+        change, path = self.change("def f():\n    return 1\n", "def f():\n    return 2\n")
+        with mock.patch.object(
+            selector.tokenize, "generate_tokens", side_effect=AssertionError("late proof ran")
+        ):
+            self.assertFalse(selector.position_preserving_formatting_edit(change, path))
+
+    def test_internal_spacing_rejects_before_full_source_work(self):
+        change, path = self.change("def f(g):\n    return g(1)\n", "def f(g):\n    return  g(1)\n")
+        with mock.patch.object(
+            selector.tokenize, "generate_tokens", side_effect=AssertionError("late proof ran")
+        ):
+            self.assertFalse(selector.position_preserving_formatting_edit(change, path))
+
+    def test_moved_identical_line_rejects_before_full_source_work(self):
+        before = "class C:\n    A = 1\n    B = 2\n    C = 3\n"
+        after = "class C:\n    B = 2\n    A = 1\n    C = 3\n"
+        change, path = self.change(before, after)
+        with mock.patch.object(
+            selector.tokenize, "generate_tokens", side_effect=AssertionError("late proof ran")
+        ):
+            self.assertFalse(selector.position_preserving_formatting_edit(change, path))
+
     def test_resource_failure_fails_closed(self):
         change, path = self.change("X = 1\n", "X = 1  \n")
         with mock.patch.object(selector, "semantic_code_fingerprint", side_effect=MemoryError):
@@ -145,6 +168,36 @@ class FormattingEquivalenceTests(unittest.TestCase):
             expected = selector.mapped_set(model, model["x"][path])
             self.assertEqual(selected, expected)
             self.assertNotEqual(selected, all_indices)
+
+    def test_unseen_non_python_directive_fixture_falls_back_globally(self):
+        path = "tests/fixtures/optimizer/not_in_the_pinned_model.sql"
+        with tempfile.TemporaryDirectory() as temporary:
+            patch = Path(temporary) / "fixture.patch"
+            patch.write_text(
+                "diff --git a/{0} b/{0}\n--- a/{0}\n+++ b/{0}\n"
+                "@@ -1 +1,2 @@\n SELECT 1;\n+# type: ignore\n".format(path)
+            )
+            with gzip.open(selector.MODEL, "rt", encoding="utf-8") as model_file:
+                model = json.load(model_file)
+            model["h"] = set(model.get("h", ()))
+            all_indices = set(range(len(model["t"])))
+            selected = selector.selected_indices(patch, model, all_indices)
+        self.assertEqual(selected, all_indices)
+
+    def test_python_suffixed_fixture_directive_remains_global(self):
+        path = "tests/fixtures/optimizer/not_in_the_pinned_model.py"
+        with tempfile.TemporaryDirectory() as temporary:
+            patch = Path(temporary) / "fixture.patch"
+            patch.write_text(
+                "diff --git a/{0} b/{0}\n--- a/{0}\n+++ b/{0}\n"
+                "@@ -1 +1,2 @@\n value = 1\n+# type: ignore\n".format(path)
+            )
+            with gzip.open(selector.MODEL, "rt", encoding="utf-8") as model_file:
+                model = json.load(model_file)
+            model["h"] = set(model.get("h", ()))
+            all_indices = set(range(len(model["t"])))
+            selected = selector.selected_indices(patch, model, all_indices)
+        self.assertEqual(selected, all_indices)
 
     def test_python_type_ignore_still_fails_closed_without_reflection(self):
         change, path = self.change(

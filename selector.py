@@ -1536,6 +1536,54 @@ def inert_comment_addition(change: dict, path: str) -> bool:
     )
 
 
+def _formatting_lexical_candidate(change: dict) -> bool:
+    """Cheaply admit only edge/comment whitespace replacements.
+
+    This is only a performance prefilter.  The complete token, AST, and code
+    comparison remains authoritative for every admitted candidate.
+    """
+
+    removed = change.get("removed")
+    added = change.get("added")
+    if (
+        not isinstance(removed, list)
+        or not isinstance(added, list)
+        or not removed
+        or len(removed) != len(added)
+        or any(type(line) is not str for line in (*removed, *added))
+    ):
+        return False
+
+    for hunk in change.get("hunks", ()):
+        if not isinstance(hunk, dict) or not isinstance(hunk.get("lines"), list):
+            return False
+        markers = [marker for marker, _line in hunk["lines"] if marker != " "]
+        # A source move can have identical removed/added text while changing
+        # declaration order.  Require ordinary replacement ordering.
+        if not markers or markers[0] != "-" or markers[-1] != "+":
+            return False
+        seen_addition = False
+        for marker in markers:
+            if marker == "+":
+                seen_addition = True
+            elif marker != "-" or seen_addition:
+                return False
+
+    def plausible_line(old: str, new: str) -> bool:
+        if old.rstrip() == new.rstrip():
+            return True
+        old_head, old_marker, old_comment = old.partition("#")
+        new_head, new_marker, new_comment = new.partition("#")
+        return bool(
+            old_marker
+            and new_marker
+            and old_comment == new_comment
+            and old_head.rstrip() == new_head.rstrip()
+        )
+
+    return all(plausible_line(old, new) for old, new in zip(removed, added))
+
+
 def position_preserving_formatting_edit(change: dict, path: str) -> bool:
     """Prove a replacement changes only lexically invisible formatting.
 
@@ -1555,8 +1603,7 @@ def position_preserving_formatting_edit(change: dict, path: str) -> bool:
         or path == "sqlglot/typing/__init__.py"
         or path.startswith("sqlglot/typing/")
         or path in PROCESS_SERIALIZATION_FILES
-        or not change.get("removed")
-        or len(change["removed"]) != len(change.get("added", ()))
+        or not _formatting_lexical_candidate(change)
         or change.get("non_lf")
         or change.get("no_newline_marker")
         or any(COMMENT_DIRECTIVE.search(line) for line in change.get("payload", ()))
