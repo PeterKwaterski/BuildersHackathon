@@ -36,6 +36,13 @@ from tpc_fixture_verify import verify as verify_tpcds_fixture
 import registry_key_research
 import query_modifier_research
 import tokenizer_setting_branch
+from tpc_rule_replay import (
+    PatchEvidence,
+    TARGET_COUNTS as TPC_RULE_TARGET_COUNTS,
+    plan_competition_risk_replay,
+    validate_profile as validate_tpc_rule_replay_profile,
+    verify_competition_risk_boundaries,
+)
 
 DATA = Path("/data")
 PINNED_SOURCE_ROOT = Path("/app/sqlglot-pinned")
@@ -79,6 +86,8 @@ NEW_MODULE_MODEL = Path(__file__).with_name("new_module_model.json.gz")
 NEW_MODULE_PROFILE_SHA256 = "1b24ab53483bb1932d8139b80fa17e797a1974ee3078157a110c0f25b28f4e10"
 NEW_MODULE_SOURCE_SHA256 = "b7f798c9e8015db63d6e160ab73f59828e445cef8739cfb383aba44d5de5f5f0"
 NEW_MODULE_INVENTORY_SHA256 = "b30749cd488217746916b61c0eb138d46ab9f3543b32e0dbbd4688c0ac9ee12b"
+TPC_RULE_REPLAY_PROFILE = Path(__file__).with_name("tpc_rule_replay_profile.json.gz")
+TPC_RULE_REPLAY_PROFILE_SHA256 = ""
 MAX_WORKERS = 8
 WORKER_COST_MS = 2_000
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -4149,6 +4158,68 @@ def selected_indices(
     return selected
 
 
+def load_tpc_rule_replay_profile() -> dict | None:
+    if not TPC_RULE_REPLAY_PROFILE_SHA256:
+        return None
+    try:
+        raw = TPC_RULE_REPLAY_PROFILE.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != TPC_RULE_REPLAY_PROFILE_SHA256:
+            return None
+        return validate_tpc_rule_replay_profile(
+            json.loads(gzip.decompress(raw).decode("utf-8"))
+        )
+    except Exception:
+        return None
+
+
+def resolve_tpc_rule_patch(_changes: list[dict], _profile: dict):
+    """Disabled port seam; promoted with the prospective collector and pin."""
+
+    return None
+
+
+def apply_tpc_rule_replay_risk(
+    selected: list[dict],
+    changes: list[dict],
+    profile: dict | None,
+    collector=None,
+    *,
+    resolver=resolve_tpc_rule_patch,
+    planner=plan_competition_risk_replay,
+    verifier=verify_competition_risk_boundaries,
+) -> list[dict]:
+    if profile is None or collector is None:
+        return selected
+    try:
+        resolved = resolver(changes, profile)
+        if resolved is None:
+            return selected
+        evidence, sources = resolved
+        if not isinstance(evidence, PatchEvidence):
+            return selected
+        target_ids = tuple(sorted(
+            test["id"] for test in selected if test.get("id") in TPC_RULE_TARGET_COUNTS
+        ))
+        if not target_ids:
+            return selected
+        retained = [test for test in selected if test.get("id") not in target_ids]
+        packed_saving = (best_cost_ms(selected) - best_cost_ms(retained)) / 1_000
+        owner = profile["owners"][evidence.owner_id]
+        projected_cpu = sum(owner["risk_cpu_s"][target] for target in target_ids)
+        plan = planner(
+            profile, evidence, target_ids, packed_saving, projected_cpu
+        )
+        if plan is None:
+            return selected
+        rows = collector(sources, profile, plan)
+        return retained if verifier(profile, plan, rows) else selected
+    except Exception:
+        return selected
+
+
+TPC_RULE_REPLAY_COLLECTOR = None
+
+
 def _main() -> None:
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     tests_by_id = {test["id"]: test for test in tests}
@@ -4270,6 +4341,7 @@ def _main() -> None:
             test_file_indices.setdefault(test["file"], set()).add(index)
     modeled_ids = set(model["t"])
     unmapped_tests = [test for test in tests if test["id"] not in modeled_ids]
+    tpc_rule_replay_profile = load_tpc_rule_replay_profile()
 
     jobs = []
     tpc_ids = set().union(*TPC_PLAN_TESTS.values())
@@ -4307,6 +4379,12 @@ def _main() -> None:
             tokenizer_setting_branch_model=tokenizer_setting_branch_model,
         )
         selected = [mapped_tests[index] for index in indices if mapped_tests[index] is not None]
+        selected = apply_tpc_rule_replay_risk(
+            selected,
+            patch_changes(patch),
+            tpc_rule_replay_profile,
+            TPC_RULE_REPLAY_COLLECTOR,
+        )
         selected.extend(unmapped_tests)
         without_all_tpc = [test for test in selected if test["id"] not in tpc_ids]
         prospective_saving = best_cost_ms(selected) - best_cost_ms(without_all_tpc)

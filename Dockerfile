@@ -31,6 +31,7 @@ COPY tpc_entry_key_access.py /app/tpc_entry_key_access.py
 COPY semantic.py /app/semantic.py
 COPY shared_arg_write_runtime.py /app/shared_arg_write_runtime.py
 COPY none_static_runtime.py /app/none_static_runtime.py
+COPY tpc_rule_replay.py /app/tpc_rule_replay.py
 COPY selector_model.json.gz /app/selector_model.json.gz
 COPY semantic_sources.json.gz /app/semantic_sources.json.gz
 COPY zero_reader_model.json.gz /app/zero_reader_model.json.gz
