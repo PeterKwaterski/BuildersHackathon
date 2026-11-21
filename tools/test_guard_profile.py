@@ -24,7 +24,9 @@ from collect_guard_observations import (
     Instrumenter,
     NONE_HOOK,
     TRUTH_HOOK,
+    canonical_digest,
     copy_tracked_tree,
+    exact_roster,
     executed_materialized_digest,
     generated_support_digest,
     generated_support_sources,
@@ -33,6 +35,7 @@ from collect_guard_observations import (
     sensitive_test_files,
     sensitive_test_owners,
     synchronous_worker_tests,
+    test_rosters,
     tracked_inventory_digest,
 )
 from guard_profile_common import none_comparison, none_comparison_safe, truth_form, truth_state
@@ -371,6 +374,159 @@ class GuardProfileTests(unittest.TestCase):
         changed = dict(sources)
         changed["guard_profile_plugin.py"] += "\n# tampered\n"
         self.assertNotEqual(expected, generated_support_digest(changed))
+
+    def test_runnable_and_skipped_rosters_are_unique_disjoint_and_order_bound(self):
+        document = {
+            "tests": [{"id": "tests/test_a.py::test_a"}, {"id": "tests/test_b.py::test_b"}],
+            "skipped": ["tests/test_c.py::test_c", "tests/test_d.py::test_d"],
+        }
+        runnable, skipped = test_rosters(document)
+        self.assertEqual(runnable, ["tests/test_a.py::test_a", "tests/test_b.py::test_b"])
+        self.assertEqual(skipped, ["tests/test_c.py::test_c", "tests/test_d.py::test_d"])
+        self.assertNotEqual(canonical_digest(skipped), canonical_digest(list(reversed(skipped))))
+        self.assertTrue(exact_roster(sorted(runnable), set(runnable)))
+        self.assertFalse(exact_roster(list(reversed(runnable)), set(runnable)))
+
+        attacks = (
+            {**document, "extra": []},
+            {**document, "tests": [*document["tests"], document["tests"][0]]},
+            {**document, "skipped": [document["tests"][0]["id"]]},
+            {**document, "skipped": [1]},
+        )
+        for attack in attacks:
+            with self.subTest(attack=attack):
+                with self.assertRaises(SystemExit):
+                    test_rosters(attack)
+
+    def test_builder_requires_exact_runnable_declared_and_actual_skip_rosters(self):
+        runnable = {"tests/test_a.py::test_a"}
+        skipped = {"tests/test_b.py::test_b"}
+        manifest = {
+            "duplicate_protocols": [],
+            "tests": sorted(runnable),
+            "skipped": sorted(skipped),
+            "skipped_protocols": sorted(skipped),
+            "xfailed_reports": [],
+        }
+        guard_builder.require_manifest_rosters(manifest, runnable, skipped, "normal")
+        for field, value in (
+            ("tests", []),
+            ("skipped", []),
+            ("skipped_protocols", []),
+            ("skipped", [*skipped, "tests/test_extra.py::test_extra"]),
+            ("skipped_protocols", [*skipped, *skipped]),
+            ("duplicate_protocols", [*runnable]),
+            ("xfailed_reports", [*skipped]),
+        ):
+            with self.subTest(field=field, value=value):
+                changed = {**manifest, field: value}
+                with self.assertRaisesRegex(SystemExit, "inadmissible normal test rosters"):
+                    guard_builder.require_manifest_rosters(changed, runnable, skipped, "normal")
+
+    def test_declared_skip_protocol_is_unowned_and_actual_skip_is_separate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            support = root / "support"
+            support.mkdir()
+            sources = generated_support_sources()
+            for name in (
+                "_br_guard_common.py",
+                "_br_guard_profile.py",
+                "guard_profile_plugin.py",
+            ):
+                (support / name).write_text(sources[name])
+            (support / "pytest.py").write_text(
+                "def hookimpl(function=None, **kwargs):\n"
+                "    if function is None:\n"
+                "        return lambda decorated: decorated\n"
+                "    return function\n"
+            )
+            script = r'''
+import os
+import guard_profile_plugin as plugin
+import _br_guard_profile as tracker
+
+skipped = "tests/test_skip.py::test_skip"
+ordinary = "tests/test_ok.py::test_ok"
+label = "truth:sqlglot/x.py:1:0:1:1"
+tracker.integrity = lambda: True
+
+class Item:
+    def __init__(self, nodeid):
+        self.nodeid = nodeid
+
+class Report:
+    def __init__(self, nodeid, skipped, wasxfail=None):
+        self.nodeid = nodeid
+        self.skipped = skipped
+        if wasxfail is not None:
+            self.wasxfail = wasxfail
+
+def protocol(nodeid, body):
+    hook = plugin.pytest_runtest_protocol(Item(nodeid), None)
+    next(hook)
+    body()
+    try:
+        next(hook)
+    except StopIteration:
+        pass
+    else:
+        raise AssertionError("protocol wrapper did not finish")
+
+def skipped_body():
+    assert tracker.CURRENT_TEST is None
+    assert "BR_PARENT_TEST" not in os.environ
+    tracker.observe_truth(label, 1)
+
+def ordinary_body():
+    assert tracker.CURRENT_TEST == ordinary
+    assert os.environ["BR_PARENT_TEST"] == ordinary
+    tracker.observe_truth(label, 1)
+
+protocol(skipped, skipped_body)
+plugin.pytest_runtest_logreport(Report(skipped, True))
+protocol(ordinary, ordinary_body)
+plugin.pytest_runtest_logreport(Report(ordinary, False))
+
+assert plugin.EXECUTED == {ordinary}
+assert plugin.SKIPPED_PROTOCOLS == {skipped}
+assert plugin.REPORTED_SKIPPED == {skipped}
+assert plugin.DUPLICATE_PROTOCOLS == set()
+assert plugin.XFAILED_REPORTS == set()
+assert tracker.CURRENT_TEST is None
+assert "BR_PARENT_TEST" not in os.environ
+for owners in tracker.document()[label].values():
+    assert skipped not in owners
+assert "__NO_TEST__" in tracker.document()[label]["seen"]
+assert ordinary in tracker.document()[label]["seen"]
+
+# Duplicate runnable and declared-skip protocols must remain visible rather
+# than being collapsed by the set-valued exact rosters.
+protocol(ordinary, ordinary_body)
+protocol(skipped, skipped_body)
+assert plugin.DUPLICATE_PROTOCOLS == {ordinary, skipped}
+
+# XFAIL and XPASS both carry wasxfail and must poison the evidence even when
+# their skipped outcomes differ.
+plugin.pytest_runtest_logreport(Report(ordinary, True, "expected failure"))
+plugin.pytest_runtest_logreport(Report(ordinary, False, "unexpected pass"))
+assert plugin.XFAILED_REPORTS == {ordinary}
+'''
+            environment = os.environ.copy()
+            environment.update({
+                "BR_PARENT_TEST": "",
+                "GUARD_SENSITIVE_OWNERS": "[]",
+                "GUARD_SKIPPED_TESTS": json.dumps(["tests/test_skip.py::test_skip"]),
+                "PYTHONPATH": str(support),
+            })
+            result = subprocess.run(
+                [sys.executable, "-c", script],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_sensitive_owner_fast_path_is_inert_and_owner_changes_do_not_leak(self):
         with tempfile.TemporaryDirectory() as temporary:

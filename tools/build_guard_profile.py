@@ -17,6 +17,7 @@ from collect_guard_observations import (
     canonical_digest,
     copy_tracked_tree,
     executed_materialized_digest,
+    exact_roster,
     generated_support_digest,
     git_tracked_paths,
     materialized_digest,
@@ -24,6 +25,7 @@ from collect_guard_observations import (
     sensitive_test_owners,
     synchronous_worker_tests,
     tracked_inventory_digest,
+    test_rosters,
 )
 from guard_profile_common import STATE_NAMES, source_sites
 
@@ -71,7 +73,8 @@ def load_pairs(manifests: list[Path], traces: list[Path]) -> dict[str, tuple[dic
             for key in (
                 "collector_sha256", "common_sha256", "environment_sha256",
                 "executed_materialized_sha256", "instrumented", "materialized_sha256", "mode", "python",
-                "runtime_image", "sensitive_files_sha256", "sensitive_owners_sha256", "source_sha",
+                "runtime_image", "sensitive_files_sha256", "sensitive_owners_sha256",
+                "skipped_test_digest", "source_sha",
                 "source_tree", "test_digest", "support_sha256", "tracked_inventory_sha256",
                 "worker_transform_sha256",
             )
@@ -93,6 +96,21 @@ def require_sensitive_quarantine(
             raise SystemExit(f"{mode} trace dropped source-derived sensitive owners")
 
 
+def require_manifest_rosters(
+    manifest: dict, expected: set[str], expected_skipped: set[str], mode: str
+) -> None:
+    """Require exact runnable protocols and exact declared/actual skips."""
+
+    if (
+        not exact_roster(manifest.get("tests"), expected)
+        or not exact_roster(manifest.get("skipped"), expected_skipped)
+        or not exact_roster(manifest.get("skipped_protocols"), expected_skipped)
+        or not exact_roster(manifest.get("duplicate_protocols"), set())
+        or not exact_roster(manifest.get("xfailed_reports"), set())
+    ):
+        raise SystemExit(f"inadmissible {mode} test rosters")
+
+
 def main() -> None:
     args = arguments()
     source = args.source.resolve()
@@ -110,16 +128,12 @@ def main() -> None:
     source_tree = subprocess.check_output(
         ["git", "-C", str(source), "rev-parse", "HEAD^{tree}"], text=True
     ).strip()
-    tests = json.loads(args.tests.read_text())["tests"]
-    test_ids = [test["id"] for test in tests]
-    if (
-        any(type(test_id) is not str for test_id in test_ids)
-        or len(test_ids) != len(set(test_ids))
-    ):
-        raise SystemExit("test manifest IDs must be unique strings")
+    test_ids, skipped_test_ids = test_rosters(json.loads(args.tests.read_text()))
     indices = {test_id: index for index, test_id in enumerate(test_ids)}
     expected = set(test_ids)
+    expected_skipped = set(skipped_test_ids)
     test_digest = hashlib.sha256("\0".join(test_ids).encode()).hexdigest()
+    skipped_test_digest = canonical_digest(skipped_test_ids)
     pairs = load_pairs(args.manifest, args.trace)
     tracked = git_tracked_paths(source)
     expected_tracked_inventory = tracked_inventory_digest(tracked)
@@ -139,15 +153,11 @@ def main() -> None:
 
     metadata_values = defaultdict(set)
     for mode, (manifest, trace) in pairs.items():
-        manifest_tests = manifest.get("tests")
+        require_manifest_rosters(manifest, expected, expected_skipped, mode)
         if (
             manifest.get("exitstatus") != 0
             or manifest.get("child_complete") is not True
             or manifest.get("pool_task_complete") is not True
-            or not isinstance(manifest_tests, list)
-            or any(type(test_id) is not str for test_id in manifest_tests)
-            or manifest_tests != sorted(set(manifest_tests))
-            or set(manifest_tests) != expected
             or manifest.get("source_sha") != revision
             or manifest.get("source_tree") != source_tree
             or manifest.get("test_digest") != test_digest
@@ -170,7 +180,8 @@ def main() -> None:
         for key in (
             "collector_sha256", "common_sha256", "environment_sha256", "instrumented",
             "materialized_sha256", "python", "runtime_image",
-            "sensitive_files_sha256", "sensitive_owners_sha256", "support_sha256",
+            "sensitive_files_sha256", "sensitive_owners_sha256", "skipped_test_digest",
+            "support_sha256",
             "tracked_inventory_sha256",
             "worker_transform_sha256",
         ):
@@ -200,6 +211,7 @@ def main() -> None:
         or metadata_values["materialized_sha256"] != {expected_materialized}
         or metadata_values["sensitive_files_sha256"] != {expected_sensitive}
         or metadata_values["sensitive_owners_sha256"] != {expected_sensitive_owners}
+        or metadata_values["skipped_test_digest"] != {skipped_test_digest}
         or metadata_values["tracked_inventory_sha256"] != {expected_tracked_inventory}
         or metadata_values["worker_transform_sha256"] != {expected_worker_transform}
         or metadata_values["instrumented"] != {len(inventory)}

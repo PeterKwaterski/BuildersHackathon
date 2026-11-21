@@ -1,6 +1,6 @@
 # Guard-profile memory-quarantine re-audit
 
-Verdict: **RE-AUDIT-READY / NO-COLLECT**
+Verdict: **FULL-RERUN-READY / NO-SHIP**
 
 Scope: uncommitted repair based on clean checkpoint
 `42f37b0ecc0886215412cb6aa677388b594d39c5`. This review covers only the
@@ -126,3 +126,88 @@ controlled fresh full normal trace followed by the full synchronous trace.
 Until both exit 0 and pass all existing admission checks, the current status is
 **NO-COLLECT / NO-SHIP**. Do not reuse the rejected evidence and do not commit
 or enable the selector as part of this repair verdict.
+
+## Fresh full-normal result and second admission invalidation
+
+After the memory repair was frozen at
+`750b4df7791face528985c9a4454ccd7a7d014e2`, one fresh complete normal-mode
+collection ran with the same immutable image, network-none/read-only launch,
+`/tmp` tmpfs, and 3-CPU/4-GiB/512-PID limits. The suite itself was fully green:
+**1,620 passed, 1 skipped, 25,440 subtests passed** in 575.30 seconds. The
+original generator-memory test passed every dialect subtest. Container OOM was
+false; total wall time was 581.65 seconds and maximum host-side RSS was 27,660
+KiB.
+
+The collector nevertheless exited 1 after pytest, so this is not admitted
+normal evidence and no synchronous trace was launched. The exact error was
+`inadmissible suite manifest; 0 tests missing, 1 extra`. The extra protocol is
+the pinned manifest's sole declared skip:
+`tests/dialects/test_sqlite.py::TestSQLite::test_variadic_iif_execution`, which
+is guarded by the source's SQLite-version `unittest.skipIf` condition. It is
+not a generated or collection-only node. Both the earlier failed full trace and
+this fresh trace recorded the same 1,621 unique protocols: all 1,620 runnable
+IDs plus that exact declared skip.
+
+The fresh files remain diagnostic only:
+
+- manifest SHA-256:
+  `4a3525e48928f8bdc36e791c2d8c4d9a2daeb10411fb59aad5f5db652bf321fb`
+- trace SHA-256:
+  `c933de77a62151ccd75939783499cc975337891acc07c9946b0e4b075285c751`
+- manifest pytest exit status: 0; outer collector/container exit: 1
+- child logs: 30/30 complete; pool tasks: 2,183 complete
+- all 27 sensitive owners escaped; sensitive event memberships: 0
+- generator-memory event memberships: 0
+
+The trace self-hash and trace/manifest metadata match, and source/image/tree
+provenance matches the locked run. Those facts diagnose the isolated roster
+admission defect but do not override the hard outer exit-1 rejection.
+
+## Strict skipped-roster repair pending independent review
+
+The pinned test file intentionally has two disjoint inventories: 1,620 runnable
+test records and one ordered declared-skip ID. The old collector and builder
+parsed only `tests`, while pytest correctly invoked all 1,621 runtest protocols.
+The uncommitted repair preserves the existing runnable digest
+`31a019981e19c3d1b18d929066da7e118fcf3d57696a360f7b9d31ce3a87bc89`
+and profile width `n=1620`, and separately provenance-binds the ordered skip
+digest
+`78e98e7eeb218780aab5e7ba228a5047cd742fd34598ece7570bc00d3568e6fe`.
+
+The plugin now records three exact canonical rosters: runnable protocols,
+declared-skip protocols, and actual skipped reports. It also records duplicate
+protocol invocations and every XFAIL/XPASS report separately; collector and
+builder admission require both exceptional rosters to be exactly empty. A declared-skip protocol
+runs with `CURRENT_TEST=None` and without `BR_PARENT_TEST`; therefore any
+setup/skip-time production observation is labeled `__NO_TEST__` and globally
+poisons that site instead of manufacturing an owner outside the 1,620-bit
+model. Collector and builder both require runnable equality and exact equality
+of declared-skip protocols and actual skip reports to the pinned skip roster.
+Missing, extra, duplicate, overlapping, unexpectedly passing, newly skipped,
+XFAIL, and XPASS nodes all fail closed.
+
+The focused suite is now 34 tests. It includes ordered-digest, malformed roster,
+duplicate/overlap, missing/extra declared protocol, missing/extra actual report,
+duplicate runnable and declared-skip runtime protocol, XFAIL/XPASS report,
+plugin ownership, and unattributed-observation attacks. **34/34 passed in five
+consecutive fresh processes**; six-file `py_compile`, all five generated-support
+compilations, and `git diff --check` passed. The old full-normal files are
+rejected by the new exact-roster gate.
+
+Current uncommitted code hashes are:
+
+- collector:
+  `967178a9127367d5ec6bd35f43a943264e9a312e632e821ad13770f352d296cb`
+- builder:
+  `146760b56198d5cec0f024ba1de1191b25930599320b82bca0b9a69e4e26ed61`
+- focused tests:
+  `2a620e059db07411d3e2fe943e026e354211943c538bc8974a5c6c5096640804`
+- generated support:
+  `b8a24b5e5ee34ff5dff32c83dbc4a48f29efd23c8b43b48baadfba01385208d8`
+
+The independent source/LIGHT re-audit found and repaired the runtime duplicate
+protocol and XFAIL/XPASS census gaps, then returned **FULL-RERUN-READY**. This
+second repair has not run in Docker. Do not reinterpret the earlier green
+pytest summary as admitted evidence and do not reuse either failed full trace;
+the next evidence must be a fresh normal collection followed by a fresh
+synchronous collection from an explicitly authorized checkpoint.

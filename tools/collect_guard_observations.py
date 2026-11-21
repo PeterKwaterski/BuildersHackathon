@@ -273,6 +273,47 @@ def canonical_digest(value: object) -> str:
     ).hexdigest()
 
 
+def test_rosters(document: object) -> tuple[list[str], list[str]]:
+    """Return exact runnable/skipped inventories from the pinned test manifest."""
+
+    if not isinstance(document, dict) or set(document) != {"tests", "skipped"}:
+        raise SystemExit("test manifest must contain only tests and skipped rosters")
+    tests = document["tests"]
+    skipped = document["skipped"]
+    if (
+        not isinstance(tests, list)
+        or any(not isinstance(test, dict) or type(test.get("id")) is not str for test in tests)
+        or not isinstance(skipped, list)
+        or any(type(test_id) is not str for test_id in skipped)
+    ):
+        raise SystemExit("test manifest contains malformed test IDs")
+    test_ids = [test["id"] for test in tests]
+    if (
+        len(test_ids) != len(set(test_ids))
+        or len(skipped) != len(set(skipped))
+        or set(test_ids) & set(skipped)
+    ):
+        raise SystemExit("test manifest rosters must be unique and disjoint")
+    return test_ids, list(skipped)
+
+
+def exact_roster(value: object, expected: set[str]) -> bool:
+    """Return whether a manifest roster is canonical and exactly expected."""
+
+    return (
+        isinstance(value, list)
+        and all(type(test_id) is str for test_id in value)
+        and value == sorted(set(value))
+        and set(value) == expected
+    )
+
+
+def roster_set(value: object) -> set[str]:
+    """Return string roster members, or an empty set for malformed input."""
+
+    return set(value) if isinstance(value, list) and all(type(item) is str for item in value) else set()
+
+
 TRACKER = r'''from __future__ import annotations
 
 import atexit
@@ -484,6 +525,11 @@ import pytest
 import _br_guard_profile
 
 EXECUTED = set()
+SKIPPED_PROTOCOLS = set()
+REPORTED_SKIPPED = set()
+DUPLICATE_PROTOCOLS = set()
+XFAILED_REPORTS = set()
+EXPECTED_SKIPPED = frozenset(json.loads(os.environ["GUARD_SKIPPED_TESTS"]))
 
 def sentries(directory, stage):
     result = {}
@@ -507,9 +553,19 @@ def sentries(directory, stage):
 
 @pytest.hookimpl(hookwrapper=True, tryfirst=True)
 def pytest_runtest_protocol(item, nextitem):
-    EXECUTED.add(item.nodeid)
-    _br_guard_profile.CURRENT_TEST = item.nodeid
-    os.environ["BR_PARENT_TEST"] = item.nodeid
+    if item.nodeid in EXECUTED or item.nodeid in SKIPPED_PROTOCOLS:
+        DUPLICATE_PROTOCOLS.add(item.nodeid)
+    if item.nodeid in EXPECTED_SKIPPED:
+        # Setup and skip evaluation are outside the runnable test model. Any
+        # production observation here is deliberately unattributed and poisons
+        # that site globally rather than creating an unindexable owner.
+        SKIPPED_PROTOCOLS.add(item.nodeid)
+        _br_guard_profile.CURRENT_TEST = None
+        os.environ.pop("BR_PARENT_TEST", None)
+    else:
+        EXECUTED.add(item.nodeid)
+        _br_guard_profile.CURRENT_TEST = item.nodeid
+        os.environ["BR_PARENT_TEST"] = item.nodeid
     if not _br_guard_profile.integrity():
         raise RuntimeError("guard-profile runtime hooks displaced before test")
     try:
@@ -519,6 +575,15 @@ def pytest_runtest_protocol(item, nextitem):
             raise RuntimeError("guard-profile runtime hooks displaced by test")
         _br_guard_profile.CURRENT_TEST = None
         os.environ.pop("BR_PARENT_TEST", None)
+
+@pytest.hookimpl(trylast=True)
+def pytest_runtest_logreport(report):
+    # Both XFAIL and XPASS reports carry wasxfail.  Neither is admissible as
+    # evidence for the pinned pass/declared-skip lifecycle.
+    if getattr(report, "wasxfail", None) is not None:
+        XFAILED_REPORTS.add(report.nodeid)
+    if report.skipped:
+        REPORTED_SKIPPED.add(report.nodeid)
 
 @pytest.hookimpl(trylast=True)
 def pytest_sessionfinish(session, exitstatus):
@@ -564,6 +629,7 @@ def pytest_sessionfinish(session, exitstatus):
         "materialized_sha256": os.environ["GUARD_MATERIALIZED_SHA256"],
         "sensitive_files_sha256": os.environ["GUARD_SENSITIVE_FILES_SHA256"],
         "sensitive_owners_sha256": os.environ["GUARD_SENSITIVE_OWNERS_SHA256"],
+        "skipped_test_digest": os.environ["GUARD_SKIPPED_TEST_DIGEST"],
         "source_sha": os.environ["GUARD_SOURCE_SHA"],
         "source_tree": os.environ["GUARD_SOURCE_TREE"],
         "support_sha256": os.environ["GUARD_SUPPORT_SHA256"],
@@ -589,8 +655,12 @@ def pytest_sessionfinish(session, exitstatus):
         "pool_task_sha256": hashlib.sha256(
             json.dumps(rows, separators=(",", ":")).encode()
         ).hexdigest(),
+        "duplicate_protocols": sorted(DUPLICATE_PROTOCOLS),
         "tests": sorted(EXECUTED),
+        "skipped": sorted(REPORTED_SKIPPED),
+        "skipped_protocols": sorted(SKIPPED_PROTOCOLS),
         "trace_sha256": hashlib.sha256(trace.encode()).hexdigest(),
+        "xfailed_reports": sorted(XFAILED_REPORTS),
     }
     Path(os.environ["GUARD_MANIFEST"]).write_text(
         json.dumps(manifest, sort_keys=True, separators=(",", ":"))
@@ -797,16 +867,11 @@ def main() -> None:
     tracked_inventory_sha256 = tracked_inventory_digest(tracked)
     sensitive_files = sensitive_test_files(source, tracked)
     sensitive_files_sha256 = canonical_digest(sensitive_files)
-    tests = json.loads(args.tests.read_text())["tests"]
-    test_ids = [test["id"] for test in tests]
-    if (
-        any(type(test_id) is not str for test_id in test_ids)
-        or len(test_ids) != len(set(test_ids))
-    ):
-        raise SystemExit("test manifest IDs must be unique strings")
+    test_ids, skipped_test_ids = test_rosters(json.loads(args.tests.read_text()))
     sensitive_owners = sensitive_test_owners(test_ids, sensitive_files)
     sensitive_owners_sha256 = canonical_digest(sensitive_owners)
     test_digest = hashlib.sha256("\0".join(test_ids).encode()).hexdigest()
+    skipped_test_digest = canonical_digest(skipped_test_ids)
     mode = "synchronous-worker" if args.synchronous_workers else "normal"
     output.parent.mkdir(parents=True, exist_ok=True)
     manifest.parent.mkdir(parents=True, exist_ok=True)
@@ -884,6 +949,8 @@ def main() -> None:
             "GUARD_SENSITIVE_FILES_SHA256": sensitive_files_sha256,
             "GUARD_SENSITIVE_OWNERS": json.dumps(sensitive_owners, separators=(",", ":")),
             "GUARD_SENSITIVE_OWNERS_SHA256": sensitive_owners_sha256,
+            "GUARD_SKIPPED_TESTS": json.dumps(skipped_test_ids, separators=(",", ":")),
+            "GUARD_SKIPPED_TEST_DIGEST": skipped_test_digest,
             "GUARD_SOURCE_SHA": revision,
             "GUARD_SOURCE_TREE": source_tree,
             "GUARD_SUPPORT_SHA256": support_digest,
@@ -907,19 +974,32 @@ def main() -> None:
 
     document = json.loads(manifest.read_text())
     executed = document.get("tests", ())
-    missing = set(test_ids) - set(executed)
-    extra = set(executed) - set(test_ids)
+    skipped = document.get("skipped", ())
+    skipped_protocols = document.get("skipped_protocols", ())
+    duplicate_protocols = document.get("duplicate_protocols", ())
+    xfailed_reports = document.get("xfailed_reports", ())
+    executed_set = roster_set(executed)
+    skipped_set = roster_set(skipped)
+    missing = set(test_ids) - executed_set
+    extra = executed_set - set(test_ids)
+    missing_skipped = set(skipped_test_ids) - skipped_set
+    extra_skipped = skipped_set - set(skipped_test_ids)
     if (
         document.get("exitstatus") != 0
         or document.get("child_complete") is not True
         or document.get("pool_task_complete") is not True
+        or not exact_roster(executed, set(test_ids))
         or missing
         or extra
-        or len(executed) != len(test_ids)
+        or not exact_roster(skipped, set(skipped_test_ids))
+        or not exact_roster(skipped_protocols, set(skipped_test_ids))
+        or not exact_roster(duplicate_protocols, set())
+        or not exact_roster(xfailed_reports, set())
     ):
         raise SystemExit(
             f"inadmissible suite manifest; {len(missing)} tests missing, "
-            f"{len(extra)} extra"
+            f"{len(extra)} extra, {len(missing_skipped)} skips missing, "
+            f"{len(extra_skipped)} skips extra"
         )
     if mode == "normal" and document.get("pool_task_count", 0) <= 0:
         raise SystemExit("normal trace lacks persistent-worker task accounting")

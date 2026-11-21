@@ -1,6 +1,6 @@
 # Per-test guard profiles
 
-Status: **MEMORY RE-AUDIT-READY; NO-COLLECT / NO-SHIP**
+Status: **FULL-RERUN-READY; NO-SHIP**
 
 The first audit's collect-ready verdict was invalidated when source-light
 preflight found the pinned tree's uninitialized `sqlglot-integration-tests`
@@ -15,6 +15,13 @@ under tracemalloc against a 1,024-byte limit. The failed exit-1 evidence is
 rejected. `GUARD_PROFILE_MEMORY_REAUDIT.md` documents the source-derived inert
 quarantine repair, independent LIGHT re-audit, and limited exact-image exit-0
 validation. A fresh full normal and synchronous pair is still required.
+A subsequent frozen full-normal run made the suite fully green (1,620 passed,
+1 skipped, 25,440 subtests) but correctly remained non-admitted because the
+collector treated the pinned manifest's separately declared skip as an extra
+protocol. `GUARD_PROFILE_MEMORY_REAUDIT.md` records the rejected evidence and
+the uncommitted strict split-roster repair. Independent source/LIGHT review
+closed duplicate-protocol and XFAIL/XPASS census gaps; a fresh full normal and
+synchronous pair is now authorized from a frozen checkpoint.
 
 This branch independently derives a conservative per-test observation model for
 simple guard-form changes.  It does not contain a profile artifact, public
@@ -159,4 +166,5 @@ Do not enable this feature until all of the following are complete:
    failing patch/test pair is retained and measuring the actual score impact.
 
 Until then `GUARD_PROFILE_SHA256 = ""` deliberately keeps the runtime path
-disabled. The current verdict is therefore **RE-AUDIT-READY / NO-COLLECT**.
+disabled. The current source/LIGHT verdict is therefore **FULL-RERUN-READY /
+NO-SHIP**.
