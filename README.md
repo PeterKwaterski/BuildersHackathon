@@ -144,6 +144,20 @@ changed body. Both normal and synchronous-worker traces are required, nested
 function ranges compose conservatively, and stale or malformed provenance
 falls back to all tests for function changes.
 
+Local annotated assignments have a separate compile-backed proof. Python does
+not evaluate or retain their annotation expressions, so an edit can be skipped
+only when replacing that one annotation with a sentinel makes both complete
+ASTs identical and their recursively compiled executable fingerprints match.
+The fingerprint includes traceback/source positions as well as bytecode,
+constants, names, bindings, and exception tables. Targets, values, directives,
+class/module annotations, malformed or multi-hunk patches, and every other
+simultaneous syntax change therefore retain the ordinary conservative path.
+Function code-object readers are selected before this proof. The pinned suite's
+only direct `sqlglot` source-text reader is `tests/test_typing.py`; it parses
+typing modules solely to derive the parent `ImportFrom` module, which the full
+AST comparison proves unchanged. `inspect.getsource`, `getsourcelines`, and
+`findsource` are statically rejected by the reflection-profile builder.
+
 ## Submit
 
 Push to a public GitHub repository with the `Dockerfile` at its top, then enter the repository and the commit hash on the track page. The final scores the commit you pick. If you pick none, your best practice submission counts.

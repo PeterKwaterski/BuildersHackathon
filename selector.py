@@ -151,6 +151,183 @@ def source_tree(path: str) -> ast.Module | None:
     return _SOURCE_TREES[path]
 
 
+def semantic_code_fingerprint(code: types.CodeType) -> tuple:
+    """Return recursively complete executable and source-position code state."""
+
+    def constant(value):
+        if isinstance(value, types.CodeType):
+            return ("code", semantic_code_fingerprint(value))
+        if isinstance(value, tuple):
+            return ("tuple", tuple(constant(item) for item in value))
+        if isinstance(value, frozenset):
+            return ("frozenset", tuple(sorted((constant(item) for item in value), key=repr)))
+        return (type(value).__qualname__, repr(value))
+
+    return (
+        code.co_name,
+        code.co_qualname,
+        code.co_firstlineno,
+        code.co_argcount,
+        code.co_posonlyargcount,
+        code.co_kwonlyargcount,
+        code.co_nlocals,
+        code.co_stacksize,
+        code.co_flags,
+        code.co_code,
+        tuple(constant(item) for item in code.co_consts),
+        code.co_names,
+        code.co_varnames,
+        code.co_freevars,
+        code.co_cellvars,
+        code.co_exceptiontable,
+        code.co_linetable,
+        tuple(code.co_positions()),
+    )
+
+
+def local_annotation_only_edit(change: dict, path: str) -> bool:
+    """Prove an edit changes only one ignored local-variable annotation.
+
+    Python does not evaluate or retain annotations on assignments inside a
+    function.  Full-tree normalization proves the patch changes no target,
+    value, binding, or neighboring syntax; compiled fingerprints independently
+    prove that executable code, constants, and traceback positions are identical.
+    """
+    source = pinned_sources().get(path)
+    if (
+        source is None
+        or not change["removed"]
+        or len(change["hunks"]) != 1
+        or any(COMMENT_DIRECTIVE.search(line) for line in change["payload"])
+    ):
+        return False
+
+    # Most patches do not touch an annotation.  Use the cached pinned tree to
+    # reject them before reparsing either complete source document.
+    candidate_tree = source_tree(path)
+    if candidate_tree is None:
+        return False
+
+    candidate_parents = {
+        child: parent
+        for parent in ast.walk(candidate_tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+
+    def is_local_assignment(node: ast.AnnAssign, parents: dict) -> bool:
+        parent = parents.get(node)
+        while parent is not None and not isinstance(
+            parent, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            parent = parents.get(parent)
+        return isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef))
+
+    if not any(
+        isinstance(node, ast.AnnAssign)
+        and is_local_assignment(node, candidate_parents)
+        and any(
+            node.annotation.lineno
+            <= line
+            <= (node.annotation.end_lineno or node.annotation.lineno)
+            for line in change["lines"]
+        )
+        for node in ast.walk(candidate_tree)
+    ):
+        return False
+
+    changed = patched_source(change, path)
+    if changed is None:
+        return False
+    try:
+        original_tree = ast.parse(source, filename=path, type_comments=True)
+        changed_tree = ast.parse(changed, filename=path, type_comments=True)
+    except (SyntaxError, ValueError):
+        return False
+
+    def node_paths(tree: ast.AST):
+        pending = [(tree, ())]
+        while pending:
+            node, node_path = pending.pop()
+            yield node, node_path
+            children = []
+            for field, value in ast.iter_fields(node):
+                if isinstance(value, ast.AST):
+                    children.append((value, (*node_path, (field, None))))
+                elif isinstance(value, list):
+                    children.extend(
+                        (item, (*node_path, (field, index)))
+                        for index, item in enumerate(value)
+                        if isinstance(item, ast.AST)
+                    )
+            pending.extend(reversed(children))
+
+    def follow(tree: ast.AST, node_path):
+        node = tree
+        for field, index in node_path:
+            value = getattr(node, field, None)
+            if index is None:
+                node = value
+            elif isinstance(value, list) and index < len(value):
+                node = value[index]
+            else:
+                return None
+            if not isinstance(node, ast.AST):
+                return None
+        return node
+
+    parents = {
+        child: parent
+        for parent in ast.walk(original_tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+
+    sentinel = ast.Name(id="__blast_radius_local_annotation__", ctx=ast.Load())
+    for node, node_path in node_paths(original_tree):
+        if (
+            not isinstance(node, ast.AnnAssign)
+            or not is_local_assignment(node, parents)
+            or not any(
+                node.annotation.lineno
+                <= line
+                <= (node.annotation.end_lineno or node.annotation.lineno)
+                for line in change["lines"]
+            )
+        ):
+            continue
+        changed_node = follow(changed_tree, node_path)
+        if not isinstance(changed_node, ast.AnnAssign):
+            continue
+        original_annotation = node.annotation
+        changed_annotation = changed_node.annotation
+        node.annotation = sentinel
+        changed_node.annotation = sentinel
+        equivalent = ast.dump(original_tree, include_attributes=False) == ast.dump(
+            changed_tree, include_attributes=False
+        )
+        node.annotation = original_annotation
+        changed_node.annotation = changed_annotation
+        if equivalent:
+            if path not in _SOURCE_CODE:
+                try:
+                    _SOURCE_CODE[path] = compile(
+                        source, path, "exec", dont_inherit=True
+                    )
+                except (SyntaxError, ValueError, TypeError, OverflowError):
+                    return False
+            changed_code = change.get("_patched_code")
+            if changed_code is None:
+                try:
+                    changed_code = compile(
+                        changed, path, "exec", dont_inherit=True
+                    )
+                except (SyntaxError, ValueError, TypeError, OverflowError):
+                    return False
+            return semantic_code_fingerprint(
+                _SOURCE_CODE[path]
+            ) == semantic_code_fingerprint(changed_code)
+    return False
+
+
 def patch_local_expression_line(change: dict, path: str, line: int) -> bool:
     """Prove a patch is wholly contained by one expression on ``line``.
 
@@ -2039,6 +2216,8 @@ def selected_indices(
             code_reflection_indices(path, change["lines"], reflection_model, all_indices)
         )
         if inert_comment_addition(change, path):
+            continue
+        if local_annotation_only_edit(change, path):
             continue
         if proven_identity_equality(change, path, model):
             continue
