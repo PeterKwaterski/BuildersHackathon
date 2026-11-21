@@ -91,6 +91,40 @@ def static_unsafe(source: Path, candidates: dict[tuple[str, str], str]) -> set[s
     # explicit global writes everywhere else.
     for path, (module, is_package, tree) in files.items():
         own = labels_by_module.get(module, {})
+        value_options: dict[str, set[str]] = defaultdict(set)
+        module_options: dict[str, set[str]] = defaultdict(set)
+        for name, label in own.items():
+            value_options[name].add(label)
+        for statement in tree.body:
+            if isinstance(statement, ast.Import):
+                for alias in statement.names:
+                    local = alias.asname or alias.name.split(".", 1)[0]
+                    module_options[local].add(
+                        alias.name if alias.asname else alias.name.split(".", 1)[0]
+                    )
+            elif isinstance(statement, ast.ImportFrom) and not any(
+                alias.name == "*" for alias in statement.names
+            ):
+                target = resolve_import(module, is_package, statement.module, statement.level)
+                for alias in statement.names:
+                    local = alias.asname or alias.name
+                    label = qualified.get((target, alias.name))
+                    if label:
+                        value_options[local].add(label)
+                    submodule = f"{target}.{alias.name}" if target else alias.name
+                    if submodule in labels_by_module or any(
+                        candidate.startswith(submodule + ".")
+                        for candidate in labels_by_module
+                    ):
+                        module_options[local].add(submodule)
+        for local in value_options.keys() | module_options.keys():
+            values = value_options.get(local, set())
+            modules = module_options.get(local, set())
+            if len(values) > 1 or len(modules) > 1 or (values and modules):
+                unsafe.update(values)
+                for imported in modules:
+                    unsafe.update(labels_by_module.get(imported, {}).values())
+
         reflective = {
             "getattr", "hasattr", "setattr", "delattr", "vars",
             "globals", "locals", "eval", "exec",
@@ -126,14 +160,16 @@ def static_unsafe(source: Path, candidates: dict[tuple[str, str], str]) -> set[s
         # map used by the trace rewriter. Resolve only candidate reads that
         # actually occur; a function-local ``import sqlglot`` alone is not a
         # read of every constant in the package.
-        nested_modules: dict[str, str] = {}
+        nested_modules: dict[str, set[str]] = defaultdict(set)
         for node in ast.walk(tree):
             if not isinstance(node, (ast.Import, ast.ImportFrom)) or node in tree.body:
                 continue
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     local = alias.asname or alias.name.split(".", 1)[0]
-                    nested_modules[local] = alias.name if alias.asname else alias.name.split(".", 1)[0]
+                    nested_modules[local].add(
+                        alias.name if alias.asname else alias.name.split(".", 1)[0]
+                    )
             else:
                 target = resolve_import(module, is_package, node.module, node.level)
                 if any(alias.name == "*" for alias in node.names):
@@ -146,7 +182,7 @@ def static_unsafe(source: Path, candidates: dict[tuple[str, str], str]) -> set[s
                     if submodule in labels_by_module or any(
                         candidate.startswith(submodule + ".") for candidate in labels_by_module
                     ):
-                        nested_modules[alias.asname or alias.name] = submodule
+                        nested_modules[alias.asname or alias.name].add(submodule)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Attribute) or not isinstance(node.ctx, ast.Load):
                 continue
@@ -154,18 +190,24 @@ def static_unsafe(source: Path, candidates: dict[tuple[str, str], str]) -> set[s
             if not flattened:
                 continue
             base, parts = flattened
-            imported = nested_modules.get(base)
-            if imported and parts:
-                label = qualified.get((".".join((imported, *parts[:-1])), parts[-1]))
-                if label:
-                    unsafe.add(label)
+            if parts:
+                for imported in nested_modules.get(base, ()):
+                    label = qualified.get((".".join((imported, *parts[:-1])), parts[-1]))
+                    if label:
+                        unsafe.add(label)
 
         aliases = dict(module_aliases.get(module, {}))
-        for local, imported in nested_modules.items():
+        for local, imported_modules in nested_modules.items():
             previous = aliases.get(local)
-            if previous is not None and previous != imported:
-                unsafe.update(labels_by_module.get(previous, {}).values())
-            aliases[local] = imported
+            possible = set(imported_modules)
+            if previous is not None:
+                possible.add(previous)
+            if len(possible) != 1:
+                for imported in possible:
+                    unsafe.update(labels_by_module.get(imported, {}).values())
+                aliases.pop(local, None)
+            else:
+                aliases[local] = possible.pop()
 
         parents = {
             child: parent

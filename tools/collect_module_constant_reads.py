@@ -128,13 +128,17 @@ def import_maps(
     value_maps: dict[str, dict[str, str]] = {}
     module_maps: dict[str, dict[str, str]] = {}
     for module, is_package, tree in files.values():
-        values = dict(exports.get(module, {}))
-        aliases: dict[str, str] = {}
+        value_options: dict[str, set[str]] = defaultdict(set)
+        module_options: dict[str, set[str]] = defaultdict(set)
+        for name, label in exports.get(module, {}).items():
+            value_options[name].add(label)
         for statement in tree.body:
             if isinstance(statement, ast.Import):
                 for alias in statement.names:
                     local = alias.asname or alias.name.split(".", 1)[0]
-                    aliases[local] = alias.name if alias.asname else alias.name.split(".", 1)[0]
+                    module_options[local].add(
+                        alias.name if alias.asname else alias.name.split(".", 1)[0]
+                    )
             elif isinstance(statement, ast.ImportFrom) and not any(
                 alias.name == "*" for alias in statement.names
             ):
@@ -143,12 +147,20 @@ def import_maps(
                     local = alias.asname or alias.name
                     label = exports.get(target, {}).get(alias.name)
                     if label is not None:
-                        values[local] = label
+                        value_options[local].add(label)
                     submodule = f"{target}.{alias.name}" if target else alias.name
                     if submodule in modules:
-                        aliases[local] = submodule
-        value_maps[module] = values
-        module_maps[module] = aliases
+                        module_options[local].add(submodule)
+        value_maps[module] = {
+            name: next(iter(options))
+            for name, options in value_options.items()
+            if len(options) == 1
+        }
+        module_maps[module] = {
+            name: next(iter(options))
+            for name, options in module_options.items()
+            if len(options) == 1 and name not in value_options
+        }
     qualified = {
         (module, name): label
         for module, values in exports.items()
