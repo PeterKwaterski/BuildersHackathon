@@ -19,6 +19,11 @@ from semantic_noops import (
     plain_definition_reorder,
 )
 from runtime_verify import verify_candidates
+from tokenizer_keyword_runtime import (
+    TokenizerKeywordContext,
+    load_context as load_tokenizer_keyword_context,
+    tokenizer_keyword_patch,
+)
 
 DATA = Path("/data")
 MODEL = Path(__file__).with_name("selector_model.json.gz")
@@ -32,6 +37,9 @@ ARG_TYPE_DERIVATION_MODEL = Path(__file__).with_name(
 CLASS_ATTRIBUTE_MODEL = Path(__file__).with_name("class_attribute_model.json.gz")
 TOKENIZER_SETTING_FLOW_MODEL = Path(__file__).with_name(
     "tokenizer_setting_flow_model.json.gz"
+)
+TOKENIZER_KEYWORD_MODEL = Path(__file__).with_name(
+    "tokenizer_keyword_model.json.gz"
 )
 MODULE_CONSTANT_MODEL = Path(__file__).with_name("module_constant_model.json.gz")
 CODE_REFLECTION_MODEL = Path(__file__).with_name("code_reflection_model.json.gz")
@@ -49,6 +57,7 @@ TOKENIZER_SETTING_FLOW_PROFILE_SHA256 = "1ef2cde294620c5767403894a6684900c88442b
 TOKENIZER_SETTING_SELECTOR_MODEL_SHA256 = "d61c504e9a4a1006217e6702e1c6f05c04846b3dd5a09ec5572523fd8b2cb382"
 TOKENIZER_SETTING_CLASS_MODEL_SHA256 = "55eb6911b5d72408c7cd947adc08b07e6b41542a8da1ee86d908f74a1b0b6fd4"
 TOKENIZER_SETTING_BUILDER_SHA256 = "cd45fe8eace881ac34ade5b5ceb26b2fd5a684c10d330d3ed438e2cdd3517e7a"
+TOKENIZER_KEYWORD_MODEL_SHA256 = "28a5241f3d8006f075f283ac8e59f46793be482457bece67de97a4ecdd3db230"
 TOKENIZER_SETTING_TRACE_SHA256 = {
     "normal": "4afe4afc075b26f4e947de92cfb5a9598ab1bea22c30f137d76ada1cc7c35ecf",
     "synchronous-worker": "709a17acaf46f8516553f94577dac156e04f17ad0a5e7f88ab7bffa77f749868",
@@ -3346,6 +3355,7 @@ def selected_indices(
     new_module_model: dict | None = None,
     default_model: dict | None = None,
     tokenizer_setting_flow_model: dict | None = None,
+    tokenizer_keyword_context: TokenizerKeywordContext | None = None,
 ) -> set[int]:
     selected: set[int] = set()
     changes = patch_changes(patch)
@@ -3416,6 +3426,13 @@ def selected_indices(
             continue
         if local_annotation:
             continue
+        if tokenizer_keyword_context is not None:
+            tokenizer_keyword_indices = tokenizer_keyword_patch(
+                changes, tokenizer_keyword_context
+            )
+            if tokenizer_keyword_indices is not None:
+                selected.update(tokenizer_keyword_indices)
+                continue
         if proven_identity_equality(change, path, model):
             continue
         if fresh_alias_model is not None and len(changes) == 1 and fresh_table_alias_copy_edit(
@@ -3619,6 +3636,17 @@ def main() -> None:
         MemoryError,
     ):
         tokenizer_setting_flow_model = None
+    try:
+        tokenizer_keyword_raw = TOKENIZER_KEYWORD_MODEL.read_bytes()
+        tokenizer_keyword_sources_raw = SEMANTIC_SOURCES.read_bytes()
+        tokenizer_keyword_context = load_tokenizer_keyword_context(
+            tokenizer_keyword_raw,
+            TOKENIZER_KEYWORD_MODEL_SHA256,
+            tokenizer_keyword_sources_raw,
+            SEMANTIC_SOURCES_SHA256,
+        )
+    except (OSError, MemoryError):
+        tokenizer_keyword_context = None
     with gzip.open(MODULE_CONSTANT_MODEL, "rt", encoding="utf-8") as constant_model_file:
         constant_model = json.load(constant_model_file)
     with gzip.open(CODE_REFLECTION_MODEL, "rt", encoding="utf-8") as reflection_model_file:
@@ -3773,6 +3801,7 @@ def main() -> None:
             new_module_model,
             default_model,
             tokenizer_setting_flow_model,
+            tokenizer_keyword_context,
         )
         selected = [
             mapped_tests[index]

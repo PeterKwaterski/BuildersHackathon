@@ -12,6 +12,7 @@ COPY selector.py /app/selector.py
 COPY semantic.py /app/semantic.py
 COPY semantic_noops.py /app/semantic_noops.py
 COPY runtime_verify.py /app/runtime_verify.py
+COPY tokenizer_keyword_runtime.py /app/tokenizer_keyword_runtime.py
 COPY max_nodes_exact.py /app/max_nodes_exact.py
 COPY selector_model.json.gz /app/selector_model.json.gz
 COPY semantic_sources.json.gz /app/semantic_sources.json.gz
@@ -20,6 +21,7 @@ COPY predicate_profile.json.gz /app/predicate_profile.json.gz
 COPY arg_type_derivation_model.json.gz /app/arg_type_derivation_model.json.gz
 COPY class_attribute_model.json.gz /app/class_attribute_model.json.gz
 COPY tokenizer_setting_flow_model.json.gz /app/tokenizer_setting_flow_model.json.gz
+COPY tokenizer_keyword_model.json.gz /app/tokenizer_keyword_model.json.gz
 COPY module_constant_model.json.gz /app/module_constant_model.json.gz
 COPY code_reflection_model.json.gz /app/code_reflection_model.json.gz
 COPY fresh_alias_profile.json.gz /app/fresh_alias_profile.json.gz
