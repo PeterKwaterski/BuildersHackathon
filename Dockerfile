@@ -15,6 +15,7 @@ assert hashlib.sha256(d).hexdigest()=='93b2445f15f395b81c20556777ece19a6c7507df9
 tarfile.open(fileobj=io.BytesIO(d)).extractall('/app',filter='data'); \
 os.rename('/app/sqlglot-'+sha,'/app/sqlglot-pinned')" \
  && python -m compileall -q --invalidation-mode checked-hash /app/sqlglot-pinned/sqlglot /app/sqlglot-pinned/tests
+RUN mkdir -p /opt && ln -s /app/sqlglot-pinned /opt/sqlglot
 COPY selector.py /app/selector.py
 COPY registry_key_research.py /app/registry_key_research.py
 COPY registry_key_research_model.json.gz /app/registry_key_research_model.json.gz
@@ -32,6 +33,8 @@ COPY semantic.py /app/semantic.py
 COPY shared_arg_write_runtime.py /app/shared_arg_write_runtime.py
 COPY none_static_runtime.py /app/none_static_runtime.py
 COPY tpc_rule_replay.py /app/tpc_rule_replay.py
+COPY tpc_rule_fast.py /app/tpc_rule_fast.py
+COPY tpc_rule_fast_runtime.py /app/tpc_rule_fast_runtime.py
 COPY selector_model.json.gz /app/selector_model.json.gz
 COPY semantic_sources.json.gz /app/semantic_sources.json.gz
 COPY zero_reader_model.json.gz /app/zero_reader_model.json.gz

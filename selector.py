@@ -43,6 +43,8 @@ from tpc_rule_replay import (
     validate_profile as validate_tpc_rule_replay_profile,
     verify_competition_risk_boundaries,
 )
+from tpc_rule_fast import plan as plan_tpc_rule_fast, validate as validate_tpc_rule_fast
+from tpc_rule_fast_runtime import verify_fast_boundaries
 
 DATA = Path("/data")
 PINNED_SOURCE_ROOT = Path("/app/sqlglot-pinned")
@@ -88,6 +90,8 @@ NEW_MODULE_SOURCE_SHA256 = "b7f798c9e8015db63d6e160ab73f59828e445cef8739cfb383ab
 NEW_MODULE_INVENTORY_SHA256 = "b30749cd488217746916b61c0eb138d46ab9f3543b32e0dbbd4688c0ac9ee12b"
 TPC_RULE_REPLAY_PROFILE = Path(__file__).with_name("tpc_rule_replay_profile.json.gz")
 TPC_RULE_REPLAY_PROFILE_SHA256 = ""
+TPC_RULE_FAST_PROFILE = Path(__file__).with_name("tpc_rule_fast_profile.json.gz")
+TPC_RULE_FAST_PROFILE_SHA256 = ""
 MAX_WORKERS = 8
 WORKER_COST_MS = 2_000
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -4172,10 +4176,91 @@ def load_tpc_rule_replay_profile() -> dict | None:
         return None
 
 
-def resolve_tpc_rule_patch(_changes: list[dict], _profile: dict):
-    """Disabled port seam; promoted with the prospective collector and pin."""
+def load_tpc_rule_fast_profile() -> dict | None:
+    if not TPC_RULE_FAST_PROFILE_SHA256:
+        return None
+    try:
+        raw = TPC_RULE_FAST_PROFILE.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != TPC_RULE_FAST_PROFILE_SHA256:
+            return None
+        return validate_tpc_rule_fast(json.loads(gzip.decompress(raw).decode("utf-8")))
+    except Exception:
+        return None
 
-    return None
+
+def _tpc_owner_nodes(tree: ast.Module):
+    result = {}
+
+    def visit(body, prefix):
+        for statement in body:
+            if isinstance(statement, ast.ClassDef):
+                visit(statement.body, (*prefix, statement.name))
+            elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                qualname = ".".join((*prefix, statement.name))
+                result[qualname] = statement if qualname not in result else None
+                visit(statement.body, (*prefix, statement.name, "<locals>"))
+
+    visit(tree.body, ())
+    return result
+
+
+def resolve_tpc_rule_patch(changes: list[dict], profile: dict):
+    if len(changes) != 1:
+        return None
+    change = changes[0]
+    path = change.get("old")
+    if (
+        not isinstance(path, str)
+        or change.get("new") != path
+        or not path.startswith("sqlglot/optimizer/")
+        or not path.endswith(".py")
+        or change.get("binary")
+        or change.get("no_newline_marker")
+        or not change.get("lines")
+    ):
+        return None
+    original = pinned_sources().get(path)
+    changed = patched_source(change, path)
+    if original is None or changed is None:
+        return None
+    source_sha = hashlib.sha256(original.encode("utf-8")).hexdigest()
+    try:
+        original_tree = ast.parse(original, filename=path, type_comments=True)
+        changed_tree = ast.parse(changed, filename=path, type_comments=True)
+    except Exception:
+        return None
+    original_nodes = _tpc_owner_nodes(original_tree)
+    changed_nodes = _tpc_owner_nodes(changed_tree)
+    matches = []
+    for owner_id, owner in profile.get("owners", {}).items():
+        node = original_nodes.get(owner.get("qualname"))
+        changed_node = changed_nodes.get(owner.get("qualname"))
+        if (
+            owner.get("path") != path
+            or owner.get("source_sha256") != source_sha
+            or not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            or not isinstance(changed_node, type(node))
+            or node.lineno != owner.get("first_line")
+            or (node.end_lineno or node.lineno) != owner.get("end_line")
+            or not all(node.lineno <= line <= (node.end_lineno or node.lineno)
+                       for line in change["lines"])
+        ):
+            continue
+        original_body, changed_body = node.body, changed_node.body
+        try:
+            node.body = [ast.Pass()]
+            changed_node.body = [ast.Pass()]
+            same = ast.dump(original_tree, include_attributes=False) == ast.dump(
+                changed_tree, include_attributes=False
+            )
+        finally:
+            node.body, changed_node.body = original_body, changed_body
+        if same:
+            matches.append((owner_id, owner))
+    if len(matches) != 1:
+        return None
+    owner_id, owner = matches[0]
+    return PatchEvidence(owner_id, source_sha, owner["rule"]), [(path, changed)]
 
 
 def apply_tpc_rule_replay_risk(
@@ -4218,6 +4303,31 @@ def apply_tpc_rule_replay_risk(
 
 
 TPC_RULE_REPLAY_COLLECTOR = None
+
+
+def apply_tpc_rule_fast_risk(
+    selected: list[dict], changes: list[dict], profile: dict | None
+) -> list[dict]:
+    if profile is None:
+        return selected
+    try:
+        resolved = resolve_tpc_rule_patch(changes, profile)
+        if resolved is None:
+            return selected
+        evidence, sources = resolved
+        targets = tuple(sorted(
+            test["id"] for test in selected if test.get("id") in TPC_RULE_TARGET_COUNTS
+        ))
+        if not targets:
+            return selected
+        retained = [test for test in selected if test.get("id") not in targets]
+        saving = (best_cost_ms(selected) - best_cost_ms(retained)) / 1_000
+        fast_plan = plan_tpc_rule_fast(profile, evidence.owner_id, targets, saving)
+        if fast_plan is None or not verify_fast_boundaries(sources, profile, fast_plan):
+            return selected
+        return retained
+    except Exception:
+        return selected
 
 
 def _main() -> None:
@@ -4342,6 +4452,7 @@ def _main() -> None:
     modeled_ids = set(model["t"])
     unmapped_tests = [test for test in tests if test["id"] not in modeled_ids]
     tpc_rule_replay_profile = load_tpc_rule_replay_profile()
+    tpc_rule_fast_profile = load_tpc_rule_fast_profile()
 
     jobs = []
     tpc_ids = set().union(*TPC_PLAN_TESTS.values())
@@ -4384,6 +4495,9 @@ def _main() -> None:
             patch_changes(patch),
             tpc_rule_replay_profile,
             TPC_RULE_REPLAY_COLLECTOR,
+        )
+        selected = apply_tpc_rule_fast_risk(
+            selected, patch_changes(patch), tpc_rule_fast_profile
         )
         selected.extend(unmapped_tests)
         without_all_tpc = [test for test in selected if test["id"] not in tpc_ids]
