@@ -20,6 +20,7 @@ ARG_TYPE_DERIVATION_MODEL = Path(__file__).with_name(
     "arg_type_derivation_model.json.gz"
 )
 CLASS_ATTRIBUTE_MODEL = Path(__file__).with_name("class_attribute_model.json.gz")
+MODULE_CONSTANT_MODEL = Path(__file__).with_name("module_constant_model.json.gz")
 FRESH_ALIAS_PROFILE = Path(__file__).with_name("fresh_alias_profile.json.gz")
 MAX_WORKERS = 8
 WORKER_COST_MS = 2_000
@@ -1508,6 +1509,102 @@ def class_attribute_edit(
     return set(readers)
 
 
+def module_constant_edit(
+    change: dict,
+    path: str,
+    constant_model: dict,
+) -> set[int] | None:
+    """Narrow one immutable module-literal edit to its traced readers."""
+    entries = constant_model.get("d", {}).get(path)
+    source = pinned_sources().get(path)
+    changed = patched_source(change, path)
+    if (
+        not entries
+        or source is None
+        or changed is None
+        or any(COMMENT_DIRECTIVE.search(line) for line in change["payload"])
+    ):
+        return None
+    try:
+        original_tree = ast.parse(source, filename=path, type_comments=True)
+        changed_tree = ast.parse(changed, filename=path, type_comments=True)
+    except (SyntaxError, ValueError):
+        return None
+
+    def assignments(tree: ast.Module):
+        result = {}
+        for statement in tree.body:
+            if isinstance(statement, ast.Assign):
+                targets = statement.targets
+            elif isinstance(statement, ast.AnnAssign):
+                targets = [statement.target]
+            else:
+                continue
+            if len(targets) == 1 and isinstance(targets[0], ast.Name):
+                name = targets[0].id
+                result[name] = statement if name not in result else None
+        return result
+
+    original_assignments = assignments(original_tree)
+    changed_assignments = assignments(changed_tree)
+    candidates = []
+    for start, end, name, value_dump, state, readers in entries:
+        if state != "safe" or not any(start <= line <= end for line in change["lines"]):
+            continue
+        statement = original_assignments.get(name)
+        if (
+            statement is None
+            or statement.lineno != start
+            or (statement.end_lineno or statement.lineno) != end
+            or ast.dump(statement.value, include_attributes=False) != value_dump
+        ):
+            continue
+        candidates.append((name, statement, readers))
+    if len(candidates) != 1:
+        return None
+    name, original_statement, readers = candidates[0]
+    changed_statement = changed_assignments.get(name)
+    if changed_statement is None:
+        return None
+    try:
+        old_literal = ast.literal_eval(original_statement.value)
+        new_literal = ast.literal_eval(changed_statement.value)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return None
+
+    def safe_literal(value) -> bool:
+        return type(value) in (type(None), bool, int, float, complex, str, bytes) or (
+            type(value) is tuple and all(safe_literal(item) for item in value)
+        )
+
+    if (
+        not safe_literal(old_literal)
+        or not safe_literal(new_literal)
+        or type(old_literal) is not type(new_literal)
+        or old_literal == new_literal
+        or not isinstance(readers, list)
+        or not readers
+        or any(
+            type(index) is not int
+            or index < 0
+            or index >= constant_model.get("n", 0)
+            for index in readers
+        )
+    ):
+        return None
+
+    # Erasing exactly the approved values must make the complete executable
+    # trees identical. This excludes target, annotation, type-comment,
+    # neighboring statement, and all other simultaneous changes.
+    original_statement.value = ast.Constant(value=None)
+    changed_statement.value = ast.Constant(value=None)
+    if ast.dump(original_tree, include_attributes=False) != ast.dump(
+        changed_tree, include_attributes=False
+    ):
+        return None
+    return set(readers)
+
+
 def derived_arg_types_edit(
     change: dict,
     path: str,
@@ -1690,6 +1787,7 @@ def selected_indices(
     predicate_model: dict | None = None,
     derivation_model: dict | None = None,
     attribute_model: dict | None = None,
+    constant_model: dict | None = None,
     fresh_alias_model: dict | None = None,
 ) -> set[int]:
     selected: set[int] = set()
@@ -1779,6 +1877,12 @@ def selected_indices(
             )
             if attribute_indices is not None:
                 selected.update(attribute_indices)
+                continue
+
+        if constant_model is not None:
+            constant_indices = module_constant_edit(change, path, constant_model)
+            if constant_indices is not None:
+                selected.update(constant_indices)
                 continue
 
         entry = model["f"].get(path)
@@ -1891,6 +1995,8 @@ def main() -> None:
         derivation_model = json.load(derivation_model_file)
     with gzip.open(CLASS_ATTRIBUTE_MODEL, "rt", encoding="utf-8") as attribute_model_file:
         attribute_model = json.load(attribute_model_file)
+    with gzip.open(MODULE_CONSTANT_MODEL, "rt", encoding="utf-8") as constant_model_file:
+        constant_model = json.load(constant_model_file)
     with gzip.open(FRESH_ALIAS_PROFILE, "rt", encoding="utf-8") as fresh_alias_file:
         fresh_alias_model = json.load(fresh_alias_file)
     test_digest = hashlib.sha256(
@@ -1926,6 +2032,13 @@ def main() -> None:
     ):
         attribute_model = {"d": {}}
     if (
+        constant_model.get("v") != 1
+        or constant_model.get("sha") != model.get("sha")
+        or constant_model.get("n") != len(tests)
+        or constant_model.get("t") != test_digest
+    ):
+        constant_model = {"d": {}}
+    if (
         fresh_alias_model.get("v") != 1
         or fresh_alias_model.get("sha") != model.get("sha")
         or fresh_alias_model.get("n") != len(tests)
@@ -1952,6 +2065,7 @@ def main() -> None:
             predicate_model,
             derivation_model,
             attribute_model,
+            constant_model,
             fresh_alias_model,
         )
         selected = [mapped_tests[index] for index in indices if mapped_tests[index] is not None]

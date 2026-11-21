@@ -127,6 +127,15 @@ Only an otherwise identical same-type literal value edit at a safely observed
 assignment can select its exact readers; import-time reads, mutation,
 reflection ambiguity, or stale provenance force the ordinary broad fallback.
 
+`tools/collect_module_constant_reads.py` and
+`tools/build_module_constant_model.py` reproduce the complete owner-aware
+module-literal reader profile documented in `tools/MODULE_CONSTANT_PROFILE.md`.
+It resolves direct global reads, from-import aliases and re-exports, and
+module-qualified reads in normal and synchronous-worker runs. Only an
+otherwise identical same-type immutable literal edit at a safely observed
+assignment selects its exact readers; mutable values, import-time reads,
+rebinding, unresolved reflection/imports, or stale provenance force fallback.
+
 ## Submit
 
 Push to a public GitHub repository with the `Dockerfile` at its top, then enter the repository and the commit hash on the track page. The final scores the commit you pick. If you pick none, your best practice submission counts.
