@@ -44,7 +44,7 @@ make check    # the output's format only
 
 `sample/answers.json` lists the tests each sample commit breaks and the kind of change it is. The practice and final commits are hidden, and so is everything your program prints when it runs on them. A rejected submission tells you which rule it broke and nothing more, so reproduce problems here.
 
-The current exact-image sample result is **109.062 simulated seconds with zero
+The current exact-image sample result is **104.175 simulated seconds with zero
 misses**. Seven recent selector-body measurements in the scorer container had a
 1.103-second median; process startup is additional and the board measures the
 complete container. Model collection used the pinned Python 3.13 image and the
@@ -86,6 +86,15 @@ literal arguments. Unchanged dictionary unpacking is permitted, but an unpack
 entry can never itself be certified. Every uncertainty falls back to the ordinary
 assignment dependency cone. The certificate is derived from pinned sources and
 tests and contains no sample commit, patch, or answer information.
+
+`tools/collect_arg_type_derivations.py` and
+`tools/build_arg_type_derivation_model.py` reproduce the source-derived class
+dictionary certificate documented in `tools/ARG_TYPE_DERIVATION.md`. It
+identity-links every `required_args` set to the exact `arg_types` dictionary
+that produced it, so inherited and dynamic subclasses are covered without a
+class-name join. Runtime use accepts only boolean value edits in an otherwise
+identical certified dictionary and selects the union of direct, value-wide,
+and derived-set consumers from two complete passing suite modes.
 
 `tools/collect_predicate_values.py` and
 `tools/build_predicate_profile.py` reproduce the still narrower ordering

@@ -16,6 +16,9 @@ MODEL = Path(__file__).with_name("selector_model.json.gz")
 SEMANTIC_SOURCES = Path(__file__).with_name("semantic_sources.json.gz")
 ZERO_READER_MODEL = Path(__file__).with_name("zero_reader_model.json.gz")
 PREDICATE_PROFILE = Path(__file__).with_name("predicate_profile.json.gz")
+ARG_TYPE_DERIVATION_MODEL = Path(__file__).with_name(
+    "arg_type_derivation_model.json.gz"
+)
 MAX_WORKERS = 8
 WORKER_COST_MS = 2_000
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -1241,6 +1244,136 @@ def profile_equivalent_predicate_edit(
     ) and not import_expression_hazard(change, path, hook_attributes)
 
 
+def derived_arg_types_edit(
+    change: dict,
+    path: str,
+    derivation_model: dict,
+    hook_attributes: set[str] | None = None,
+) -> set[int] | None:
+    """Narrow a boolean arg_types edit to its direct and derived consumers."""
+    entries = derivation_model.get("d", {}).get(path)
+    source = pinned_sources().get(path)
+    changed = patched_source(change, path)
+    if (
+        not entries
+        or source is None
+        or changed is None
+        or path in PROCESS_SERIALIZATION_FILES
+        or any(COMMENT_DIRECTIVE.search(line) for line in change["payload"])
+    ):
+        return None
+    try:
+        original_tree = ast.parse(source, filename=path, type_comments=True)
+        changed_tree = ast.parse(changed, filename=path, type_comments=True)
+    except (SyntaxError, ValueError):
+        return None
+
+    def assignments(tree: ast.Module):
+        result = {}
+
+        def visit_body(body: list[ast.stmt], owner: tuple[str, ...]) -> None:
+            for statement in body:
+                if isinstance(statement, ast.Assign):
+                    targets = statement.targets
+                elif isinstance(statement, ast.AnnAssign):
+                    targets = [statement.target]
+                else:
+                    targets = []
+                if (
+                    len(targets) == 1
+                    and isinstance(targets[0], ast.Name)
+                    and isinstance(getattr(statement, "value", None), ast.Dict)
+                ):
+                    key = owner, targets[0].id
+                    result[key] = statement if key not in result else None
+                if isinstance(statement, ast.ClassDef):
+                    visit_body(statement.body, (*owner, statement.name))
+
+        visit_body(tree.body, ())
+        return result
+
+    original_assignments = assignments(original_tree)
+    changed_assignments = assignments(changed_tree)
+    candidates = []
+    for start, end, target, key_entries in entries:
+        if not any(start <= line <= end for line in change["lines"]):
+            continue
+        matches = [
+            (key, statement)
+            for key, statement in original_assignments.items()
+            if key[1] == target
+            and statement is not None
+            and statement.lineno == start
+            and (statement.end_lineno or statement.lineno) == end
+        ]
+        if len(matches) != 1:
+            return None
+        candidates.append((*matches[0], dict(key_entries)))
+    if len(candidates) != 1:
+        return None
+
+    key, original_statement, readers = candidates[0]
+    changed_statement = changed_assignments.get(key)
+    if changed_statement is None:
+        return None
+    original_dict = original_statement.value
+    changed_dict = changed_statement.value
+    if any(item is None for item in (*original_dict.keys, *changed_dict.keys)):
+        return None
+    if len(original_dict.keys) != len(changed_dict.keys):
+        return None
+    original_key_dumps = [
+        ast.dump(item, include_attributes=False) for item in original_dict.keys
+    ]
+    if original_key_dumps != [
+        ast.dump(item, include_attributes=False) for item in changed_dict.keys
+    ]:
+        return None
+
+    runtime_keys = []
+    for key_node in original_dict.keys:
+        try:
+            runtime_key = ast.literal_eval(key_node)
+            hash(runtime_key)
+        except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+            return None
+        if runtime_key in runtime_keys:
+            return None
+        runtime_keys.append(runtime_key)
+
+    changed_values = [
+        index
+        for index, (old, new) in enumerate(zip(original_dict.values, changed_dict.values))
+        if ast.dump(old, include_attributes=False)
+        != ast.dump(new, include_attributes=False)
+    ]
+    if not changed_values:
+        return None
+    selected = set()
+    for index in changed_values:
+        old_value = original_dict.values[index]
+        new_value = changed_dict.values[index]
+        if not (
+            isinstance(old_value, ast.Constant)
+            and type(old_value.value) is bool
+            and isinstance(new_value, ast.Constant)
+            and type(new_value.value) is bool
+            and original_key_dumps[index] in readers
+        ):
+            return None
+        selected.update(readers[original_key_dumps[index]])
+        original_dict.values[index] = ast.Constant(value=None)
+        changed_dict.values[index] = ast.Constant(value=None)
+
+    if ast.dump(original_tree, include_attributes=False) != ast.dump(
+        changed_tree, include_attributes=False
+    ):
+        return None
+    if import_expression_hazard(change, path, hook_attributes):
+        return None
+    return selected
+
+
 def path_dependency_cone(
     paths: tuple[str | None, ...],
     model: dict,
@@ -1283,6 +1416,7 @@ def selected_indices(
     test_file_indices: dict[str, set[int]] | None = None,
     zero_model: dict | None = None,
     predicate_model: dict | None = None,
+    derivation_model: dict | None = None,
 ) -> set[int]:
     selected: set[int] = set()
     changes = patch_changes(patch)
@@ -1349,6 +1483,14 @@ def selected_indices(
             change, path, predicate_model, model.get("h")
         ):
             continue
+
+        if derivation_model is not None:
+            derived_indices = derived_arg_types_edit(
+                change, path, derivation_model, model.get("h")
+            )
+            if derived_indices is not None:
+                selected.update(derived_indices)
+                continue
 
         entry = model["f"].get(path)
         if entry is None and new_path not in (None, "/dev/null"):
@@ -1456,6 +1598,8 @@ def main() -> None:
         zero_model = json.load(zero_model_file)
     with gzip.open(PREDICATE_PROFILE, "rt", encoding="utf-8") as predicate_model_file:
         predicate_model = json.load(predicate_model_file)
+    with gzip.open(ARG_TYPE_DERIVATION_MODEL, "rt", encoding="utf-8") as derivation_model_file:
+        derivation_model = json.load(derivation_model_file)
     test_digest = hashlib.sha256(
         "\0".join(test["id"] for test in tests).encode("utf-8")
     ).hexdigest()
@@ -1474,6 +1618,13 @@ def main() -> None:
         or predicate_model.get("t") != test_digest
     ):
         predicate_model = {"d": {}}
+    if (
+        derivation_model.get("v") != 1
+        or derivation_model.get("sha") != model.get("sha")
+        or derivation_model.get("n") != len(tests)
+        or derivation_model.get("t") != test_digest
+    ):
+        derivation_model = {"d": {}}
     mapped_tests = [tests_by_id.get(test_id) for test_id in model["t"]]
     all_indices = {index for index, test in enumerate(mapped_tests) if test is not None}
     test_file_indices: dict[str, set[int]] = {}
@@ -1492,6 +1643,7 @@ def main() -> None:
             test_file_indices,
             zero_model,
             predicate_model,
+            derivation_model,
         )
         selected = [mapped_tests[index] for index in indices if mapped_tests[index] is not None]
         selected.extend(unmapped_tests)
