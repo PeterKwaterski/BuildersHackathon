@@ -252,6 +252,23 @@ def main() -> None:
         for dialect, owners in dependencies.get("dialects", {}).items():
             dialects[dialect].update(test_index[owner] for owner in owners if owner in test_index)
 
+    init_subclass_attributes: set[str] = set()
+    for tree in parsed.values():
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if node.name != "__init_subclass__" or not node.args.args:
+                continue
+            receiver = node.args.args[0].arg
+            init_subclass_attributes.update(
+                child.attr
+                for child in ast.walk(node)
+                if isinstance(child, ast.Attribute)
+                and isinstance(child.value, ast.Name)
+                and child.value.id == receiver
+                and isinstance(child.ctx, ast.Load)
+            )
+
     model = {
         "v": 1,
         "sha": PINNED_SHA,
@@ -269,6 +286,7 @@ def main() -> None:
         "q": {
             dialect: intern(indices) for dialect, indices in sorted(dialects.items()) if indices
         },
+        "h": sorted(init_subclass_attributes),
     }
     encoded = json.dumps(model, sort_keys=True, separators=(",", ":")).encode()
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -282,7 +300,8 @@ def main() -> None:
     if args.sources_output:
         sources = {
             path.relative_to(source).as_posix(): path.read_text()
-            for path in sorted((source / "sqlglot").rglob("*.py"))
+            for top in ("sqlglot", "tests")
+            for path in sorted((source / top).rglob("*.py"))
         }
         source_bytes = json.dumps(sources, sort_keys=True, separators=(",", ":")).encode()
         with args.sources_output.open("wb") as raw_output:

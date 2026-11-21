@@ -1,5 +1,6 @@
 ast_serialize==0.13.1
 cfgv==3.5.0
+coverage==7.17.4
 distlib==0.4.4
 duckdb==2.0.0
 execnet==2.1.2

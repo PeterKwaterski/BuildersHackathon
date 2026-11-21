@@ -2,9 +2,11 @@
 
 import ast
 import gzip
+import hashlib
 import json
 import re
 import sys
+import types
 from pathlib import Path
 
 from semantic import SemanticProof
@@ -12,6 +14,7 @@ from semantic import SemanticProof
 DATA = Path("/data")
 MODEL = Path(__file__).with_name("selector_model.json.gz")
 SEMANTIC_SOURCES = Path(__file__).with_name("semantic_sources.json.gz")
+ZERO_READER_MODEL = Path(__file__).with_name("zero_reader_model.json.gz")
 MAX_WORKERS = 8
 WORKER_COST_MS = 2_000
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -20,6 +23,10 @@ COMMENT_DIRECTIVE = re.compile(r"(?i)(coding\s*[:=]|type:|noqa|pragma|fmt:|pyrig
 PROCESS_SERIALIZATION_FILES = {"sqlglot/serde.py"}
 _SEMANTIC_PROOF = None
 _PINNED_SOURCES = None
+_SOURCE_TREES = {}
+_IMPORT_DEFINITION_RANGES = {}
+_SOURCE_CODE = {}
+_INIT_SUBCLASS_ATTRIBUTES = None
 
 
 def split(tests: list[dict], worker_count: int) -> tuple[list[list[int]], int]:
@@ -48,6 +55,7 @@ def patch_changes(patch: Path) -> list[dict]:
     change = None
     hunk = None
     old_line = 0
+    new_line = 0
     addition_anchor = None
     in_hunk = False
     for line in patch.read_text().splitlines():
@@ -60,6 +68,7 @@ def patch_changes(patch: Path) -> list[dict]:
                 "removed": [],
                 "added": [],
                 "added_at": [],
+                "added_new_at": [],
                 "hunks": [],
             }
             changes.append(change)
@@ -71,6 +80,7 @@ def patch_changes(patch: Path) -> list[dict]:
             old_start = int(match.group(1))
             old_count = int(match.group(2) or 1)
             old_line = old_start + (old_count == 0)
+            new_line = int(match.group(3))
             addition_anchor = None
             hunk = {"old_start": old_start, "old_count": old_count, "lines": []}
             change["hunks"].append(hunk)
@@ -81,6 +91,10 @@ def patch_changes(patch: Path) -> list[dict]:
         elif not in_hunk and line.startswith("+++ "):
             name = line[4:].split("\t", 1)[0]
             change["new"] = name[2:] if name.startswith("b/") else name
+        elif not in_hunk and line.startswith("rename from "):
+            change["old"] = line.removeprefix("rename from ")
+        elif not in_hunk and line.startswith("rename to "):
+            change["new"] = line.removeprefix("rename to ")
         elif line.startswith("-"):
             hunk["lines"].append(("-", line[1:]))
             if addition_anchor is None:
@@ -98,9 +112,12 @@ def patch_changes(patch: Path) -> list[dict]:
             change["payload"].append(line[1:])
             change["added"].append(line[1:])
             change["added_at"].append((old_line, line[1:]))
+            change["added_new_at"].append((new_line, line[1:]))
+            new_line += 1
         elif line.startswith(" "):
             hunk["lines"].append((" ", line[1:]))
             old_line += 1
+            new_line += 1
             addition_anchor = None
     return changes
 
@@ -113,6 +130,438 @@ def pinned_sources() -> dict[str, str]:
     return _PINNED_SOURCES
 
 
+def source_tree(path: str) -> ast.Module | None:
+    if path not in _SOURCE_TREES:
+        source = pinned_sources().get(path)
+        if source is None:
+            return None
+        try:
+            _SOURCE_TREES[path] = ast.parse(source, filename=path, type_comments=True)
+        except (SyntaxError, ValueError):
+            _SOURCE_TREES[path] = None
+    return _SOURCE_TREES[path]
+
+
+def precise_coverage_line(path: str, line: int) -> bool:
+    """Whether executing a line necessarily reaches the changed expression."""
+    tree = source_tree(path)
+    if tree is None:
+        return False
+    statements = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.stmt)
+        and node.lineno <= line <= (node.end_lineno or node.lineno)
+    ]
+    if not statements:
+        return False
+    statement = min(
+        statements,
+        key=lambda node: ((node.end_lineno or node.lineno) - node.lineno, node.col_offset),
+    )
+    if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return False
+    definitions = [
+        node
+        for node in ast.walk(tree)
+        if node is not statement
+        and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        and node.lineno <= statement.lineno
+        and (node.end_lineno or node.lineno) >= (statement.end_lineno or statement.lineno)
+    ]
+    if not definitions:
+        return False
+    definition = min(
+        definitions,
+        key=lambda node: ((node.end_lineno or node.lineno) - node.lineno, node.col_offset),
+    )
+    if not isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return False
+    if statement.lineno == (statement.end_lineno or statement.lineno) == line:
+        return True
+    header_expressions = []
+    if isinstance(statement, (ast.If, ast.While, ast.Assert)):
+        header_expressions.append(statement.test)
+    elif isinstance(statement, (ast.For, ast.AsyncFor)):
+        header_expressions.extend((statement.target, statement.iter))
+    elif isinstance(statement, (ast.With, ast.AsyncWith)):
+        header_expressions.extend(item.context_expr for item in statement.items)
+    return any(
+        expression.lineno == (expression.end_lineno or expression.lineno) == line
+        for expression in header_expressions
+    )
+
+
+def import_definition_line(path: str, line: int) -> bool:
+    """Whether a definition fragment executes while its module is imported."""
+    if path not in _IMPORT_DEFINITION_RANGES:
+        tree = source_tree(path)
+        if tree is None:
+            _IMPORT_DEFINITION_RANGES[path] = []
+        else:
+            parents = {}
+            for parent in ast.walk(tree):
+                for child in ast.iter_child_nodes(parent):
+                    parents[child] = parent
+            ranges = []
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    continue
+                ancestor = parents.get(node)
+                nested_in_function = False
+                while ancestor is not None:
+                    if isinstance(ancestor, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                        nested_in_function = True
+                        break
+                    ancestor = parents.get(ancestor)
+                if nested_in_function:
+                    continue
+                body_start = min(
+                    (statement.lineno for statement in node.body),
+                    default=node.lineno,
+                )
+                ranges.append((node.lineno, max(node.lineno, body_start - 1)))
+                ranges.extend(
+                    (decorator.lineno, decorator.end_lineno or decorator.lineno)
+                    for decorator in node.decorator_list
+                )
+            _IMPORT_DEFINITION_RANGES[path] = ranges
+    return any(
+        start <= line <= end for start, end in _IMPORT_DEFINITION_RANGES[path]
+    )
+
+
+def init_subclass_attributes() -> set[str]:
+    """Class attributes read directly by pinned ``__init_subclass__`` hooks."""
+    global _INIT_SUBCLASS_ATTRIBUTES
+    if _INIT_SUBCLASS_ATTRIBUTES is None:
+        attributes = set()
+        for path, source in pinned_sources().items():
+            if "def __init_subclass__" not in source:
+                continue
+            tree = source_tree(path)
+            if tree is None:
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if node.name != "__init_subclass__" or not node.args.args:
+                    continue
+                receiver = node.args.args[0].arg
+                attributes.update(
+                    child.attr
+                    for child in ast.walk(node)
+                    if isinstance(child, ast.Attribute)
+                    and isinstance(child.value, ast.Name)
+                    and child.value.id == receiver
+                    and isinstance(child.ctx, ast.Load)
+                )
+        _INIT_SUBCLASS_ATTRIBUTES = attributes
+    return _INIT_SUBCLASS_ATTRIBUTES
+
+
+def import_expression_hazard(
+    change: dict, path: str, hook_attributes: set[str] | None = None
+) -> bool:
+    """Detect changed class/module expressions that can now fail during import."""
+    source = pinned_sources().get(path)
+    changed = patched_source(change, path)
+    if source is None or changed is None:
+        return False
+    original_tree = source_tree(path)
+    if original_tree is None:
+        return True
+
+    def annotations_deferred(tree: ast.Module) -> bool:
+        return any(
+            isinstance(statement, ast.ImportFrom)
+            and statement.module == "__future__"
+            and any(alias.name == "annotations" for alias in statement.names)
+            for statement in tree.body
+        )
+
+    def context(tree: ast.Module, line: int) -> tuple[ast.stmt | None, bool]:
+        parents = {}
+        candidates = []
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                parents[child] = parent
+            start = getattr(parent, "lineno", None)
+            end = getattr(parent, "end_lineno", start)
+            if start is not None and start <= line <= (end or start):
+                candidates.append(parent)
+        if not candidates:
+            return None, False
+        node = min(
+            candidates,
+            key=lambda item: (
+                (getattr(item, "end_lineno", line) or line)
+                - getattr(item, "lineno", line),
+                (getattr(item, "end_col_offset", 0) or 0)
+                - getattr(item, "col_offset", 0),
+            ),
+        )
+        nested_runtime = False
+        statement = None
+        while node is not None:
+            if isinstance(node, ast.Lambda):
+                nested_runtime = True
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                body_start = min(
+                    (item.lineno for item in node.body),
+                    default=node.end_lineno or node.lineno,
+                )
+                if line > node.lineno and line >= body_start:
+                    nested_runtime = True
+            if statement is None and isinstance(node, ast.stmt):
+                statement = node
+            node = parents.get(node)
+        return statement, nested_runtime
+
+    def assignment_used_later(tree: ast.Module, statement: ast.stmt) -> bool:
+        """Whether an assigned name is loaded later during the same import."""
+        if isinstance(statement, ast.Assign):
+            targets = statement.targets
+        elif isinstance(statement, ast.AnnAssign):
+            targets = [statement.target]
+        else:
+            return False
+        names = {target.id for target in targets if isinstance(target, ast.Name)}
+        if len(names) != len(targets):
+            return True
+
+        parents = {}
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                parents[child] = parent
+        container = parents.get(statement)
+        if not isinstance(container, (ast.Module, ast.ClassDef)):
+            return False
+        try:
+            following = container.body[container.body.index(statement) + 1 :]
+        except ValueError:
+            return True
+
+        class ImportLoads(ast.NodeVisitor):
+            found = False
+
+            def visit_Name(self, node: ast.Name) -> None:
+                if isinstance(node.ctx, ast.Load) and node.id in names:
+                    self.found = True
+
+            def _definition_header(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+                for decorator in node.decorator_list:
+                    self.visit(decorator)
+                for default in (*node.args.defaults, *node.args.kw_defaults):
+                    if default is not None:
+                        self.visit(default)
+                for argument in (
+                    *node.args.posonlyargs,
+                    *node.args.args,
+                    *node.args.kwonlyargs,
+                ):
+                    if argument.annotation is not None:
+                        self.visit(argument.annotation)
+                if node.args.vararg and node.args.vararg.annotation is not None:
+                    self.visit(node.args.vararg.annotation)
+                if node.args.kwarg and node.args.kwarg.annotation is not None:
+                    self.visit(node.args.kwarg.annotation)
+                if node.returns is not None:
+                    self.visit(node.returns)
+
+            visit_FunctionDef = _definition_header
+            visit_AsyncFunctionDef = _definition_header
+
+            def visit_Lambda(self, node: ast.Lambda) -> None:
+                for default in (*node.args.defaults, *node.args.kw_defaults):
+                    if default is not None:
+                        self.visit(default)
+
+        visitor = ImportLoads()
+        for later in following:
+            visitor.visit(later)
+            if visitor.found:
+                return True
+        return False
+
+    original_lines = change["lines"] if change["removed"] else set()
+    try:
+        changed_tree = ast.parse(changed, filename=path, type_comments=True)
+    except (SyntaxError, ValueError):
+        return True
+
+    lines = {line for line, _ in change["added_new_at"]}
+    if (
+        original_lines
+        and all(context(original_tree, line)[1] for line in original_lines)
+        and (not lines or all(context(changed_tree, line)[1] for line in lines))
+    ):
+        return False
+    original_statements = {
+        statement
+        for line in original_lines
+        for statement, nested_runtime in [context(original_tree, line)]
+        if statement is not None and not nested_runtime
+    }
+    patched_statements = {
+        statement
+        for line in lines
+        for statement, nested_runtime in [context(changed_tree, line)]
+        if statement is not None and not nested_runtime
+    }
+
+    def class_assignment_key(
+        tree: ast.Module, statement: ast.stmt
+    ) -> tuple[tuple[str, ...], str] | None:
+        if isinstance(statement, ast.Assign):
+            if len(statement.targets) != 1 or not isinstance(statement.targets[0], ast.Name):
+                return None
+            target = statement.targets[0].id
+        elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
+            target = statement.target.id
+        else:
+            return None
+        parents = {}
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                parents[child] = parent
+        owner = parents.get(statement)
+        if not isinstance(owner, ast.ClassDef):
+            return None
+        names = []
+        while isinstance(owner, ast.ClassDef):
+            names.append(owner.name)
+            owner = parents.get(owner)
+        if not isinstance(owner, ast.Module):
+            return None
+        return tuple(reversed(names)), target
+
+    def literal_shape(value: ast.AST | None):
+        if value is None:
+            return ("none",)
+        try:
+            literal = ast.literal_eval(value)
+        except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+            return None
+
+        def shape(item):
+            if isinstance(item, dict):
+                return (
+                    "dict",
+                    tuple(
+                        ((type(key).__qualname__, repr(key)), shape(child))
+                        for key, child in item.items()
+                    ),
+                )
+            if isinstance(item, list):
+                return ("list", tuple(shape(child) for child in item))
+            if isinstance(item, tuple):
+                return ("tuple", tuple(shape(child) for child in item))
+            if isinstance(item, set):
+                return (
+                    "set",
+                    tuple(sorted((shape(child) for child in item), key=repr)),
+                )
+            return ("scalar", type(item).__qualname__)
+
+        return shape(literal)
+
+    original_class_assignments = {
+        key: statement
+        for statement in original_statements
+        for key in [class_assignment_key(original_tree, statement)]
+        if key is not None
+    }
+    patched_class_assignments = {
+        key: statement
+        for statement in patched_statements
+        for key in [class_assignment_key(changed_tree, statement)]
+        if key is not None
+    }
+    for key in original_class_assignments.keys() | patched_class_assignments.keys():
+        original_statement = original_class_assignments.get(key)
+        patched_statement = patched_class_assignments.get(key)
+        if original_statement is None or patched_statement is None:
+            return True
+        original_value = original_statement.value
+        patched_value = patched_statement.value
+        original_shape = literal_shape(original_value)
+        patched_shape = literal_shape(patched_value)
+        if original_shape != patched_shape:
+            return True
+        if (
+            key[1] in (hook_attributes or init_subclass_attributes())
+            and original_shape is not None
+            and original_shape[0] != "dict"
+            and ast.dump(original_value, include_attributes=False)
+            != ast.dump(patched_value, include_attributes=False)
+        ):
+            return True
+
+    for statement in original_statements:
+        if isinstance(statement, ast.Assign):
+            if not all(isinstance(target, ast.Name) for target in statement.targets):
+                return True
+            value = statement.value
+        elif isinstance(statement, ast.AnnAssign):
+            if not isinstance(statement.target, ast.Name):
+                return True
+            if not annotations_deferred(original_tree):
+                return True
+            value = statement.value
+        else:
+            # Removing or replacing an import-time mutation/definition can
+            # alter every importer even when old coordinates vanish from the
+            # patched tree.
+            return True
+        if assignment_used_later(original_tree, statement):
+            return True
+        if value is not None:
+            try:
+                ast.literal_eval(value)
+            except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+                return True
+
+    for line in lines:
+        statement, nested_runtime = context(changed_tree, line)
+        if nested_runtime:
+            continue
+        if statement is None:
+            old_statement, old_nested_runtime = context(original_tree, line)
+            if old_statement is not None and not old_nested_runtime:
+                return True
+            continue
+        if isinstance(statement, ast.Assign):
+            if not all(isinstance(target, ast.Name) for target in statement.targets):
+                return True
+            value = statement.value
+        elif isinstance(statement, ast.AnnAssign):
+            if not isinstance(statement.target, ast.Name):
+                return True
+            if not annotations_deferred(changed_tree):
+                return True
+            value = statement.value
+        elif isinstance(statement, ast.Expr):
+            value = statement.value
+        else:
+            # Definition headers have a separate import-time gate. Other class
+            # and module statements can execute arbitrary code.
+            if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                return True
+            if change["added"]:
+                return True
+            continue
+        if value is None:
+            continue
+        if assignment_used_later(changed_tree, statement):
+            return True
+        try:
+            ast.literal_eval(value)
+        except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+            return True
+    return False
+
+
 def comment_only_addition(change: dict) -> bool:
     return (
         bool(change["added"])
@@ -123,6 +572,8 @@ def comment_only_addition(change: dict) -> bool:
 
 def patched_source(change: dict, path: str) -> str | None:
     """Apply one file's unified hunks to its pinned source."""
+    if "_patched_source" in change:
+        return change["_patched_source"]
     source = pinned_sources().get(path)
     if source is None:
         return None
@@ -135,6 +586,7 @@ def patched_source(change: dict, path: str) -> str | None:
             hunk["old_start"] if hunk["old_count"] == 0 else hunk["old_start"] - 1,
         )
         if start < cursor or start > len(original):
+            change["_patched_source"] = None
             return None
         result.extend(original[cursor:start])
         cursor = start
@@ -143,13 +595,15 @@ def patched_source(change: dict, path: str) -> str | None:
                 result.append(text)
                 continue
             if cursor >= len(original) or original[cursor] != text:
+                change["_patched_source"] = None
                 return None
             if marker == " ":
                 result.append(original[cursor])
             cursor += 1
     result.extend(original[cursor:])
     ending = "\n" if source.endswith("\n") else ""
-    return "\n".join(result) + ending
+    change["_patched_source"] = "\n".join(result) + ending
+    return change["_patched_source"]
 
 
 def invalid_python_patch(change: dict, path: str) -> bool:
@@ -159,10 +613,81 @@ def invalid_python_patch(change: dict, path: str) -> bool:
     if changed is None:
         return True
     try:
-        compile(changed, path, "exec", dont_inherit=True)
+        change["_patched_code"] = compile(changed, path, "exec", dont_inherit=True)
     except (SyntaxError, ValueError, OverflowError):
         return True
     return False
+
+
+def preserves_function_bindings(change: dict, path: str, line: int) -> bool:
+    """Prove an edit cannot change name binding or generator semantics elsewhere."""
+    tree = source_tree(path)
+    if tree is None:
+        return False
+    functions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.lineno <= line <= (node.end_lineno or node.lineno)
+    ]
+    if not functions:
+        return False
+    function = min(
+        functions,
+        key=lambda node: ((node.end_lineno or node.lineno) - node.lineno, node.col_offset),
+    )
+    first_line = min(
+        [function.lineno, *(decorator.lineno for decorator in function.decorator_list)]
+    )
+    if path not in _SOURCE_CODE:
+        try:
+            _SOURCE_CODE[path] = compile(
+                pinned_sources()[path], path, "exec", dont_inherit=True
+            )
+        except (SyntaxError, ValueError, OverflowError):
+            return False
+    patched_code = change.get("_patched_code")
+    if patched_code is None:
+        changed = patched_source(change, path)
+        if changed is None:
+            return False
+        try:
+            patched_code = compile(changed, path, "exec", dont_inherit=True)
+        except (SyntaxError, ValueError, OverflowError):
+            return False
+
+    def matching_codes(root: types.CodeType) -> list[types.CodeType]:
+        matches = []
+        stack = [root]
+        while stack:
+            code = stack.pop()
+            if code.co_name == function.name and code.co_firstlineno == first_line:
+                matches.append(code)
+            stack.extend(
+                constant for constant in code.co_consts if isinstance(constant, types.CodeType)
+            )
+        return matches
+
+    original_matches = matching_codes(_SOURCE_CODE[path])
+    patched_matches = matching_codes(patched_code)
+    if len(original_matches) != 1 or len(patched_matches) != 1:
+        return False
+
+    def binding_fingerprint(code: types.CodeType) -> tuple:
+        return (
+            code.co_argcount,
+            code.co_posonlyargcount,
+            code.co_kwonlyargcount,
+            code.co_nlocals,
+            code.co_varnames,
+            code.co_cellvars,
+            code.co_freevars,
+            code.co_flags,
+        )
+
+    return binding_fingerprint(original_matches[0]) == binding_fingerprint(
+        patched_matches[0]
+    )
 
 
 def inert_comment_addition(change: dict, path: str) -> bool:
@@ -203,7 +728,13 @@ def proven_identity_equality(change: dict, path: str, model: dict) -> bool:
         return False
     global _SEMANTIC_PROOF
     if _SEMANTIC_PROOF is None:
-        _SEMANTIC_PROOF = SemanticProof(pinned_sources())
+        _SEMANTIC_PROOF = SemanticProof(
+            {
+                source_path: source
+                for source_path, source in pinned_sources().items()
+                if source_path.startswith("sqlglot/")
+            }
+        )
     return _SEMANTIC_PROOF.covers(path, change["lines"])
 
 
@@ -211,7 +742,172 @@ def mapped_set(model: dict, set_id: int) -> set[int]:
     return set(model["z"][set_id])
 
 
-def selected_indices(patch: Path, model: dict, all_indices: set[int]) -> set[int]:
+def zero_reader_dict_edit(
+    change: dict,
+    path: str,
+    zero_model: dict,
+    hook_attributes: set[str] | None = None,
+) -> bool:
+    """Prove the patch only changes certified dictionary values no test reads."""
+    entries = zero_model.get("d", {}).get(path)
+    source = pinned_sources().get(path)
+    changed = patched_source(change, path)
+    if not entries or source is None or changed is None:
+        return False
+    try:
+        original_tree = ast.parse(source, filename=path, type_comments=True)
+        changed_tree = ast.parse(changed, filename=path, type_comments=True)
+    except (SyntaxError, ValueError):
+        return False
+
+    def assignments(tree: ast.Module):
+        result = {}
+
+        def visit_body(body: list[ast.stmt], owner: tuple[str, ...]) -> None:
+            for statement in body:
+                if isinstance(statement, ast.Assign):
+                    targets = statement.targets
+                elif isinstance(statement, ast.AnnAssign):
+                    targets = [statement.target]
+                else:
+                    targets = []
+                if (
+                    len(targets) == 1
+                    and isinstance(targets[0], ast.Name)
+                    and isinstance(getattr(statement, "value", None), ast.Dict)
+                ):
+                    key = owner, targets[0].id
+                    if key in result:
+                        result[key] = None
+                    else:
+                        result[key] = statement
+                if isinstance(statement, ast.ClassDef):
+                    visit_body(statement.body, (*owner, statement.name))
+
+        visit_body(tree.body, ())
+        return result
+
+    original_assignments = assignments(original_tree)
+    changed_assignments = assignments(changed_tree)
+    candidates = []
+    changed_lines = change["lines"]
+    for start, end, target, zero_keys in entries:
+        if not any(start <= line <= end for line in changed_lines):
+            continue
+        matches = [
+            (key, statement)
+            for key, statement in original_assignments.items()
+            if key[1] == target
+            and statement is not None
+            and statement.lineno == start
+            and (statement.end_lineno or statement.lineno) == end
+        ]
+        if len(matches) != 1:
+            return False
+        candidates.append((*matches[0], set(zero_keys)))
+    if len(candidates) != 1:
+        return False
+
+    key, original_statement, zero_keys = candidates[0]
+    changed_statement = changed_assignments.get(key)
+    if changed_statement is None:
+        return False
+    original_dict = original_statement.value
+    changed_dict = changed_statement.value
+    if any(item is None for item in (*original_dict.keys, *changed_dict.keys)):
+        return False
+    if len(original_dict.keys) != len(changed_dict.keys):
+        return False
+    original_key_dumps = [
+        ast.dump(item, include_attributes=False) for item in original_dict.keys
+    ]
+    changed_key_dumps = [
+        ast.dump(item, include_attributes=False) for item in changed_dict.keys
+    ]
+    if original_key_dumps != changed_key_dumps:
+        return False
+
+    runtime_keys = []
+    for key_node in original_dict.keys:
+        try:
+            runtime_key = ast.literal_eval(key_node)
+            hash(runtime_key)
+        except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+            return False
+        if runtime_key in runtime_keys:
+            return False
+        runtime_keys.append(runtime_key)
+
+    changed_values = [
+        index
+        for index, (old, new) in enumerate(
+            zip(original_dict.values, changed_dict.values)
+        )
+        if ast.dump(old, include_attributes=False)
+        != ast.dump(new, include_attributes=False)
+    ]
+    if not changed_values:
+        return False
+    for index in changed_values:
+        if original_key_dumps[index] not in zero_keys:
+            return False
+        try:
+            ast.literal_eval(original_dict.values[index])
+            ast.literal_eval(changed_dict.values[index])
+        except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+            return False
+        original_dict.values[index] = ast.Constant(value=None)
+        changed_dict.values[index] = ast.Constant(value=None)
+
+    if ast.dump(original_tree, include_attributes=False) != ast.dump(
+        changed_tree, include_attributes=False
+    ):
+        return False
+    return not import_expression_hazard(change, path, hook_attributes)
+
+
+def path_dependency_cone(
+    paths: tuple[str | None, ...],
+    model: dict,
+    test_file_indices: dict[str, set[int]] | None,
+) -> tuple[set[int], bool]:
+    selected: set[int] = set()
+    known = False
+    for path in paths:
+        if path in (None, "/dev/null"):
+            continue
+        if test_file_indices and path in test_file_indices:
+            selected.update(test_file_indices[path])
+            known = True
+        for mapping in (model.get("x", {}), model.get("r", {})):
+            set_id = mapping.get(path)
+            if set_id is not None:
+                selected.update(mapped_set(model, set_id))
+                known = True
+        entry = model.get("f", {}).get(path)
+        if entry is not None:
+            selected.update(mapped_set(model, entry["f"]))
+            known = True
+        parts = Path(path).parts
+        if (
+            len(parts) >= 3
+            and parts[0] == "sqlglot"
+            and parts[1] in {"dialects", "parsers", "generators", "typing"}
+        ):
+            set_id = model.get("q", {}).get(Path(path).stem.lower())
+            if set_id is not None:
+                selected.update(mapped_set(model, set_id))
+                known = True
+    return selected, known
+
+
+def selected_indices(
+    patch: Path,
+    model: dict,
+    all_indices: set[int],
+    test_file_indices: dict[str, set[int]] | None = None,
+    zero_model: dict | None = None,
+) -> set[int]:
     selected: set[int] = set()
     changes = patch_changes(patch)
     if not changes:
@@ -224,10 +920,23 @@ def selected_indices(patch: Path, model: dict, all_indices: set[int]) -> set[int
             selected.update(all_indices)
             continue
         if old_path != new_path:
-            # New/deleted/renamed modules can invalidate imports independently
-            # of any covered line in the old file.
-            selected.update(all_indices)
-            continue
+            # Renames and deletions invalidate their known consumers even when
+            # no executable line changed. Unknown additions remain global.
+            if any(
+                candidate not in (None, "/dev/null")
+                and candidate.startswith("tests/")
+                and candidate.endswith(".py")
+                for candidate in (old_path, new_path)
+            ):
+                selected.update(all_indices)
+                continue
+            cone, known = path_dependency_cone(
+                (old_path, new_path), model, test_file_indices
+            )
+            selected.update(cone)
+            if not known:
+                selected.update(all_indices)
+                continue
         if invalid_python_patch(change, path):
             # Python parses the whole module before any test can import it.
             selected.update(all_indices)
@@ -241,6 +950,10 @@ def selected_indices(patch: Path, model: dict, all_indices: set[int]) -> set[int
             continue
         if proven_identity_equality(change, path, model):
             continue
+        if test_file_indices and path in test_file_indices:
+            # A syntax or import error fails every collected test in the file,
+            # even when only one test function covered the changed line.
+            selected.update(test_file_indices[path])
 
         fixture_set = model["x"].get(path)
         if fixture_set is not None:
@@ -249,6 +962,11 @@ def selected_indices(patch: Path, model: dict, all_indices: set[int]) -> set[int
         if path.startswith("tests/fixtures/"):
             # An unseen fixture can be shared or loaded during class setup.
             selected.update(all_indices)
+            continue
+
+        if zero_model is not None and zero_reader_dict_edit(
+            change, path, zero_model, model.get("h")
+        ):
             continue
 
         entry = model["f"].get(path)
@@ -276,6 +994,14 @@ def selected_indices(patch: Path, model: dict, all_indices: set[int]) -> set[int
                 continue
 
         for line in changed_lines:
+            if (
+                change["removed"]
+                and line in line_sets
+                and precise_coverage_line(path, line)
+                and preserves_function_bindings(change, path, line)
+            ):
+                selected.update(mapped_set(model, line_sets[line]))
+                continue
             containing = [scope for scope in scopes if scope[0] <= line <= scope[1]]
             if containing:
                 scope = min(containing, key=lambda item: item[1] - item[0])
@@ -294,14 +1020,29 @@ def selected_indices(patch: Path, model: dict, all_indices: set[int]) -> set[int
         if not changed_lines or path in PROCESS_SERIALIZATION_FILES:
             selected.update(mapped_set(model, entry["f"]))
 
+        expression_hazard = import_expression_hazard(change, path, model.get("h"))
         if any(
             start <= line <= end
             for start, end in entry.get("i", ())
             for line in changed_lines
-        ):
+        ) or any(
+            import_definition_line(path, line) for line in changed_lines
+        ) or expression_hazard:
             importer_set = model.get("r", {}).get(path)
             if importer_set is not None:
                 selected.update(mapped_set(model, importer_set))
+            if expression_hazard:
+                parts = Path(path).parts
+                if path.startswith("tests/"):
+                    selected.update(all_indices)
+                elif (
+                    len(parts) >= 3
+                    and parts[0] == "sqlglot"
+                    and parts[1] in {"dialects", "parsers", "generators", "typing"}
+                ):
+                    dialect_set = model.get("q", {}).get(Path(path).stem.lower())
+                    if dialect_set is not None:
+                        selected.update(mapped_set(model, dialect_set))
 
         matched_assignment = False
         for start, end, set_id in model.get("a", {}).get(path, ()):
@@ -328,13 +1069,35 @@ def main() -> None:
     tests_by_id = {test["id"]: test for test in tests}
     with gzip.open(MODEL, "rt", encoding="utf-8") as model_file:
         model = json.load(model_file)
+    model["h"] = set(model.get("h", ()))
+    with gzip.open(ZERO_READER_MODEL, "rt", encoding="utf-8") as zero_model_file:
+        zero_model = json.load(zero_model_file)
+    if (
+        zero_model.get("v") != 1
+        or zero_model.get("sha") != model.get("sha")
+        or zero_model.get("n") != len(tests)
+        or zero_model.get("t")
+        != hashlib.sha256(
+            "\0".join(test["id"] for test in tests).encode("utf-8")
+        ).hexdigest()
+    ):
+        zero_model = {"d": {}}
     mapped_tests = [tests_by_id.get(test_id) for test_id in model["t"]]
     all_indices = {index for index, test in enumerate(mapped_tests) if test is not None}
+    test_file_indices: dict[str, set[int]] = {}
+    for index, test in enumerate(mapped_tests):
+        if test is not None:
+            test_file_indices.setdefault(test["file"], set()).add(index)
+    modeled_ids = set(model["t"])
+    unmapped_tests = [test for test in tests if test["id"] not in modeled_ids]
 
     selection_count = 0
     for patch in sorted((DATA / "commits").glob("*.patch")):
-        indices = selected_indices(patch, model, all_indices)
+        indices = selected_indices(
+            patch, model, all_indices, test_file_indices, zero_model
+        )
         selected = [mapped_tests[index] for index in indices if mapped_tests[index] is not None]
+        selected.extend(unmapped_tests)
         selection_count += len(selected)
         workers = best_split(selected)
         print(

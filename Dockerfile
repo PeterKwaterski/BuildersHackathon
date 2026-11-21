@@ -6,4 +6,5 @@ COPY selector.py /app/selector.py
 COPY semantic.py /app/semantic.py
 COPY selector_model.json.gz /app/selector_model.json.gz
 COPY semantic_sources.json.gz /app/semantic_sources.json.gz
+COPY zero_reader_model.json.gz /app/zero_reader_model.json.gz
 CMD ["python", "/app/selector.py"]

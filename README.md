@@ -44,15 +44,16 @@ make check    # the output's format only
 
 `sample/answers.json` lists the tests each sample commit breaks and the kind of change it is. The practice and final commits are hidden, and so is everything your program prints when it runs on them. A rejected submission tells you which rule it broke and nothing more, so reproduce problems here.
 
-The current exact-image sample result is **137.148 simulated seconds with zero
-misses**. Three instrumented container runs used a median 2.657 CPU seconds,
-for a local middle total of **139.805 seconds**. Model collection used the
-pinned Python 3.13 image and the locked
-dependencies. Ordinary coverage is merged with a coverage-only synchronous
-process-pool pass so both serialization paths and optimizer/executor bodies are
-represented. `tools/build_model.py` compacts those answer-independent inputs
-into `selector_model.json.gz`; runtime test IDs are resolved against
-`/data/tests.json` rather than assuming fixed test numbers.
+The current exact-image sample result is **118.952 simulated seconds with zero
+misses**. Seven recent selector-body measurements in the scorer container had a
+1.103-second median; process startup is additional and the board measures the
+complete container. Model collection used the pinned Python 3.13 image and the
+locked dependencies. Ordinary coverage is merged with a coverage-only
+synchronous process-pool pass so both serialization paths and
+optimizer/executor bodies are represented. `tools/build_model.py` compacts
+those answer-independent inputs into `selector_model.json.gz`; runtime test IDs
+are resolved against `/data/tests.json` rather than assuming fixed test
+numbers.
 
 At runtime, a general semantic analyzer derives identity/equality equivalence
 from the committed pinned source. It is used only when a one-line patch changes
@@ -61,6 +62,25 @@ an Enum singleton or an object-identity class. Ordinary added comments are
 skipped only when applying their full unified diff produces the same Python AST
 (including type comments); directives and compile errors stay conservative.
 These are source analyses, not sample-patch or answer lookups.
+
+Import-time edits are checked in both the old and patched trees. The selector
+accounts for deleted side effects, evaluated annotations, later uses in the
+same module or class, literal container shape, and attributes consumed by
+`__init_subclass__`. Function-body line coverage is used only when the AST and
+compiled binding layout prove that executing the changed line reaches the edit
+without changing local or closure bindings.
+
+`tools/collect_dict_access.py` reproduces the complete pinned-suite access trace
+described in `tools/DICT_TRACING.md`; `tools/build_zero_reader_model.py` turns it
+into a still narrower certificate. Static identity flow must prove
+that a dictionary reaches only keyed readers or key/shape-only operations; an
+unknown call, copy, value-wide operation, native boundary, relevant
+import-context read, or value-observing trace wildcard rejects it. At runtime this certificate is used only for an
+existing literal key with no reader at all, identical old/new key order, literal
+old/new values, and a whole-file AST that becomes identical when the changed
+value is replaced by a sentinel. Every uncertainty falls back to the ordinary
+assignment dependency cone. The certificate is derived from pinned sources and
+tests and contains no sample commit, patch, or answer information.
 
 ## Submit
 
