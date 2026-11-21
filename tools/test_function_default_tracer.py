@@ -17,6 +17,7 @@ from collect_function_defaults import (
 
 SOURCE = """
 import functools
+import inspect
 
 def candidate(x=5, y=7): return x + y
 def keyword(x=2, *, flag=True): return x if flag else 0
@@ -60,6 +61,10 @@ def stale_native_cases():
     dispatch(native, lambda: [2, 1])
 def constructor_case(): Constructed(99)
 def partial_subclass_case(): PartialSubclass(candidate)(99)
+def partial_cases():
+    functools.partial(candidate, 1, y=2)()
+    functools.partial(candidate, 1)()
+def reflection_case(): inspect.signature(candidate)
 """
 
 
@@ -134,6 +139,12 @@ def main() -> None:
         label: dict(events) for label, events in trace.EVENTS.items()
     }
 
+    reset(None)
+    namespace["explicit_cases"]()
+    assert not any("reader" in events for events in trace.EVENTS.values())
+    namespace["candidate"]()
+    assert trace.EVENTS["candidate:x"]["reader"] == {"__NO_TEST__"}
+
     reset("omitted")
     namespace["omitted_cases"]()
     assert all(events["reader"] == {"omitted"} for events in trace.EVENTS.values())
@@ -162,6 +173,16 @@ def main() -> None:
     namespace["partial_subclass_case"]()
     assert trace.EVENTS["candidate:x"]["reader"] == {"partial-subclass"}
     assert trace.EVENTS["candidate:y"]["reader"] == {"partial-subclass"}
+
+    reset("partial")
+    namespace["partial_cases"]()
+    assert "reader" not in trace.EVENTS["candidate:x"]
+    assert trace.EVENTS["candidate:y"]["reader"] == {"partial"}
+
+    reset("reflection")
+    namespace["reflection_case"]()
+    assert trace.EVENTS["candidate:x"]["reflect"] == {"reflection"}
+    assert trace.EVENTS["candidate:y"]["reader"] == {"reflection"}
     print("function-default tracer synthetic regressions passed")
 
 

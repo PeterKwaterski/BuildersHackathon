@@ -15,6 +15,8 @@ from collect_function_default_imports import module_names, tasks
 from build_function_default_model import (
     SUITE_MANIFEST_KEYS,
     SYNC_INSTRUMENTATION_DELTA,
+    consumed_labels,
+    reader_owners,
     valid_instrumentation_counts,
     valid_import_provenance,
     valid_suite_provenance,
@@ -62,6 +64,33 @@ class ImportTracePlanTests(unittest.TestCase):
         self.assertEqual(len(tokens), len(set(tokens)))
         changed = dict(plan[0], name=plan[0]["name"] + ".tampered")
         self.assertNotEqual(token(plan[0]), token(changed))
+
+    def test_only_consumption_events_poison_import_global_defaults(self):
+        events = {
+            "explicit": {"call": ["__IMPORT__"], "entered": ["__IMPORT__"]},
+            "omitted": {
+                "call": ["__IMPORT__"],
+                "entered": ["__IMPORT__"],
+                "reader": ["__IMPORT__"],
+            },
+            "native": {"opaque": ["__IMPORT__"], "reader": ["__IMPORT__"]},
+            "reflected": {"reflect": ["__IMPORT__"], "reader": ["__IMPORT__"]},
+            "test-only": {"reader": ["a-test"]},
+            "suite-explicit": {
+                "call": ["__NO_TEST__"],
+                "entered": ["__NO_TEST__"],
+            },
+            "suite-omitted": {"reader": ["__NO_TEST__"]},
+        }
+        self.assertEqual(
+            consumed_labels(events, "__IMPORT__"),
+            {"omitted", "native", "reflected"},
+        )
+        self.assertEqual(reader_owners(events["explicit"]), set())
+        self.assertEqual(reader_owners(events["omitted"]), {"__IMPORT__"})
+        self.assertEqual(
+            consumed_labels(events, "__NO_TEST__"), {"suite-omitted"}
+        )
 
 
 class ArtifactEncodingTests(unittest.TestCase):

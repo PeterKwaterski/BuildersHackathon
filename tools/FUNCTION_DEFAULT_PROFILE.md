@@ -22,8 +22,9 @@ Lazy module imports are a separate lifecycle boundary: a default consumed
 while a test imports a dialect can initialize module or registry state that a
 later test observes. A third trace therefore imports every SQLGlot module in a
 fresh process, then exercises base-warm dialect loading in both orders. Every
-default touched by that trace is globally `import-read`; it is never assigned
-only to the test which happened to trigger the import.
+default consumed by that trace is globally `import-read`; an explicitly bound
+parameter is not. Import-global readers are never assigned only to the test
+which happened to trigger the import.
 
 ```sh
 python tools/collect_function_defaults.py \

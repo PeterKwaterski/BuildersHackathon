@@ -140,6 +140,20 @@ def write_model(output: Path, payload: dict) -> None:
             compressed.write(raw)
 
 
+def reader_owners(events: dict | None) -> set[str]:
+    """Return owners proven to have consumed a default value."""
+    return set(events.get("reader", ())) if events else set()
+
+
+def consumed_labels(events: dict[str, dict], owner: str) -> set[str]:
+    """Return labels whose default value was consumed by ``owner``."""
+    return {
+        label
+        for label, kinds in events.items()
+        if owner in reader_owners(kinds)
+    }
+
+
 def inventory(source: Path):
     runtime = source_labels(source)
     for path in sorted((source / "sqlglot").rglob("*.py")):
@@ -333,8 +347,9 @@ def main() -> None:
 
     # A separate, fresh-process trace closes the lifecycle gap where a lazy
     # module import happens under a test owner and initializes shared module or
-    # dialect-registry state.  Every default touched by import is globally
-    # unsafe, regardless of the owner sets in the two suite traces.
+    # dialect-registry state.  Every default consumed by import is globally
+    # unsafe, regardless of the owner sets in the two suite traces. Calls
+    # which explicitly bind the parameter do not consume its default.
     import_manifest_path = args.import_manifest.resolve()
     import_trace_path = args.import_trace.resolve()
     import_manifest = json.loads(import_manifest_path.read_text())
@@ -439,7 +454,12 @@ def main() -> None:
             or any(owners != ["__IMPORT__"] for owners in events.values())
         ):
             raise SystemExit(f"malformed import events for {label}")
-    import_labels = set(import_trace["events"])
+    # Import-time execution is globally shared, but an explicit-argument call
+    # does not read the function's default.  The tracker emits ``reader`` for
+    # every omitted argument and conservatively for reflection, native entry,
+    # constructors, starred calls, and opaque partial dispatch.  Only that
+    # consumption event can make a default import-global.
+    import_labels = consumed_labels(import_trace["events"], "__IMPORT__")
 
     for path, document in zip(args.trace, documents):
         if not isinstance(document, dict) or set(document) != {
@@ -622,7 +642,10 @@ def main() -> None:
             state = "ambiguous"
         elif any(events is None for events in observations):
             state = "incomplete" if owners else "unobserved"
-        elif "__NO_TEST__" in owners:
+        elif any(
+            "__NO_TEST__" in reader_owners(events)
+            for events in observations
+        ):
             state = "import-read"
         elif not owners or "call" not in kinds:
             state = "unobserved"

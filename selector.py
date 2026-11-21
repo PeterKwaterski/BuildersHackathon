@@ -40,7 +40,7 @@ NEW_MODULE_MODEL = Path(__file__).with_name("new_module_model.json.gz")
 FUNCTION_DEFAULT_MODEL = Path(__file__).with_name("function_default_model.json.gz")
 # Filled only after all exact Python 3.13 traces build the final artifact.
 # An empty pin intentionally disables the profile.
-FUNCTION_DEFAULT_PROFILE_SHA256 = "fa12e481e8628e3234ae60a506892af6ba0d02309a63a76d4f738aed85430a18"
+FUNCTION_DEFAULT_PROFILE_SHA256 = "f729c7f9c1eb6a30646b513006ad6829b159ca118e42714e07082bda966d2968"
 GENERATOR_DISPATCH_INVENTORY_SHA256 = "3e3cb5a12da0fb01cd68f9b2fc789bc8d020523e015fea7016e04679c34d1dca"
 GENERATOR_DISPATCH_PROFILE_SHA256 = "8829e844dbd6870f2bca81cc7fb4f89f16ccdef7ecbba278748cdd850aeb1bfd"
 NEW_MODULE_PROFILE_SHA256 = "1b24ab53483bb1932d8139b80fa17e797a1974ee3078157a110c0f25b28f4e10"
