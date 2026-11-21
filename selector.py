@@ -26,9 +26,9 @@ ARG_TYPE_DERIVATION_MODEL = Path(__file__).with_name(
 CLASS_ATTRIBUTE_MODEL = Path(__file__).with_name("class_attribute_model.json.gz")
 FRESH_ALIAS_PROFILE = Path(__file__).with_name("fresh_alias_profile.json.gz")
 SHARED_ARG_WRITE_MODEL = Path(__file__).with_name("shared_arg_write_model.json.gz")
-# Candidate recognition is complete, but narrowing stays off until the
-# source-derived non-escape/ownership fixed point is admitted independently.
-SHARED_ARG_WRITE_ENABLED = False
+# The artifact admits only calls whose exact-formal identity and non-escape
+# fixed point proves that mutations stay within a fresh owned object graph.
+SHARED_ARG_WRITE_ENABLED = True
 _SHARED_ARG_WRITE_MODEL = None
 MAX_WORKERS = 8
 WORKER_COST_MS = 2_000
@@ -657,7 +657,7 @@ def patched_source(change: dict, path: str) -> str | None:
 
 
 def contained_fresh_receiver_edit(change: dict, path: str) -> bool:
-    """Default-off bridge to the source-derived fresh-receiver candidate gate."""
+    """Apply the source-derived fresh-object ownership admission gate."""
     global _SHARED_ARG_WRITE_MODEL
     if not SHARED_ARG_WRITE_ENABLED:
         return False

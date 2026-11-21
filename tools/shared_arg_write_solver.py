@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import builtins
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 import gzip
@@ -107,6 +108,7 @@ class FunctionInfo:
     fresh_classes: dict[str, tuple[str, str]] = field(default_factory=dict)
     ambiguous_fresh_classes: set[str] = field(default_factory=set)
     fresh_calls: set[tuple[int, int, str, str]] = field(default_factory=set)
+    contained_fresh_calls: set[tuple[int, int, str, str]] = field(default_factory=set)
     direct: list[int] = field(default_factory=list)
     summary: list[int] = field(default_factory=list)
     return_alias: set[int] = field(default_factory=set)
@@ -438,6 +440,681 @@ class SourceIndex:
         return list(self.module_functions.get((target_path, name), ())) if target_path else []
 
 
+@dataclass(frozen=True, slots=True)
+class OwnershipResult:
+    safe: bool
+    identity: bool = False
+    written_fields: frozenset[str] = frozenset()
+
+
+class OwnershipAnalyzer:
+    """Context-sensitive non-escape proof for one exact fresh object graph."""
+
+    UNKNOWN_VALUE = object()
+    OWNED_VALUE = object()
+
+    def __init__(self, solver: "SharedArgumentSolver") -> None:
+        self.solver = solver
+        self.index = solver.index
+        self.memo: dict[tuple, OwnershipResult] = {}
+        self.active: set[tuple] = set()
+        self.failures: Counter = Counter()
+
+    def _reject(self, reason: str) -> OwnershipResult:
+        self.failures[reason] += 1
+        return OwnershipResult(False)
+
+    @staticmethod
+    def _contains_alias(node: ast.AST | None, aliases: set[str]) -> bool:
+        return bool(node) and any(
+            isinstance(child, ast.Name)
+            and isinstance(child.ctx, ast.Load)
+            and child.id in aliases
+            for child in ast.walk(node)
+        )
+
+    def _class_constant(
+        self, domain: tuple[str, str], name: str, seen=frozenset()
+    ) -> object:
+        if domain in seen:
+            return self.UNKNOWN_VALUE
+        path, qualname = domain
+        cls = self.index.classes.get(domain)
+        if cls is None:
+            return self.UNKNOWN_VALUE
+        values = []
+        for statement in cls.body:
+            if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                if any(isinstance(target, ast.Name) and target.id == name for target in targets):
+                    value = statement.value
+                    if isinstance(value, ast.Constant):
+                        values.append(value.value)
+                    else:
+                        return self.UNKNOWN_VALUE
+        if values:
+            return values[0] if all(value == values[0] for value in values) else self.UNKNOWN_VALUE
+        inherited = []
+        for base in self.index.class_bases.get(domain, ()):
+            base_name = base.rsplit(".", 1)[-1]
+            candidates = self.index.global_classes_by_name.get(base_name, ())
+            if len(candidates) != 1:
+                return self.UNKNOWN_VALUE
+            value = self._class_constant(candidates[0], name, seen | {domain})
+            if value is not self.UNKNOWN_VALUE:
+                inherited.append(value)
+        return (
+            inherited[0]
+            if inherited and all(value == inherited[0] for value in inherited)
+            else self.UNKNOWN_VALUE
+        )
+
+    def _has_truth_protocol(self, domain: tuple[str, str]) -> bool:
+        return bool(
+            self.index.method(*domain, "__bool__")
+            or self.index.method(*domain, "__len__")
+        )
+
+    def _known(
+        self,
+        node: ast.AST | None,
+        aliases: set[str],
+        values: Mapping[str, object],
+        domain: tuple[str, str],
+        fields: Mapping[str, object],
+    ) -> object:
+        if node is None:
+            return None
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.Name):
+            if node.id in aliases:
+                return self.UNKNOWN_VALUE if self._has_truth_protocol(domain) else self.OWNED_VALUE
+            return values.get(node.id, self.UNKNOWN_VALUE)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            if node.value.id in aliases:
+                if node.attr in fields:
+                    return fields[node.attr]
+                return self._class_constant(domain, node.attr)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            value = self._known(node.operand, aliases, values, domain, fields)
+            return self.UNKNOWN_VALUE if value is self.UNKNOWN_VALUE else not bool(value)
+        if isinstance(node, ast.BoolOp):
+            current: object = True if isinstance(node.op, ast.And) else False
+            for value_node in node.values:
+                current = self._known(value_node, aliases, values, domain, fields)
+                if current is self.UNKNOWN_VALUE:
+                    return current
+                if isinstance(node.op, ast.And) and not bool(current):
+                    return current
+                if isinstance(node.op, ast.Or) and bool(current):
+                    return current
+            return current
+        if isinstance(node, ast.Compare) and len(node.ops) == len(node.comparators) == 1:
+            left = self._known(node.left, aliases, values, domain, fields)
+            right = self._known(node.comparators[0], aliases, values, domain, fields)
+            if left is self.UNKNOWN_VALUE or right is self.UNKNOWN_VALUE:
+                return self.UNKNOWN_VALUE
+            operation = node.ops[0]
+            if isinstance(operation, ast.Is):
+                return left is right
+            if isinstance(operation, ast.IsNot):
+                return left is not right
+            if isinstance(operation, ast.Eq) and type(left) is type(right):
+                return left == right
+            if isinstance(operation, ast.NotEq) and type(left) is type(right):
+                return left != right
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "isinstance"
+            and len(node.args) == 2
+        ):
+            value = self._known(node.args[0], aliases, values, domain, fields)
+            if value is not self.UNKNOWN_VALUE and value is not self.OWNED_VALUE:
+                class_name = dotted(node.args[1])
+                builtin = {
+                    "bool": bool, "bytes": bytes, "dict": dict, "float": float,
+                    "int": int, "list": list, "str": str, "tuple": tuple,
+                }.get(class_name or "")
+                if builtin is not None:
+                    return isinstance(value, builtin)
+                # A scalar cannot be an application source class.
+                if type(value) in {bool, bytes, float, int, str, tuple, type(None)}:
+                    return False
+        return self.UNKNOWN_VALUE
+
+    @staticmethod
+    def _parameter_defaults(info: FunctionInfo) -> dict[int, object]:
+        node = info.node
+        if isinstance(node, ast.Lambda):
+            arguments = node.args
+        else:
+            arguments = node.args
+        positional = [*arguments.posonlyargs, *arguments.args]
+        defaults = [None] * (len(positional) - len(arguments.defaults)) + list(arguments.defaults)
+        result: dict[int, object] = {}
+        for slot, default in enumerate(defaults):
+            if isinstance(default, ast.Constant):
+                result[slot] = default.value
+        offset = len(positional) + (1 if arguments.vararg else 0)
+        for index, default in enumerate(arguments.kw_defaults, offset):
+            if isinstance(default, ast.Constant):
+                result[index] = default.value
+        return result
+
+    def _call_target(
+        self,
+        info: FunctionInfo,
+        call: ast.Call,
+        aliases: set[str],
+        domain: tuple[str, str],
+    ) -> CallTarget | None:
+        if isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name):
+            if call.func.value.id in aliases:
+                candidates = self.index.method(*domain, call.func.attr)
+                if len(candidates) != 1:
+                    return None
+                target = self.index.functions[candidates[0]]
+                if target.decorators - TRANSPARENT_DECORATORS or "property" in target.decorators:
+                    return None
+                return CallTarget(target.key, call.func.value, True, True)
+        return self.solver._resolve_call(info, call)
+
+    def _call_effect(
+        self,
+        info: FunctionInfo,
+        call: ast.Call,
+        aliases: set[str],
+        values: Mapping[str, object],
+        domain: tuple[str, str],
+        fields: Mapping[str, object],
+    ) -> OwnershipResult:
+        if not self._contains_alias(call, aliases):
+            return OwnershipResult(True)
+        direct_receiver = (
+            isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id in aliases
+        )
+        direct_arguments = any(
+            isinstance(argument, ast.Name) and argument.id in aliases
+            for argument in call.args
+        ) or any(
+            isinstance(keyword.value, ast.Name) and keyword.value.id in aliases
+            for keyword in call.keywords
+        )
+        nested_arguments = any(
+            self._contains_alias(argument, aliases)
+            and not (isinstance(argument, ast.Name) and argument.id in aliases)
+            for argument in call.args
+        ) or any(
+            self._contains_alias(keyword.value, aliases)
+            and not (isinstance(keyword.value, ast.Name) and keyword.value.id in aliases)
+            for keyword in call.keywords
+        )
+        if nested_arguments:
+            len_owned_field = (
+                isinstance(call.func, ast.Name)
+                and call.func.id == "len"
+                and len(call.args) == 1
+                and not call.keywords
+                and isinstance(call.args[0], ast.Attribute)
+                and isinstance(call.args[0].value, ast.Name)
+                and call.args[0].value.id in aliases
+                and self._owned_field_type(domain, call.args[0].attr) is not None
+            )
+            formatted_values = [
+                argument
+                for argument in call.args
+                if self._contains_alias(argument, aliases)
+            ]
+            formatted_safe = bool(formatted_values) and all(
+                isinstance(argument, ast.JoinedStr)
+                and self._expression_safe(
+                    info, argument, aliases, values, domain, fields
+                ).safe
+                for argument in formatted_values
+            )
+            if not len_owned_field and not formatted_safe:
+                return self._reject("nested-alias-argument")
+            return OwnershipResult(True)
+        if not direct_receiver and not direct_arguments:
+            if not self._owned_field_call(call, aliases, domain):
+                return self._reject("unproved-owned-field-call")
+            return OwnershipResult(True)
+        if (
+            isinstance(call.func, ast.Name)
+            and call.func.id in {"isinstance", "type"}
+            and call.args
+            and isinstance(call.args[0], ast.Name)
+            and call.args[0].id in aliases
+        ):
+            return OwnershipResult(True)
+        target = self._call_target(info, call, aliases, domain)
+        if target is None:
+            return self._reject("unresolved-call")
+        bound, error = self.solver._bind(call, target)
+        if error is not None:
+            return self._reject(f"binding:{error}")
+        tracked_slots: set[int] = set()
+        if (
+            target.receiver_to_slot
+            and isinstance(target.receiver, ast.Name)
+            and target.receiver.id in aliases
+        ):
+            tracked_slots.add(0)
+        known: dict[int, object] = {}
+        for actual, slot in bound:
+            if isinstance(actual, ast.Name) and actual.id in aliases:
+                tracked_slots.add(slot)
+            elif self._contains_alias(actual, aliases):
+                return self._reject("nested-alias-argument")
+            else:
+                value = self._known(actual, aliases, values, domain, fields)
+                if value is not self.UNKNOWN_VALUE:
+                    known[slot] = value
+        if len(tracked_slots) != 1:
+            return self._reject("ambiguous-tracked-slots")
+        tracked_slot = next(iter(tracked_slots))
+        callee = self.index.functions[target.key]
+        callee_domain = domain
+        if tracked_slot != 0:
+            callee_domain = domain
+        result = self.prove(target.key, tracked_slot, callee_domain, known, fields)
+        return result
+
+    def _owned_field_call(
+        self,
+        call: ast.Call,
+        aliases: set[str],
+        domain: tuple[str, str],
+    ) -> bool:
+        """Prove a call is an exact builtin operation on an owned field."""
+        if not (
+            isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Attribute)
+            and isinstance(call.func.value.value, ast.Name)
+            and call.func.value.value.id in aliases
+            and not call.func.attr.startswith("__")
+        ):
+            return False
+        builtin_type = self._owned_field_type(domain, call.func.value.attr)
+        if builtin_type is None:
+            return False
+        descriptor = vars(builtin_type).get(call.func.attr)
+        return descriptor is not None and callable(descriptor)
+
+    def _owned_field_type(
+        self, domain: tuple[str, str], field_name: str
+    ) -> type | None:
+        annotations: set[str] = set()
+        pending = [domain]
+        seen = set()
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                return False
+            seen.add(current)
+            cls = self.index.classes.get(current)
+            if cls is None:
+                return False
+            for node in ast.walk(cls):
+                if not isinstance(node, ast.AnnAssign):
+                    continue
+                target_matches = (
+                    isinstance(node.target, ast.Attribute)
+                    and isinstance(node.target.value, ast.Name)
+                    and node.target.value.id == "self"
+                    and node.target.attr == field_name
+                ) or (isinstance(node.target, ast.Name) and node.target.id == field_name)
+                if not target_matches:
+                    continue
+                builtin_annotations = {
+                    child.id
+                    for child in ast.walk(node.annotation)
+                    if isinstance(child, ast.Name)
+                    and child.id in {"dict", "list", "set", "tuple"}
+                }
+                annotations.update(builtin_annotations)
+            for base in self.index.class_bases.get(current, ()):
+                candidates = self.index.global_classes_by_name.get(base.rsplit(".", 1)[-1], ())
+                if len(candidates) != 1:
+                    return False
+                pending.append(candidates[0])
+        if len(annotations) != 1:
+            return None
+        builtin_name = next(iter(annotations)).rsplit(".", 1)[-1]
+        return {"dict": dict, "list": list, "set": set, "tuple": tuple}.get(
+            builtin_name
+        )
+
+    def _expression_safe(
+        self,
+        info: FunctionInfo,
+        node: ast.AST | None,
+        aliases: set[str],
+        values: Mapping[str, object],
+        domain: tuple[str, str],
+        fields: Mapping[str, object],
+    ) -> OwnershipResult:
+        if node is None or not self._contains_alias(node, aliases):
+            return OwnershipResult(True)
+        if isinstance(node, ast.Call):
+            return self._call_effect(info, node, aliases, values, domain, fields)
+        if isinstance(node, ast.Name) and node.id in aliases:
+            return OwnershipResult(True, identity=True)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in aliases:
+            methods = self.index.method(*domain, node.attr)
+            if methods:
+                if len(methods) != 1:
+                    return self._reject("ambiguous-descriptor")
+                target = self.index.functions[methods[0]]
+                if "property" not in target.decorators:
+                    return self._reject("bound-method-escape")
+                return self.prove(target.key, 0, domain, {}, fields)
+            return OwnershipResult(True)
+        if isinstance(node, (ast.BoolOp, ast.UnaryOp, ast.Compare)):
+            known = self._known(node, aliases, values, domain, fields)
+            return OwnershipResult(known is not self.UNKNOWN_VALUE)
+        if isinstance(node, ast.IfExp):
+            condition = self._known(node.test, aliases, values, domain, fields)
+            if condition is self.UNKNOWN_VALUE:
+                left = self._expression_safe(info, node.body, aliases, values, domain, fields)
+                right = self._expression_safe(info, node.orelse, aliases, values, domain, fields)
+                return OwnershipResult(
+                    left.safe and right.safe,
+                    left.identity and right.identity,
+                    left.written_fields | right.written_fields,
+                )
+            return self._expression_safe(
+                info,
+                node.body if bool(condition) else node.orelse,
+                aliases,
+                values,
+                domain,
+                fields,
+            )
+        if isinstance(node, (ast.JoinedStr, ast.FormattedValue)):
+            # Avoid mutating the pinned AST with parent pointers: explicitly
+            # accept only occurrences used as ``owned.__class__``.
+            for child in ast.walk(node):
+                if isinstance(child, ast.Name) and child.id in aliases:
+                    if not any(
+                        isinstance(parent, ast.Attribute)
+                        and parent.value is child
+                        and parent.attr == "__class__"
+                        for parent in ast.walk(node)
+                    ):
+                        return self._reject("dynamic-format-owned")
+            return OwnershipResult(True)
+        if isinstance(node, (ast.Tuple, ast.List, ast.Set, ast.Dict)):
+            return self._reject("container-escape")
+        return self._reject(f"unsupported-expression:{type(node).__name__}")
+
+    def prove(
+        self,
+        function_key: str,
+        tracked_slot: int,
+        domain: tuple[str, str],
+        known_slots: Mapping[int, object],
+        initial_fields: Mapping[str, object],
+    ) -> OwnershipResult:
+        key = (
+            function_key, tracked_slot, domain,
+            tuple(sorted(known_slots.items())), tuple(sorted(initial_fields.items())),
+        )
+        if key in self.memo:
+            return self.memo[key]
+        if key in self.active:
+            return self._reject("recursive-effect")
+        self.active.add(key)
+        info = self.index.functions[function_key]
+        aliases = {info.parameters[tracked_slot].name}
+        values = {
+            info.parameters[slot].name: value
+            for slot, value in self._parameter_defaults(info).items()
+            if slot < len(info.parameters)
+        }
+        values.update(
+            {
+                info.parameters[slot].name: value
+                for slot, value in known_slots.items()
+                if slot < len(info.parameters)
+            }
+        )
+        fields = dict(initial_fields)
+        written: set[str] = set()
+        returns: list[bool] = []
+        external_names = {
+            name
+            for node in immediate_nodes(info.node)
+            if isinstance(node, (ast.Global, ast.Nonlocal))
+            for name in node.names
+        }
+        safe = True
+
+        def visit_block(statements: list[ast.stmt]) -> bool:
+            nonlocal aliases, values, fields, written
+            def apply_effect(effect: OwnershipResult) -> None:
+                written.update(effect.written_fields)
+                for field_name in effect.written_fields:
+                    fields.pop(field_name, None)
+
+            def snapshot():
+                return set(aliases), dict(values), dict(fields), set(written)
+
+            def restore(state) -> None:
+                nonlocal aliases, values, fields, written
+                aliases, values, fields, written = (
+                    set(state[0]), dict(state[1]), dict(state[2]), set(state[3])
+                )
+
+            def join(states) -> None:
+                nonlocal aliases, values, fields, written
+                aliases = set().union(*(state[0] for state in states))
+                common_values = set.intersection(*(set(state[1]) for state in states))
+                values = {
+                    name: states[0][1][name]
+                    for name in common_values
+                    if all(
+                        type(state[1][name]) is type(states[0][1][name])
+                        and state[1][name] == states[0][1][name]
+                        for state in states[1:]
+                    )
+                }
+                common_fields = set.intersection(*(set(state[2]) for state in states))
+                fields = {
+                    name: states[0][2][name]
+                    for name in common_fields
+                    if all(
+                        type(state[2][name]) is type(states[0][2][name])
+                        and state[2][name] == states[0][2][name]
+                        for state in states[1:]
+                    )
+                }
+                written = set().union(*(state[3] for state in states))
+
+            for statement in statements:
+                if isinstance(statement, ast.If):
+                    condition = self._known(statement.test, aliases, values, domain, fields)
+                    branches = (
+                        [statement.body] if condition is not self.UNKNOWN_VALUE and bool(condition)
+                        else [statement.orelse] if condition is not self.UNKNOWN_VALUE
+                        else [statement.body, statement.orelse]
+                    )
+                    base = snapshot()
+                    exits = []
+                    for branch in branches:
+                        restore(base)
+                        if not visit_block(branch):
+                            self.failures["unsafe-branch"] += 1
+                            return False
+                        exits.append(snapshot())
+                    join(exits)
+                    continue
+                if isinstance(statement, ast.While):
+                    condition = self._known(statement.test, aliases, values, domain, fields)
+                    if condition is not self.UNKNOWN_VALUE and not bool(condition):
+                        continue
+                    if self._contains_alias(statement.test, aliases):
+                        self.failures["dynamic-owned-while"] += 1
+                        return False
+                    before = snapshot()
+                    if not visit_block(statement.body):
+                        self.failures["unsafe-while-body"] += 1
+                        return False
+                    after = snapshot()
+                    join([before, after])
+                    continue
+                if isinstance(statement, (ast.For, ast.AsyncFor)):
+                    owned_field_iteration = (
+                        isinstance(statement.iter, ast.Attribute)
+                        and isinstance(statement.iter.value, ast.Name)
+                        and statement.iter.value.id in aliases
+                    )
+                    if self._contains_alias(statement.iter, aliases) and not owned_field_iteration:
+                        effect = self._expression_safe(
+                            info, statement.iter, aliases, values, domain, fields
+                        )
+                        if not effect.safe or effect.identity:
+                            self.failures["iterate-owned"] += 1
+                            return False
+                        apply_effect(effect)
+                    before = snapshot()
+                    if not visit_block(statement.body):
+                        self.failures["unsafe-loop-body"] += 1
+                        return False
+                    after = snapshot()
+                    join([before, after])
+                    continue
+                if isinstance(statement, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+                    value = statement.value
+                    targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                    effect = self._expression_safe(info, value, aliases, values, domain, fields)
+                    if not effect.safe:
+                        self.failures["unsafe-assignment-value"] += 1
+                        return False
+                    apply_effect(effect)
+                    known = self._known(value, aliases, values, domain, fields)
+                    for target in targets:
+                        if isinstance(target, ast.Name):
+                            if target.id in external_names and self._contains_alias(value, aliases):
+                                self.failures["global-nonlocal-store"] += 1
+                                return False
+                            if effect.identity:
+                                aliases.add(target.id)
+                            else:
+                                aliases.discard(target.id)
+                            if known is not self.UNKNOWN_VALUE:
+                                values[target.id] = known
+                            else:
+                                values.pop(target.id, None)
+                        elif isinstance(target, ast.Attribute):
+                            if self._contains_alias(value, aliases) and not (
+                                isinstance(target.value, ast.Name) and target.value.id in aliases
+                            ):
+                                self.failures["external-attribute-store"] += 1
+                                return False
+                            if isinstance(target.value, ast.Name) and target.value.id in aliases:
+                                written.add(target.attr)
+                                if known is not self.UNKNOWN_VALUE:
+                                    fields[target.attr] = known
+                                else:
+                                    fields.pop(target.attr, None)
+                        elif isinstance(target, ast.Subscript):
+                            if self._contains_alias(value, aliases) and not self._contains_alias(
+                                target.value, aliases
+                            ):
+                                self.failures["external-container-store"] += 1
+                                return False
+                    continue
+                if isinstance(statement, ast.Expr):
+                    effect = self._expression_safe(
+                        info, statement.value, aliases, values, domain, fields
+                    )
+                    if not effect.safe:
+                        self.failures["unsafe-expression"] += 1
+                        return False
+                    apply_effect(effect)
+                    continue
+                if isinstance(statement, ast.Return):
+                    effect = self._expression_safe(
+                        info, statement.value, aliases, values, domain, fields
+                    )
+                    if not effect.safe:
+                        self.failures["unsafe-return"] += 1
+                        return False
+                    apply_effect(effect)
+                    if self._contains_alias(statement.value, aliases) and not effect.identity:
+                        self.failures["nonidentity-return"] += 1
+                        return False
+                    returns.append(effect.identity)
+                    continue
+                if isinstance(statement, (ast.Raise, ast.Yield, ast.YieldFrom)):
+                    if self._contains_alias(statement, aliases):
+                        if isinstance(statement, ast.Raise):
+                            if (
+                                isinstance(statement.exc, ast.Call)
+                                and isinstance(statement.exc.func, ast.Name)
+                                and not self.solver._resolve_name(info, statement.exc.func.id)
+                                and isinstance(
+                                    getattr(builtins, statement.exc.func.id, None),
+                                    type,
+                                )
+                                and issubclass(
+                                    getattr(builtins, statement.exc.func.id), BaseException
+                                )
+                                and all(
+                                    self._expression_safe(
+                                        info, argument, aliases, values, domain, fields
+                                    ).safe
+                                    for argument in statement.exc.args
+                                )
+                            ):
+                                continue
+                            effect = self._expression_safe(
+                                info, statement.exc, aliases, values, domain, fields
+                            )
+                            if effect.safe and not effect.identity:
+                                continue
+                        self.failures["raise-yield-escape"] += 1
+                        return False
+                if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    if any(
+                        isinstance(child, ast.Name)
+                        and isinstance(child.ctx, ast.Load)
+                        and child.id in aliases
+                        for child in ast.walk(statement)
+                    ):
+                        self.failures["closure-escape"] += 1
+                        return False
+                if isinstance(statement, (ast.Global, ast.Nonlocal)) and aliases & set(statement.names):
+                    self.failures["global-nonlocal"] += 1
+                    return False
+                if not isinstance(
+                    statement,
+                    (
+                        ast.Pass, ast.Break, ast.Continue, ast.Global, ast.Nonlocal,
+                        ast.Import, ast.ImportFrom,
+                    ),
+                ) and self._contains_alias(statement, aliases):
+                    self.failures[f"unhandled-statement:{type(statement).__name__}"] += 1
+                    return False
+            return True
+
+        body = info.node.body if not isinstance(info.node, ast.Lambda) else []
+        safe = bool(body) and visit_block(body)
+        result = OwnershipResult(
+            safe,
+            safe and bool(returns) and all(returns),
+            frozenset(written),
+        )
+        self.active.remove(key)
+        self.memo[key] = result
+        return result
+
+
 class SharedArgumentSolver:
     def __init__(self, sources: Mapping[str, str]) -> None:
         self.index = SourceIndex(sources)
@@ -707,6 +1384,115 @@ class SharedArgumentSolver:
             if rounds > len(self.index.functions) + 1:
                 raise RuntimeError("non-monotone fresh-result fixed point")
         return rounds
+
+    def _constructor_fields(self, domain: tuple[str, str]) -> dict[str, object]:
+        methods = self.index.method(*domain, "__init__")
+        if len(methods) != 1:
+            return {}
+        info = self.index.functions[methods[0]]
+        if not info.parameters:
+            return {}
+        receiver = info.parameters[0].name
+        fields: dict[str, object] = {}
+        for node in immediate_nodes(info.node):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if not isinstance(node.value, ast.Constant):
+                continue
+            for target in targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == receiver
+                ):
+                    fields[target.attr] = node.value.value
+        return fields
+
+    def _owned_expression(
+        self,
+        analyzer: OwnershipAnalyzer,
+        info: FunctionInfo,
+        node: ast.AST,
+    ) -> tuple[tuple[str, str], dict[str, object]] | None:
+        if isinstance(node, ast.Name) and node.id in info.fresh_classes:
+            domain = info.fresh_classes[node.id]
+            return domain, self._constructor_fields(domain)
+        if not isinstance(node, ast.Call):
+            return None
+        constructor = self.index.fresh_constructor(info.path, node.func)
+        if constructor is not None:
+            return constructor, self._constructor_fields(constructor)
+        target = self._resolve_call(info, node)
+        if target is None:
+            return None
+        bound, error = self._bind(node, target)
+        if error is not None:
+            return None
+        callee = self.index.functions[target.key]
+        candidates = [
+            (slot, self._owned_expression(analyzer, info, actual))
+            for actual, slot in bound
+            if slot in callee.return_alias
+        ]
+        candidates = [(slot, value) for slot, value in candidates if value is not None]
+        if len(candidates) != 1:
+            return None
+        slot, (domain, fields) = candidates[0]
+        known = {
+            actual_slot: actual.value
+            for actual, actual_slot in bound
+            if isinstance(actual, ast.Constant)
+        }
+        result = analyzer.prove(target.key, slot, domain, known, fields)
+        if not result.safe or not result.identity:
+            return None
+        for field_name in result.written_fields:
+            fields.pop(field_name, None)
+        return domain, fields
+
+    def _prove_contained_fresh_calls(self) -> int:
+        analyzer = OwnershipAnalyzer(self)
+        admitted = 0
+        for info in self.index.functions.values():
+            if not info.fresh_calls:
+                continue
+            assignments: dict[str, ast.AST] = {}
+            calls: dict[tuple[int, int], ast.Call] = {}
+            for node in immediate_nodes(info.node):
+                if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    for target in targets:
+                        if isinstance(target, ast.Name):
+                            assignments[target.id] = node.value
+                elif isinstance(node, ast.Call):
+                    calls[(node.lineno, node.col_offset)] = node
+            for line, column, receiver, target_key in sorted(info.fresh_calls):
+                call = calls.get((line, column))
+                value = assignments.get(receiver)
+                if call is None or value is None:
+                    continue
+                owned = self._owned_expression(analyzer, info, value)
+                if owned is None:
+                    continue
+                domain, fields = owned
+                target = self._resolve_call(info, call)
+                if target is None or target.key != target_key:
+                    continue
+                bound, error = self._bind(call, target)
+                if error is not None:
+                    continue
+                known = {
+                    slot: actual.value
+                    for actual, slot in bound
+                    if isinstance(actual, ast.Constant)
+                }
+                result = analyzer.prove(target.key, 0, domain, known, fields)
+                if result.safe:
+                    record = (line, column, receiver, target_key)
+                    info.contained_fresh_calls.add(record)
+                    admitted += 1
+        return admitted
 
     def _unsafe(self, info: FunctionInfo, roots: Iterable[int], flags: int, reason: str) -> None:
         for slot in roots:
@@ -1022,6 +1808,7 @@ class SharedArgumentSolver:
         for info in self.index.functions.values():
             self._direct(info)
             info.summary[:] = info.direct
+        contained_fresh_calls = self._prove_contained_fresh_calls()
         changed = True
         rounds = 0
         ordered_edges = sorted(
@@ -1075,6 +1862,7 @@ class SharedArgumentSolver:
                     ],
                     [[name, *domain] for name, domain in sorted(info.fresh_classes.items())],
                     [list(call) for call in sorted(info.fresh_calls)],
+                    [list(call) for call in sorted(info.contained_fresh_calls)],
                 ]
             )
         shared = {
@@ -1108,6 +1896,7 @@ class SharedArgumentSolver:
                 "fresh_receiver_calls": sum(
                     len(info.fresh_calls) for info in self.index.functions.values()
                 ),
+                "contained_fresh_receiver_calls": contained_fresh_calls,
                 "typed_formal_slots": sum(
                     len(info.parameter_classes) for info in self.index.functions.values()
                 ),

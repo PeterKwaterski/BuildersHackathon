@@ -116,6 +116,69 @@ class SharedArgumentSolverTests(unittest.TestCase):
             )
         )
 
+    def test_owned_identity_wrapper_and_adversarial_escapes(self):
+        safe = self.solve(
+            "class Box:\n"
+            "    def __init__(self):\n"
+            "        self.value = None\n"
+            "    def set(self, key, value):\n"
+            "        self.value = value\n"
+            "def identity(instance):\n"
+            "    return instance\n"
+            "def candidate():\n"
+            "    item = identity(Box())\n"
+            "    item.set('key', True)\n"
+        )[1]
+        self.assertEqual(safe["stats"]["contained_fresh_receiver_calls"], 1)
+
+        variants = (
+            "global saved\n    saved = instance\n",
+            "unknown(instance)\n",
+            "def nested():\n        return instance\n    nested()\n",
+            "saved.append(instance)\n",
+            "unknown([instance])\n",
+            "getattr(instance, 'value')\n",
+            "try:\n        unknown(instance)\n    except Exception:\n        pass\n",
+            "alias = instance\n    for _ in ():\n        alias = None\n    unknown(alias)\n",
+            "if saved:\n        alias = instance\n    else:\n        alias = None\n    unknown(alias)\n",
+        )
+        for body in variants:
+            with self.subTest(body=body):
+                source = (
+                    "saved = []\n"
+                    "class Box:\n"
+                    "    def __init__(self):\n"
+                    "        self.value = None\n"
+                    "    def set(self, key, value):\n"
+                    "        self.value = value\n"
+                    "def identity(instance):\n"
+                    f"    {body}"
+                    "    return instance\n"
+                    "def candidate():\n"
+                    "    item = identity(Box())\n"
+                    "    item.set('key', True)\n"
+                )
+                document = self.solve(source)[1]
+                self.assertEqual(
+                    document["stats"]["contained_fresh_receiver_calls"], 0
+                )
+        descriptor = self.solve(
+            "class Box:\n"
+            "    def __init__(self):\n"
+            "        self.value = None\n"
+            "    @property\n"
+            "    def callback(self):\n"
+            "        return lambda: None\n"
+            "    def set(self, key, value):\n"
+            "        self.value = value\n"
+            "def identity(instance):\n"
+            "    instance.callback()\n"
+            "    return instance\n"
+            "def candidate():\n"
+            "    item = identity(Box())\n"
+            "    item.set('key', True)\n"
+        )[1]
+        self.assertEqual(descriptor["stats"]["contained_fresh_receiver_calls"], 0)
     def test_alias_and_container_escape(self):
         _, _, functions = self.solve(
             "def sink(value):\n"
@@ -189,6 +252,15 @@ class SharedArgumentSolverTests(unittest.TestCase):
                 "sqlglot/expressions/core.py:Expression.set:1084",
             ),
             at_time_zone.fresh_calls,
+        )
+        self.assertIn(
+            (
+                7186,
+                12,
+                "at_time_zone",
+                "sqlglot/expressions/core.py:Expression.set:1084",
+            ),
+            at_time_zone.contained_fresh_calls,
         )
         self.assertEqual(parser_expression.return_alias, {1})
         self.assertEqual(rename_lambda.capture_from[2][1], 0)

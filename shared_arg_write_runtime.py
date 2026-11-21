@@ -1,9 +1,4 @@
-"""Default-off admission for source-derived fresh-receiver mutations.
-
-This module recognizes candidates only.  Enabling the selector optimization
-also requires the model's non-escape/ownership proof; candidates never narrow
-selection merely because their spelling matches this recognizer.
-"""
+"""Admission for source-derived, ownership-contained fresh-receiver mutations."""
 
 from __future__ import annotations
 
@@ -15,7 +10,7 @@ from pathlib import Path
 
 
 MODEL_VERSION = 2
-MODEL_SHA256 = "07c63674343c93c4b53c60f8b0dee38ffc87e48b932206c00514aac039f559e5"
+MODEL_SHA256 = "6ebc3828c4c4cb020fd4625df98f5869ec8881c06bf284f9c95c24bee4d1d4b4"
 SOURCE_SHA = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
 
 
@@ -130,7 +125,11 @@ def _single_scalar_argument_edit(original: ast.Call, changed: ast.Call) -> bool:
         for (_, left), (_, right) in zip(before, after)
         if ast.dump(left, include_attributes=False) != ast.dump(right, include_attributes=False)
     ]
-    return len(differences) == 1 and all(_scalar(node) for node in differences[0])
+    return (
+        len(differences) == 1
+        and all(_scalar(node) for node in differences[0])
+        and type(differences[0][0].value) is type(differences[0][1].value)
+    )
 
 
 def _unaliased_before_call(
@@ -167,11 +166,10 @@ def fresh_receiver_candidate(
     changed_source: str,
     model: dict,
 ) -> bool:
-    """Recognize one exact fresh-receiver scalar-argument mutation.
+    """Admit one exact fresh-receiver scalar-argument mutation.
 
-    The result deliberately does not assert non-escape.  The caller must also
-    require a separately derived ownership summary for the wrapper and target
-    method before suppressing import-owner expansion.
+    Record 13 is populated only after the builder's context-sensitive
+    identity/non-escape proof closes the wrapper and mutation method.
     """
     lines = change.get("lines")
     if (
@@ -182,17 +180,11 @@ def fresh_receiver_candidate(
     ):
         return False
     line = next(iter(lines))
-    try:
-        original_tree = ast.parse(original_source, filename=path, type_comments=True)
-        changed_tree = ast.parse(changed_source, filename=path, type_comments=True)
-    except (SyntaxError, ValueError, RecursionError, MemoryError):
-        return False
-
     records = [
         record
         for record in model.get("functions", ())
         if isinstance(record, list)
-        and len(record) >= 13
+        and len(record) >= 14
         and record[1] == path
         and isinstance(record[3], int)
         and isinstance(record[4], int)
@@ -202,12 +194,17 @@ def fresh_receiver_candidate(
         return False
     record = min(records, key=lambda item: item[4] - item[3])
     calls = [
-        item for item in record[12]
+        item for item in record[13]
         if isinstance(item, list) and len(item) == 4 and item[0] == line
     ]
     if len(calls) != 1:
         return False
     call_line, column, receiver, target_key = calls[0]
+    try:
+        original_tree = ast.parse(original_source, filename=path, type_comments=True)
+        changed_tree = ast.parse(changed_source, filename=path, type_comments=True)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return False
     candidates = [
         (node, node_path)
         for node, node_path in _nodes(original_tree)

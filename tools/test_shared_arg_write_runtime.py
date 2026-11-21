@@ -32,19 +32,9 @@ class FreshReceiverRuntimeTests(unittest.TestCase):
                 change, "sqlglot/parser.py", source, changed, self.model
             )
         )
-        self.assertFalse(
+        self.assertTrue(
             selector.contained_fresh_receiver_edit(change, "sqlglot/parser.py")
         )
-        previous = selector.SHARED_ARG_WRITE_ENABLED
-        selector.SHARED_ARG_WRITE_ENABLED = True
-        selector._SHARED_ARG_WRITE_MODEL = None
-        try:
-            self.assertTrue(
-                selector.contained_fresh_receiver_edit(change, "sqlglot/parser.py")
-            )
-        finally:
-            selector.SHARED_ARG_WRITE_ENABLED = previous
-            selector._SHARED_ARG_WRITE_MODEL = None
 
     def test_target_change_and_alias_are_rejected(self):
         path = "sqlglot/example.py"
@@ -64,6 +54,7 @@ class FreshReceiverRuntimeTests(unittest.TestCase):
         record = [
             f"{path}:build:1", path, "build", 1, 3, [], [], [], ["item"], [], [],
             [["item", path, "Box"]], [[3, 4, "item", f"{path}:Box.set:10"]],
+            [[3, 4, "item", f"{path}:Box.set:10"]],
         ]
         model = {"functions": [record]}
         change = {"lines": {3}, "removed": [original.splitlines()[2]], "added": [changed.splitlines()[2]]}
@@ -79,6 +70,8 @@ class FreshReceiverRuntimeTests(unittest.TestCase):
         alias_model["functions"][0][4] = 4
         alias_model["functions"][0][12][0][0] = 4
         alias_model["functions"][0][12][0][1] = 4
+        alias_model["functions"][0][13][0][0] = 4
+        alias_model["functions"][0][13][0][1] = 4
         self.assertFalse(
             fresh_receiver_candidate(
                 alias_change, path, aliased, alias_changed, alias_model

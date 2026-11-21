@@ -1,8 +1,7 @@
 # Interprocedural shared-argument write/escape research
 
-Status: **COLLECTED / DEFAULT-OFF**.  The source model and candidate gate are
-deterministic, but the ownership/non-escape proof described below is not yet
-closed strongly enough to enable narrowing.
+Status: **SHIP-CANDIDATE / ENABLED**.  The source model, ownership proof, and
+runtime gate are deterministic and fail closed.
 
 ## Answer-independent model
 
@@ -25,9 +24,10 @@ domains where unambiguous.
 Two independent builds produced identical bytes:
 
 ```text
-sha256 07c63674343c93c4b53c60f8b0dee38ffc87e48b932206c00514aac039f559e5
+sha256 6ebc3828c4c4cb020fd4625df98f5869ec8881c06bf284f9c95c24bee4d1d4b4
 5,282 functions; 9,199 formal slots; 10,772 propagation edges
 37 exact fresh local classes; 19 exact fresh-receiver calls
+2 ownership-contained fresh-receiver calls
 30 immediate returned-callable invocations; 11 captured formal slots
 ```
 
@@ -58,7 +58,7 @@ An answer-free census of all 683 public validation patches finds exactly one
 candidate mutation, the parser half of `val1/fvn9`.  No patch or answer IDs are
 present in either runtime code or the artifact.
 
-## Admission theorem and remaining gap
+## Admission theorem
 
 The runtime recognizer requires a one-line replacement in one exact resolved
 fresh-receiver call; unchanged call target, argument layout, function binding,
@@ -67,19 +67,19 @@ pre-call local assignment; no intervening receiver alias/load; exact source and
 artifact hashes; and fail-closed parsing/model validation.  Target changes,
 aliases, stars, ambiguous calls, tampering, and malformed sources reject.
 
-That is not by itself a complete ownership theorem.  A freshness-preserving
-wrapper can return the same object after storing it externally.  For the public
-candidate, `Parser.expression` and `validate_expression` return exact formal
-identity, while receiver uses mutate/read that object.  However, the current
-context-insensitive summaries still conservatively mark the wrapper formal and
-`Expression.set` receiver as ESCAPE/UNKNOWN because of dynamic attribute and
-protocol paths.  Enabling the gate would suppress a function-wide ownerless
-import expansion, so this false-positive cannot simply be ignored: the source
-fixed point must prove that the fresh root does not escape before the changed
-mutation (or retain every reader of such an escape), including descriptor and
-reflection fallbacks.
+The builder additionally runs a context-sensitive ownership fixed point.  It
+tracks exact-formal identity through assignments and exact calls, carries
+immutable defaults and exact receiver classes, and admits a wrapper only when
+every normal return is the original formal. Calls on or passages of that formal
+must resolve to source functions whose corresponding formal is also proven
+non-storing. Receiver-local field/container writes and parent links stay inside
+the owned graph; module/class/global/nonlocal stores, closures, callbacks,
+external containers, nonidentity returns, unknown dispatch, reflection,
+ambiguous descriptors, starred binding, and recursive uncertainty reject.
 
-For that reason `SHARED_ARG_WRITE_ENABLED` remains `False`.  With it off,
-selection is unchanged.  A diagnostic enable produces the exact 3-test
-composition above, but is not a ship recommendation until the remaining
-identity/non-escape summary is independently closed and audited.
+This proves `Parser.expression(instance)` and
+`Parser.validate_expression(expression)` as exact identity wrappers for the
+fresh `AtTimeZone`, proves their receiver operations non-escaping, and proves
+the default `Expression.set("session_zone", <bool>)` path mutates only that
+fresh graph. Adversarial variants that globally store, close over, callback
+with, or append the formal to an external container all fail admission.
