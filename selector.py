@@ -3,11 +3,13 @@
 import ast
 import gzip
 import hashlib
+import io
 import json
 import base64
 import keyword
 import re
 import sys
+import tokenize
 import types
 from collections import Counter, deque
 from pathlib import Path
@@ -1532,6 +1534,74 @@ def inert_comment_addition(change: dict, path: str) -> bool:
     return ast.dump(original_tree, include_attributes=False) == ast.dump(
         changed_tree, include_attributes=False
     )
+
+
+def position_preserving_formatting_edit(change: dict, path: str) -> bool:
+    """Prove a replacement changes only lexically invisible formatting.
+
+    Unlike the broader comment-insertion proof, this rule requires the complete
+    recursive code fingerprint, including every line table and instruction
+    position, to remain identical.  Token text (including comments) must also
+    be unchanged.  This leaves only whitespace which neither tokenization nor
+    any executable/source position can distinguish.
+
+    The pinned typing tests read production source bytes directly, so that
+    package remains outside this proof even when compilation is identical.
+    """
+
+    if (
+        not path.startswith("sqlglot/")
+        or not path.endswith(".py")
+        or path == "sqlglot/typing/__init__.py"
+        or path.startswith("sqlglot/typing/")
+        or path in PROCESS_SERIALIZATION_FILES
+        or not change.get("removed")
+        or len(change["removed"]) != len(change.get("added", ()))
+        or change.get("non_lf")
+        or change.get("no_newline_marker")
+        or any(COMMENT_DIRECTIVE.search(line) for line in change.get("payload", ()))
+    ):
+        return False
+    original = pinned_sources().get(path)
+    prospective = patched_source(change, path)
+    if (
+        original is None
+        or prospective is None
+        or original.count("\n") != prospective.count("\n")
+    ):
+        return False
+
+    def tokens(source: str) -> tuple[tuple[int, str], ...]:
+        return tuple(
+            (token.type, token.string)
+            for token in tokenize.generate_tokens(io.StringIO(source).readline)
+            if token.type != tokenize.ENDMARKER
+        )
+
+    try:
+        if tokens(original) != tokens(prospective):
+            return False
+        original_tree = ast.parse(original, filename=path, type_comments=True)
+        prospective_tree = ast.parse(prospective, filename=path, type_comments=True)
+        if ast.dump(original_tree, include_attributes=False) != ast.dump(
+            prospective_tree, include_attributes=False
+        ):
+            return False
+        original_code = compile(original, path, "exec", dont_inherit=True)
+        prospective_code = compile(prospective, path, "exec", dont_inherit=True)
+        return semantic_code_fingerprint(original_code) == semantic_code_fingerprint(
+            prospective_code
+        )
+    except (
+        SyntaxError,
+        tokenize.TokenError,
+        ValueError,
+        TypeError,
+        OverflowError,
+        MemoryError,
+        RecursionError,
+    ):
+        return False
 
 
 def proven_identity_equality(change: dict, path: str, model: dict) -> bool:
@@ -3826,7 +3896,7 @@ def selected_indices(
             selected.update(all_indices)
             continue
         directive_comment_proved = False
-        if comment_only_addition(change) and any(
+        if path.endswith(".py") and comment_only_addition(change) and any(
             COMMENT_DIRECTIVE.search(line) for line in change["added"]
         ):
             if reflection_model is None or not runtime_inert_directive_comment(change, path):
@@ -3836,6 +3906,11 @@ def selected_indices(
         reflection_indices = code_reflection_indices(
             path, change["lines"], reflection_model, all_indices
         )
+        if reflection_model is not None and position_preserving_formatting_edit(
+            change, path
+        ):
+            selected.update(reflection_indices)
+            continue
         if directive_comment_proved:
             reflection_indices.update(
                 file_code_reflection_indices(path, reflection_model, all_indices)
