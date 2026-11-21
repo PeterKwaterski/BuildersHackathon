@@ -20,6 +20,7 @@ ARG_TYPE_DERIVATION_MODEL = Path(__file__).with_name(
     "arg_type_derivation_model.json.gz"
 )
 CLASS_ATTRIBUTE_MODEL = Path(__file__).with_name("class_attribute_model.json.gz")
+FRESH_ALIAS_PROFILE = Path(__file__).with_name("fresh_alias_profile.json.gz")
 MAX_WORKERS = 8
 WORKER_COST_MS = 2_000
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -776,6 +777,120 @@ def proven_identity_equality(change: dict, path: str, model: dict) -> bool:
             }
         )
     return _SEMANTIC_PROOF.covers(path, change["lines"])
+
+
+def fresh_table_alias_copy_edit(
+    change: dict,
+    path: str,
+    fresh_alias_model: dict,
+    hook_attributes: set[str] | None = None,
+) -> bool:
+    """Prove ``copy=`` is irrelevant for a profiled fresh inline table."""
+    # Avoid parsing or walking sources for unrelated changes. The AST check
+    # below remains authoritative; this gate only recognizes one boolean copy
+    # keyword token changing on an otherwise text-identical removed/added line.
+    if len(change["removed"]) != 1 or len(change["added"]) != 1:
+        return False
+    old_line, new_line = change["removed"][0], change["added"][0]
+    copy_token = re.compile(r"\bcopy\s*=\s*(True|False)\b")
+    old_matches = list(copy_token.finditer(old_line))
+    new_matches = list(copy_token.finditer(new_line))
+    if (
+        len(old_matches) != 1
+        or len(new_matches) != 1
+        or old_matches[0].group(1) == new_matches[0].group(1)
+        or copy_token.sub("copy=<bool>", old_line)
+        != copy_token.sub("copy=<bool>", new_line)
+    ):
+        return False
+
+    entries = fresh_alias_model.get("d", {}).get(path)
+    source = pinned_sources().get(path)
+    changed = patched_source(change, path)
+    if (
+        not entries
+        or source is None
+        or changed is None
+        or path in PROCESS_SERIALIZATION_FILES
+        or any(COMMENT_DIRECTIVE.search(line) for line in change["payload"])
+    ):
+        return False
+    try:
+        original_tree = ast.parse(source, filename=path, type_comments=True)
+        changed_tree = ast.parse(changed, filename=path, type_comments=True)
+    except (SyntaxError, ValueError):
+        return False
+
+    candidates = []
+    for start, end, call_dump, state, readers in entries:
+        if state != "safe" or not any(start <= line <= end for line in change["lines"]):
+            continue
+        if not isinstance(readers, list) or any(
+            type(index) is not int
+            or index < 0
+            or index >= fresh_alias_model.get("n", 0)
+            for index in readers
+        ):
+            return False
+        matches = [
+            node
+            for node in ast.walk(original_tree)
+            if isinstance(node, ast.Call)
+            and node.lineno == start
+            and (node.end_lineno or node.lineno) == end
+            and ast.dump(node, include_attributes=False) == call_dump
+        ]
+        if len(matches) != 1:
+            return False
+        candidates.append(matches[0])
+    if len(candidates) != 1:
+        return False
+    original_call = candidates[0]
+
+    def changed_candidate(tree: ast.Module) -> tuple[ast.Call, ast.keyword] | None:
+        matches = []
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and node.lineno == original_call.lineno
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "exp"
+                and node.func.attr == "alias_"
+                and node.args
+                and isinstance(node.args[0], ast.Call)
+                and isinstance(node.args[0].func, ast.Attribute)
+                and isinstance(node.args[0].func.value, ast.Name)
+                and node.args[0].func.value.id == "exp"
+                and node.args[0].func.attr == "table_"
+            ):
+                continue
+            keywords = [keyword for keyword in node.keywords if keyword.arg == "copy"]
+            if (
+                len(keywords) == 1
+                and isinstance(keywords[0].value, ast.Constant)
+                and type(keywords[0].value.value) is bool
+            ):
+                matches.append((node, keywords[0]))
+        return matches[0] if len(matches) == 1 else None
+
+    original = changed_candidate(original_tree)
+    patched = changed_candidate(changed_tree)
+    if original is None or patched is None:
+        return False
+    original_call, original_copy = original
+    _, patched_copy = patched
+    if original_copy.value.value == patched_copy.value.value:
+        return False
+    original_copy.value = ast.Constant(value=False)
+    patched_copy.value = ast.Constant(value=False)
+    if ast.dump(original_tree, include_attributes=False) != ast.dump(
+        changed_tree, include_attributes=False
+    ):
+        return False
+    return preserves_function_bindings(
+        change, path, original_call.lineno
+    ) and not import_expression_hazard(change, path, hook_attributes)
 
 
 def mapped_set(model: dict, set_id: int) -> set[int]:
@@ -1575,6 +1690,7 @@ def selected_indices(
     predicate_model: dict | None = None,
     derivation_model: dict | None = None,
     attribute_model: dict | None = None,
+    fresh_alias_model: dict | None = None,
 ) -> set[int]:
     selected: set[int] = set()
     changes = patch_changes(patch)
@@ -1617,6 +1733,10 @@ def selected_indices(
         if inert_comment_addition(change, path):
             continue
         if proven_identity_equality(change, path, model):
+            continue
+        if fresh_alias_model is not None and len(changes) == 1 and fresh_table_alias_copy_edit(
+            change, path, fresh_alias_model, model.get("h")
+        ):
             continue
         if test_file_indices and path in test_file_indices:
             # A syntax or import error fails every collected test in the file,
@@ -1771,6 +1891,8 @@ def main() -> None:
         derivation_model = json.load(derivation_model_file)
     with gzip.open(CLASS_ATTRIBUTE_MODEL, "rt", encoding="utf-8") as attribute_model_file:
         attribute_model = json.load(attribute_model_file)
+    with gzip.open(FRESH_ALIAS_PROFILE, "rt", encoding="utf-8") as fresh_alias_file:
+        fresh_alias_model = json.load(fresh_alias_file)
     test_digest = hashlib.sha256(
         "\0".join(test["id"] for test in tests).encode("utf-8")
     ).hexdigest()
@@ -1803,6 +1925,13 @@ def main() -> None:
         or attribute_model.get("t") != test_digest
     ):
         attribute_model = {"d": {}}
+    if (
+        fresh_alias_model.get("v") != 1
+        or fresh_alias_model.get("sha") != model.get("sha")
+        or fresh_alias_model.get("n") != len(tests)
+        or fresh_alias_model.get("t") != test_digest
+    ):
+        fresh_alias_model = {"d": {}}
     mapped_tests = [tests_by_id.get(test_id) for test_id in model["t"]]
     all_indices = {index for index, test in enumerate(mapped_tests) if test is not None}
     test_file_indices: dict[str, set[int]] = {}
@@ -1823,6 +1952,7 @@ def main() -> None:
             predicate_model,
             derivation_model,
             attribute_model,
+            fresh_alias_model,
         )
         selected = [mapped_tests[index] for index in indices if mapped_tests[index] is not None]
         selected.extend(unmapped_tests)

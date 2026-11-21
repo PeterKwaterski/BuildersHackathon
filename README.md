@@ -44,7 +44,7 @@ make check    # the output's format only
 
 `sample/answers.json` lists the tests each sample commit breaks and the kind of change it is. The practice and final commits are hidden, and so is everything your program prints when it runs on them. A rejected submission tells you which rule it broke and nothing more, so reproduce problems here.
 
-The current exact-image sample result is **100.285 simulated seconds with zero
+The current exact-image sample result is **97.819 simulated seconds with zero
 misses**. Seven recent selector-body measurements in the scorer container had a
 1.103-second median; process startup is additional and the board measures the
 complete container. Model collection used the pinned Python 3.13 image and the
@@ -62,6 +62,16 @@ an Enum singleton or an object-identity class. Ordinary added comments are
 skipped only when applying their full unified diff produces the same Python AST
 (including type comments); directives and compile errors stay conservative.
 These are source analyses, not sample-patch or answer lookups.
+
+`tools/collect_fresh_alias_profile.py` and
+`tools/build_fresh_alias_profile.py` reproduce the complete inline
+`exp.alias_(exp.table_(...))` execution profile documented in
+`tools/FRESH_ALIAS_PROFILE.md`. A `copy=` toggle is skipped only at a site
+where both complete suite modes observed exact string inputs and the canonical
+`exp`, `alias_`, and `table_` bindings. The inner call then allocates the
+complete expression graph, so no reference to the pre-copy graph can escape.
+Runtime use normalizes only the boolean keyword and requires whole-file AST,
+function-binding, import, directive, source, and test-digest equivalence.
 
 Import-time edits are checked in both the old and patched trees. The selector
 accounts for deleted side effects, evaluated annotations, later uses in the
