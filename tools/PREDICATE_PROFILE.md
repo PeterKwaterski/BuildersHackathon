@@ -54,8 +54,12 @@ operator generically to the complete raw profile and can skip only when every
 recorded observation has the same old and new result.
 
 At runtime the selector independently parses both complete files and locates
-the certified source coordinate by its AST path. It requires the exact directed
-operator pair, a literal boundary, unchanged operands, and equality of the
-entire executable AST after normalizing that one operator. Function binding,
-compile, import-expression, directive, and model/source/test-digest gates must
-also pass. Every ambiguity falls back to the broad coverage selector.
+the certified source coordinate by its AST path. It requires two distinct
+operators recorded by the artifact (`<`, `<=`, `>`, `>=`, `==`, or `!=`), a
+literal boundary, unchanged operands, and equality of the entire executable
+AST after normalizing that one operator. The old and new raw boolean outcomes
+must agree at every recorded invocation. Identity operators remain excluded:
+their outcomes are not recorded, and source instrumentation can perturb
+constant interning. Function binding, compile, import-expression, directive,
+and model/source/test-digest gates must also pass. Every ambiguity falls back
+to the broad coverage selector.

@@ -2164,15 +2164,20 @@ def profile_equivalent_predicate_edit(
         return False
     if type(changed_compare.ops[0]).__name__ != new_operator:
         return False
-    adjacent = {
-        ("Lt", "LtE"),
-        ("LtE", "Lt"),
-        ("Gt", "GtE"),
-        ("GtE", "Gt"),
-    }
-    if (old_operator, new_operator) not in adjacent:
-        return False
     outcome_index = {"Lt": 0, "LtE": 1, "Gt": 2, "GtE": 3, "Eq": 4, "NotEq": 5}
+    # The artifact stores the result of every profiled operator on the exact
+    # same immutable operands.  The proof therefore does not depend on the
+    # replacement being the adjacent inclusive/exclusive ordering operator:
+    # any distinct recorded pair is equivalent when its booleans agree for
+    # every observation.  Identity operators remain excluded because their
+    # outcomes are not present in this artifact and source instrumentation can
+    # perturb constant interning.
+    if (
+        old_operator == new_operator
+        or old_operator not in outcome_index
+        or new_operator not in outcome_index
+    ):
+        return False
     if (
         state != "safe"
         or not isinstance(observations, list)
@@ -2185,6 +2190,21 @@ def profile_equivalent_predicate_edit(
             != outcome[outcome_index[new_operator]]
             for outcome in observations
         )
+    ):
+        return False
+
+    # Quiet-NaN ordering can raise FE_INVALID even when equality returns the
+    # same boolean. Native floating-point status is not part of a Python bool,
+    # so reject the one recorded outcome vector that can hide this difference.
+    # This also conservatively covers recursively safe tuples containing a
+    # distinct NaN. Same-class ordering replacements retain the same FP
+    # comparison class, while NotEq cannot equal an ordering result on this
+    # vector in the first place.
+    unordered_nan = [False, False, False, False, False, True]
+    ordering_operators = {"Lt", "LtE", "Gt", "GtE"}
+    if (
+        (old_operator in ordering_operators) != (new_operator in ordering_operators)
+        and any(outcome == unordered_nan for outcome in observations)
     ):
         return False
 
