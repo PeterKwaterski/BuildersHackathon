@@ -44,7 +44,7 @@ make check    # the output's format only
 
 `sample/answers.json` lists the tests each sample commit breaks and the kind of change it is. The practice and final commits are hidden, and so is everything your program prints when it runs on them. A rejected submission tells you which rule it broke and nothing more, so reproduce problems here.
 
-The current exact-image sample result is **104.175 simulated seconds with zero
+The current exact-image sample result is **102.598 simulated seconds with zero
 misses**. Seven recent selector-body measurements in the scorer container had a
 1.103-second median; process startup is additional and the board measures the
 complete container. Model collection used the pinned Python 3.13 image and the
@@ -105,6 +105,14 @@ It is not filtered by a candidate edit and contains no replacement operators or
 test ownership. Runtime use requires an adjacent operator pair whose old and new
 outcomes match across the raw profile, plus whole-file AST equality after normalizing only that operator,
 plus the ordinary compile, directive, import and function-binding gates.
+
+`tools/collect_class_attribute_reads.py` and
+`tools/build_class_attribute_model.py` reproduce the complete owner-aware
+class-attribute reader profile documented in `tools/CLASS_ATTRIBUTE_PROFILE.md`.
+Runtime MRO identity keeps same-named attributes on unrelated classes separate.
+Only an otherwise identical same-type literal value edit at a safely observed
+assignment can select its exact readers; import-time reads, mutation,
+reflection ambiguity, or stale provenance force the ordinary broad fallback.
 
 ## Submit
 
