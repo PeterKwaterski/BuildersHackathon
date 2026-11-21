@@ -10,6 +10,10 @@ import types
 from pathlib import Path
 
 from semantic import SemanticProof
+from shared_arg_write_runtime import (
+    fresh_receiver_candidate,
+    load_model as load_shared_arg_model,
+)
 
 DATA = Path("/data")
 MODEL = Path(__file__).with_name("selector_model.json.gz")
@@ -21,6 +25,11 @@ ARG_TYPE_DERIVATION_MODEL = Path(__file__).with_name(
 )
 CLASS_ATTRIBUTE_MODEL = Path(__file__).with_name("class_attribute_model.json.gz")
 FRESH_ALIAS_PROFILE = Path(__file__).with_name("fresh_alias_profile.json.gz")
+SHARED_ARG_WRITE_MODEL = Path(__file__).with_name("shared_arg_write_model.json.gz")
+# Candidate recognition is complete, but narrowing stays off until the
+# source-derived non-escape/ownership fixed point is admitted independently.
+SHARED_ARG_WRITE_ENABLED = False
+_SHARED_ARG_WRITE_MODEL = None
 MAX_WORKERS = 8
 WORKER_COST_MS = 2_000
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -645,6 +654,25 @@ def patched_source(change: dict, path: str) -> str | None:
     ending = "\n" if source.endswith("\n") else ""
     change["_patched_source"] = "\n".join(result) + ending
     return change["_patched_source"]
+
+
+def contained_fresh_receiver_edit(change: dict, path: str) -> bool:
+    """Default-off bridge to the source-derived fresh-receiver candidate gate."""
+    global _SHARED_ARG_WRITE_MODEL
+    if not SHARED_ARG_WRITE_ENABLED:
+        return False
+    if _SHARED_ARG_WRITE_MODEL is None:
+        _SHARED_ARG_WRITE_MODEL = load_shared_arg_model(SHARED_ARG_WRITE_MODEL)
+    source = pinned_sources().get(path)
+    changed = patched_source(change, path)
+    return bool(
+        _SHARED_ARG_WRITE_MODEL is not None
+        and source is not None
+        and changed is not None
+        and fresh_receiver_candidate(
+            change, path, source, changed, _SHARED_ARG_WRITE_MODEL
+        )
+    )
 
 
 def invalid_python_patch(change: dict, path: str) -> bool:
@@ -1725,6 +1753,7 @@ def selected_indices(
             # Python parses the whole module before any test can import it.
             selected.update(all_indices)
             continue
+        fresh_receiver_contained = contained_fresh_receiver_edit(change, path)
         if comment_only_addition(change) and any(
             COMMENT_DIRECTIVE.search(line) for line in change["added"]
         ):
@@ -1834,10 +1863,13 @@ def selected_indices(
             selected.update(mapped_set(model, entry["f"]))
 
         expression_hazard = import_expression_hazard(change, path, model.get("h"))
-        if any(
-            start <= line <= end
-            for start, end in entry.get("i", ())
-            for line in changed_lines
+        if (
+            not fresh_receiver_contained
+            and any(
+                start <= line <= end
+                for start, end in entry.get("i", ())
+                for line in changed_lines
+            )
         ) or any(
             import_definition_line(path, line) for line in changed_lines
         ) or expression_hazard:
