@@ -1,6 +1,7 @@
 """Select tests from answer-independent coverage, fixture, and symbol maps."""
 
 import ast
+import configparser
 import gzip
 import hashlib
 import io
@@ -36,6 +37,8 @@ import query_modifier_research
 
 DATA = Path("/data")
 PINNED_SOURCE_ROOT = Path("/app/sqlglot-pinned")
+MYPY_CONFIG_PATH = "setup.cfg"
+MYPY_CONFIG_SHA256 = "399372875088fb648f820f409d715aa28219d1886fba957dfc2848ecc5631942"
 MODEL = Path(__file__).with_name("selector_model.json.gz")
 SEMANTIC_SOURCES = Path(__file__).with_name("semantic_sources.json.gz")
 ZERO_READER_MODEL = Path(__file__).with_name("zero_reader_model.json.gz")
@@ -3584,6 +3587,131 @@ def isolated_new_fixture_indices(
     return set(readers)
 
 
+def isolated_mypy_config_indices(
+    changes: list[dict], discovery_profile: dict | None
+) -> set[int] | None:
+    """Prove a pinned setup.cfg edit remains private to mypy configuration."""
+    if (
+        len(changes) != 1
+        or not canonical_text_changes(changes)
+        or not isinstance(discovery_profile, dict)
+    ):
+        return None
+    try:
+        discovery_body = {
+            key: discovery_profile[key]
+            for key in ("a", "b", "d", "f", "i", "k", "m", "r", "w")
+        }
+    except KeyError:
+        return None
+    if (
+        discovery_profile.get("d") != NEW_MODULE_SOURCE_SHA256
+        or discovery_profile.get("p") != NEW_MODULE_PROFILE_SHA256
+        or _stable_json_digest(discovery_profile.get("i"))
+        != NEW_MODULE_INVENTORY_SHA256
+        or _stable_json_digest(discovery_body) != NEW_MODULE_PROFILE_SHA256
+    ):
+        return None
+    change = changes[0]
+    if (
+        change.get("old") != MYPY_CONFIG_PATH
+        or change.get("new") != MYPY_CONFIG_PATH
+        or change.get("diff_old") != MYPY_CONFIG_PATH
+        or change.get("diff_new") != MYPY_CONFIG_PATH
+    ):
+        return None
+    config_path = PINNED_SOURCE_ROOT / MYPY_CONFIG_PATH
+    try:
+        if (
+            not PINNED_SOURCE_ROOT.is_dir()
+            or not config_path.is_file()
+            or config_path.is_symlink()
+        ):
+            return None
+        raw_source = config_path.read_bytes()
+    except (OSError, ValueError, OverflowError, MemoryError):
+        return None
+    if (
+        len(raw_source) > 16_384
+        or hashlib.sha256(raw_source).hexdigest() != MYPY_CONFIG_SHA256
+    ):
+        return None
+    try:
+        source = raw_source.decode("utf-8")
+    except UnicodeError:
+        return None
+    original = source.splitlines()
+    result = []
+    cursor = 0
+    for hunk in change.get("hunks", ()):
+        start = max(
+            0,
+            hunk["old_start"] if hunk["old_count"] == 0 else hunk["old_start"] - 1,
+        )
+        if start < cursor or start > len(original):
+            return None
+        result.extend(original[cursor:start])
+        cursor = start
+        for marker, text in hunk["lines"]:
+            if marker == "+":
+                result.append(text)
+                continue
+            if cursor >= len(original) or original[cursor] != text:
+                return None
+            if marker == " ":
+                result.append(original[cursor])
+            cursor += 1
+    result.extend(original[cursor:])
+    prospective = "\n".join(result) + ("\n" if source.endswith("\n") else "")
+    if prospective == source or len(prospective.encode("utf-8")) > 16_384:
+        return None
+
+    parser = configparser.ConfigParser(
+        interpolation=None,
+        strict=True,
+        empty_lines_in_values=False,
+    )
+    try:
+        parser.read_string(prospective, source=MYPY_CONFIG_PATH)
+    except (
+        configparser.Error,
+        UnicodeError,
+        ValueError,
+        TypeError,
+        MemoryError,
+        RecursionError,
+    ):
+        return None
+    sections = parser.sections()
+    if (
+        parser.defaults()
+        or not sections
+        or any(
+            re.fullmatch(r"mypy(?:-[A-Za-z0-9_.*-]+)?", section) is None
+            for section in sections
+        )
+    ):
+        return None
+    active_section = False
+    lexical_sections = []
+    for line in prospective.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", ";")):
+            continue
+        section_match = re.fullmatch(r"\[(mypy(?:-[A-Za-z0-9_.*-]+)?)\]", line)
+        if section_match is not None:
+            active_section = True
+            lexical_sections.append(section_match.group(1))
+            continue
+        if not active_section or re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_-]*\s*=\s*[A-Za-z0-9_.*,:/+ -]+", line
+        ) is None:
+            return None
+    if lexical_sections != sections:
+        return None
+    return set()
+
+
 def selected_indices(
     patch: Path,
     model: dict,
@@ -3645,6 +3773,9 @@ def selected_indices(
     )
     if new_module_readers is not None:
         return new_module_readers & all_indices
+    mypy_config_readers = isolated_mypy_config_indices(changes, new_module_model)
+    if mypy_config_readers is not None:
+        return mypy_config_readers
     helper_changes = [
         change for change in changes
         if TPC_ENTRY_PATH in (change.get("old"), change.get("new"))
