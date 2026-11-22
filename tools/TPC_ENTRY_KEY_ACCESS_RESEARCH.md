@@ -48,14 +48,18 @@ entire changed byte string must equal one literal-token substitution.
 
 ## Complete pinned reader closure
 
-`tpc_entry_reader_provenance.json.gz` is rebuilt from the complete pinned
-`sqlglot/**/*.py` and `tests/**/*.py` graph. Its compressed SHA-256 is
-`2c336f8dd94a2788e84b1e4d5261d57692decae7e3bbc24333e0b52ec1ef7e9d`;
+`tpc_entry_reader_provenance.json.gz` is rebuilt from all 258 tracked Python
+files plus a repository-wide textual scan of all 365 tracked index entries. Its
+compressed SHA-256 is
+`5e1049132f3c88793fed8d0fed7a12c76e541cd1dce2598b668e1d88ec25eaf4`;
 its signed-profile SHA-256 is
-`764d50b84c970aeac683fe7a33509c9ee8bce4be3800c19eec7ca2f64b646ec5`.
+`0d3b6fdc2ca925e10528e362e44a38a1232db404d4d429fbe6ca859d0bce5c30`.
 It binds the pinned revision, compressed selector-model digest, manifest digest,
-three source digests, collected-file list, all definition/import/name/attribute/
-string events, exact owners and fixture-model provenance.
+all 258 Python source digests, tracked-index digest
+`a2f99e795d6c15564829485f6e761f28922ba471613097d8c41227dd2bb91ca6`,
+the 28 repository-wide textual reference sites, collected-file list, all
+definition/import/name/attribute/string events, exact owners and fixture-model
+provenance. The builder rejects a dirty or wrong-revision source tree.
 Those bindings are revision
 `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`, selector-model SHA-256
 `d61c504e9a4a1006217e6702e1c6f05c04846b3dd5a09ec5572523fd8b2cb382`,
@@ -75,6 +79,10 @@ The complete graph has these relevant observations:
 - `tests/gen_fixtures.py` defines distinct local objects with the same names. It
   is absent from the 58 collected manifest files and no pinned module imports
   it. Its two top-level loads therefore do not alias `tests.helpers`.
+- `benchmarks/optimize.py` imports and returns both helper objects, but it too is
+  absent from the collected manifest. No tracked Python import or exact dynamic
+  module string reaches either `benchmarks.optimize` or `tests.gen_fixtures`.
+  These uncollected readers are recorded, not silently omitted.
 - There are no `tests.helpers` star/module imports, schema-name attributes,
   schema-name string/reflection references or other loads in the complete graph.
   Direct `from` binding itself evaluates only the already-safe literal object;

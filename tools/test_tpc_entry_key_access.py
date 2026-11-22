@@ -104,13 +104,27 @@ class TpcEntryKeyAccessTest(unittest.TestCase):
         )
         imports = [event for event in document["events"] if event["kind"] == "import"]
         self.assertEqual(
-            {event["path"] for event in imports},
+            {
+                event["path"] for event in imports
+                if event["path"] in document["collected_files"]
+            },
             {"tests/test_executor.py", "tests/test_optimizer.py"},
         )
         self.assertFalse(any(
             event["kind"] in {"attribute", "string"} for event in document["events"]
         ))
         self.assertNotIn("tests/gen_fixtures.py", document["collected_files"])
+        self.assertNotIn("benchmarks/optimize.py", document["collected_files"])
+        self.assertEqual(document["tracked_file_count"], 365)
+        self.assertEqual(document["tracked_python_count"], 258)
+        self.assertEqual(len(document["source_hashes"]), 258)
+        self.assertEqual(
+            document["tracked_index_sha256"],
+            "a2f99e795d6c15564829485f6e761f28922ba471613097d8c41227dd2bb91ca6",
+        )
+        self.assertEqual(len(document["text_references"]), 28)
+        self.assertEqual(document["uncollected_reader_imports"], [])
+        self.assertIn("benchmarks/optimize.py", {event["path"] for event in imports})
         self.assertEqual(
             {name: len(owners) for name, owners in document["owners"].items()},
             {"TPCH_SCHEMA": 61, "TPCDS_SCHEMA": 61},

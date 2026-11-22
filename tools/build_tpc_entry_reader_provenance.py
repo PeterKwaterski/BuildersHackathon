@@ -14,6 +14,7 @@ from pathlib import Path
 
 PINNED = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
 NAMES = {"TPCH_SCHEMA", "TPCDS_SCHEMA"}
+UNCOLLECTED_READERS = {"benchmarks.optimize", "tests.gen_fixtures"}
 
 
 def sha(data: bytes) -> str:
@@ -41,6 +42,12 @@ def main() -> int:
     ).stdout.strip()
     if revision != PINNED:
         raise SystemExit("wrong revision")
+    dirty = subprocess.run(
+        ["git", "-C", str(args.source), "status", "--porcelain", "--untracked-files=no"],
+        check=True, capture_output=True,
+    ).stdout
+    if dirty:
+        raise SystemExit("dirty pinned source")
     model_bytes = args.model.read_bytes()
     model = json.loads(gzip.decompress(model_bytes))
     if model.get("sha") != PINNED:
@@ -48,7 +55,35 @@ def main() -> int:
 
     events = []
     source_hashes = {}
-    for path in sorted((*args.source.glob("sqlglot/**/*.py"), *args.source.glob("tests/**/*.py"))):
+    tracked = subprocess.run(
+        ["git", "-C", str(args.source), "ls-files", "-z", "--", "*.py"],
+        check=True, capture_output=True,
+    ).stdout.split(b"\0")
+    python_paths = [args.source / item.decode() for item in tracked if item]
+    all_tracked_result = subprocess.run(
+        ["git", "-C", str(args.source), "ls-files", "-z"],
+        check=True, capture_output=True,
+    ).stdout
+    all_tracked = all_tracked_result.split(b"\0")
+    tracked_index = subprocess.run(
+        ["git", "-C", str(args.source), "ls-files", "-s", "-z"],
+        check=True, capture_output=True,
+    ).stdout
+    all_paths = [args.source / item.decode() for item in all_tracked if item]
+    text_references = []
+    for path in all_paths:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            if any(name in line for name in (*NAMES, "tests.helpers")):
+                text_references.append({
+                    "path": path.relative_to(args.source).as_posix(),
+                    "line": line_number,
+                })
+    uncollected_reader_imports = []
+    for path in sorted(python_paths):
         relative = path.relative_to(args.source).as_posix()
         data = path.read_bytes()
         source_hashes[relative] = sha(data)
@@ -56,6 +91,21 @@ def main() -> int:
         parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
         for node in ast.walk(tree):
             event = None
+            imported_modules = []
+            if isinstance(node, ast.Import):
+                imported_modules.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported_modules.append(node.module)
+                imported_modules.extend(
+                    f"{node.module}.{alias.name}" for alias in node.names
+                )
+            elif isinstance(node, ast.Constant) and type(node.value) is str:
+                imported_modules.append(node.value)
+            for module in imported_modules:
+                if module in UNCOLLECTED_READERS:
+                    uncollected_reader_imports.append({
+                        "path": relative, "line": node.lineno, "module": module,
+                    })
             if (
                 isinstance(node, ast.Assign)
                 and len(node.targets) == 1
@@ -101,12 +151,14 @@ def main() -> int:
         "revision": revision,
         "model_sha256": sha(model_bytes),
         "test_id_sha256": sha("\0".join(test_ids).encode()),
-        "source_hashes": {
-            path: source_hashes[path]
-            for path in ("tests/helpers.py", "tests/test_executor.py", "tests/test_optimizer.py")
-        },
+        "source_hashes": dict(sorted(source_hashes.items())),
+        "tracked_index_sha256": sha(tracked_index),
         "events": events,
         "collected_files": sorted({test_id.split("::", 1)[0] for test_id in test_ids}),
+        "tracked_file_count": len(all_paths),
+        "tracked_python_count": len(python_paths),
+        "text_references": text_references,
+        "uncollected_reader_imports": uncollected_reader_imports,
         "owners": owners,
         "fixtures": fixtures,
     }
