@@ -33,6 +33,11 @@ gross is therefore 9.436 seconds per patch and **56.616 seconds total**.
 The sample30 output is byte-for-byte unchanged from b8: 101 selected tests over
 30 patches. None of the sample patches enters the new-module lane.
 
+On the loaded local filesystem, 100 repeated artifact decode-and-validation
+cycles averaged 12.30 ms each. The hardened patch parser averaged 7.09 ms for
+all sample30 patches versus 7.37 ms for b8, so the measured fixed selector cost
+is approximately 12 ms rather than a per-patch regression.
+
 ## AST-refactor and member result
 
 The public same-file Python census found seven patches accepted as equivalent by
