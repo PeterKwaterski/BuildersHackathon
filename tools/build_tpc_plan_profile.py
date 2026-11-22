@@ -13,15 +13,10 @@ import sys
 import unittest  # Keep the target tests' import order.
 from pathlib import Path
 
+from tpc_graph_digest import GRAPH_FORMAT, graph_digest
+
 
 SOURCE_SHA = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
-
-
-def digest(value: object) -> str:
-    encoded = json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
-    ).encode()
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def collect(tree: Path) -> dict:
@@ -45,12 +40,15 @@ def collect(tree: Path) -> dict:
                     "sql_sha256": hashlib.sha256(sql.encode()).hexdigest(),
                     "expected_sha256": hashlib.sha256(expected.encode()).hexdigest(),
                     "pretty_sha256": hashlib.sha256(expression.sql(pretty=True).encode()).hexdigest(),
-                    "graph_sha256": digest(expression.dump()),
+                    "graph_sha256": graph_digest(expression)
+                    if bool(meta.get("execute"))
+                    else None,
                 }
             )
         suites[name] = rows
     return {
-        "format": "kashimo-tpc-plan-profile-v1",
+        "format": "kashimo-tpc-plan-profile-v2",
+        "graph_format": GRAPH_FORMAT,
         "source_sha": SOURCE_SHA,
         "python": list(sys.version_info[:3]),
         "implementation": sys.implementation.name,

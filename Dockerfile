@@ -43,5 +43,6 @@ COPY tools/executor_result_memo.json.gz /app/executor_result_memo.json.gz
 COPY tools/verify_prospective_executor_memo.py /app/verify_prospective_executor_memo.py
 COPY tools/run_prospective_executor_memo.py /app/run_prospective_executor_memo.py
 COPY tpc_plan_runtime.py /app/tpc_plan_runtime.py
+COPY tpc_graph_digest.py /app/tpc_graph_digest.py
 COPY tpc_plan_profile.json.gz /app/tpc_plan_profile.json.gz
 CMD ["python", "/app/selector.py"]

@@ -20,8 +20,9 @@ from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import get_context
 from pathlib import Path
 
+from tpc_graph_digest import GRAPH_FORMAT, graph_digest
 
-PROFILE_SHA256 = "0c7c89237e9854f596ec75d028d912346eead351bb0207acdbea5b89ade5f01a"
+PROFILE_SHA256 = "d929551c3041efcde8eb955768e0f8173cfafd6828c4d8a5762703346f31b1ce"
 SOURCE_SHA = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
 
 
@@ -47,13 +48,6 @@ def cpu_seconds() -> float:
     return own.ru_utime + own.ru_stime + children.ru_utime + children.ru_stime
 
 
-def canonical_digest(value: object) -> str:
-    encoded = json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
-    ).encode()
-    return hashlib.sha256(encoded).hexdigest()
-
-
 def load_profile(path: Path) -> dict:
     payload = path.read_bytes()
     if hashlib.sha256(payload).hexdigest() != PROFILE_SHA256:
@@ -64,7 +58,8 @@ def load_profile(path: Path) -> dict:
         raise Unsupported("invalid plan profile") from error
     if (
         not isinstance(document, dict)
-        or document.get("format") != "kashimo-tpc-plan-profile-v1"
+        or document.get("format") != "kashimo-tpc-plan-profile-v2"
+        or document.get("graph_format") != GRAPH_FORMAT
         or document.get("source_sha") != SOURCE_SHA
         or document.get("python") != list(sys.version_info[:3])
         or document.get("implementation") != sys.implementation.name
@@ -153,7 +148,7 @@ def verify_spawn_partition(
         ) != state_before:
             raise Unsupported("optimizer changed persistent module state")
         equal = equal and (
-            canonical_digest(expression.dump())
+            graph_digest(expression)
             == baseline.get("graph_sha256")
         )
         if not equal:
