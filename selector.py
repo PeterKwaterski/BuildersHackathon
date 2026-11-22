@@ -183,6 +183,12 @@ def patch_changes(patch: Path) -> list[dict]:
             change["old"] = line.removeprefix("rename from ")
         elif not in_hunk and line.startswith("rename to "):
             change["new"] = line.removeprefix("rename to ")
+        elif line.startswith(("-", "+", " ")) and hunk is None:
+            # A rejected binary or malformed structural body can contain
+            # payload-looking lines without a unified text hunk. Never index a
+            # missing hunk; mark the section unknown so ordinary selection
+            # retains the complete test inventory.
+            change["structural_invalid"] = True
         elif line.startswith("-"):
             hunk["lines"].append(("-", line[1:]))
             if addition_anchor is None:

@@ -294,6 +294,36 @@ class BinaryCopyPatchTest(unittest.TestCase):
                 all_indices,
             )
 
+    def test_rejected_binary_payload_without_text_hunk_fails_closed(self):
+        all_indices = set(range(len(TEST_IDS)))
+        prefix = (
+            "diff --git a/tests/fixtures/jsonpath/cts.json "
+            "b/tests/fixtures/jsonpath/cts.json\n"
+            "index 0000000000000000000000000000000000000000.."
+            "1111111111111111111111111111111111111111 100644\n"
+            "GIT binary patch\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            patch = Path(directory) / "malformed.patch"
+            for payload in ("-bad\n", "+bad\n"):
+                patch.write_text(prefix + payload, encoding="utf-8")
+                self.assertEqual(
+                    selector.selected_indices(
+                        patch, MODEL, all_indices, binary_preimages=PREIMAGES
+                    ),
+                    all_indices,
+                )
+
+            patch.write_text(
+                binary_differ("tests/fixtures/jsonpath/cts.json"), encoding="utf-8"
+            )
+            self.assertEqual(
+                selector.selected_indices(
+                    patch, MODEL, all_indices, binary_preimages=None
+                ),
+                all_indices,
+            )
+
     def test_pinned_artifact_loader(self):
         self.assertEqual(
             binary.load_preimages(
