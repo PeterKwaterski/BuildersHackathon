@@ -19,4 +19,5 @@ COPY shared_arg_write_model.json.gz /app/shared_arg_write_model.json.gz
 COPY none_static_profile.json.gz /app/none_static_profile.json.gz
 COPY fixture_binary_preimages.json.gz /app/fixture_binary_preimages.json.gz
 COPY tpc_entry_reader_provenance.json.gz /app/tpc_entry_reader_provenance.json.gz
+COPY new_module_model.json.gz /app/new_module_model.json.gz
 CMD ["python", "/app/selector.py"]

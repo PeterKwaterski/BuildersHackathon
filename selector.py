@@ -4,6 +4,8 @@ import ast
 import gzip
 import hashlib
 import json
+import base64
+import keyword
 import re
 import sys
 import types
@@ -41,10 +43,17 @@ TPC_ENTRY_PROVENANCE = Path(__file__).with_name("tpc_entry_reader_provenance.jso
 # fixed point proves that mutations stay within a fresh owned object graph.
 SHARED_ARG_WRITE_ENABLED = True
 _SHARED_ARG_WRITE_MODEL = None
+NEW_MODULE_MODEL = Path(__file__).with_name("new_module_model.json.gz")
+NEW_MODULE_PROFILE_SHA256 = "1b24ab53483bb1932d8139b80fa17e797a1974ee3078157a110c0f25b28f4e10"
+NEW_MODULE_SOURCE_SHA256 = "b7f798c9e8015db63d6e160ab73f59828e445cef8739cfb383aba44d5de5f5f0"
+NEW_MODULE_INVENTORY_SHA256 = "b30749cd488217746916b61c0eb138d46ab9f3543b32e0dbbd4688c0ac9ee12b"
 MAX_WORKERS = 8
 WORKER_COST_MS = 2_000
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 COMMENT_DIRECTIVE = re.compile(r"(?i)(coding\s*[:=]|type:|noqa|pragma|fmt:|pyright|mypy)")
+NEW_MODULE_PATH = re.compile(
+    r"sqlglot(?:/[A-Za-z_][A-Za-z0-9_]*)*/[A-Za-z_][A-Za-z0-9_]*\.py\Z"
+)
 PROCESS_SERIALIZATION_FILES = {"sqlglot/serde.py"}
 _PINNED_SOURCES = None
 _SOURCE_TREES = {}
@@ -53,6 +62,10 @@ _IMPORT_DEFINITION_RANGES = {}
 _SOURCE_CODE = {}
 _INIT_SUBCLASS_ATTRIBUTES = None
 
+# Independent review found no opaque package-discovery path reachable from the
+# pinned test manifest and locked pure-Python runtime. Every source-visible
+# discovery site retains its complete reader set; malformed evidence fails shut.
+NEW_MODULE_PROOF_ENABLED = True
 
 def split(tests: list[dict], worker_count: int) -> tuple[list[list[int]], int]:
     """Longest test first, each onto the worker with the least to do so far."""
@@ -100,6 +113,12 @@ def patch_changes(patch: Path) -> list[dict]:
                 "diff_old": header[2][2:] if len(header) == 4 and header[2].startswith("a/") else None,
                 "diff_new": header[3][2:] if len(header) == 4 and header[3].startswith("b/") else None,
                 "new_file_mode": None,
+                "new_file_mode_count": 0,
+                "old_marker_count": 0,
+                "new_marker_count": 0,
+                "index_count": 0,
+                "new_file_index": False,
+                "structural_invalid": False,
                 "binary": False,
                 "non_lf": non_lf,
                 "no_newline_marker": False,
@@ -115,26 +134,49 @@ def patch_changes(patch: Path) -> list[dict]:
             change["no_newline_marker"] = True
         elif not in_hunk and line.startswith("new file mode "):
             change["new_file_mode"] = line.removeprefix("new file mode ")
+            change["new_file_mode_count"] += 1
+        elif not in_hunk and line.startswith("index "):
+            change["index_count"] += 1
+            change["new_file_index"] = bool(
+                re.fullmatch(r"index 0{7,64}\.\.[0-9a-f]{7,64}", line)
+            )
+        elif not in_hunk and line.startswith(
+            (
+                "old mode ",
+                "new mode ",
+                "deleted file mode ",
+                "similarity index ",
+                "dissimilarity index ",
+                "rename from ",
+                "rename to ",
+                "copy from ",
+                "copy to ",
+            )
+        ):
+            change["structural_invalid"] = True
         elif match := HUNK.match(line):
             old_start = int(match.group(1))
             old_count = int(match.group(2) or 1)
             old_line = old_start + (old_count == 0)
-            new_line = int(match.group(3))
+            new_start = int(match.group(3))
             new_count = int(match.group(4) or 1)
+            new_line = new_start
             addition_anchor = None
             hunk = {
                 "old_start": old_start,
                 "old_count": old_count,
-                "new_start": int(match.group(3)),
+                "new_start": new_start,
                 "new_count": new_count,
                 "lines": [],
             }
             change["hunks"].append(hunk)
             in_hunk = True
         elif not in_hunk and line.startswith("--- "):
+            change["old_marker_count"] += 1
             name = line[4:].split("\t", 1)[0]
             change["old"] = name[2:] if name.startswith("a/") else name
         elif not in_hunk and line.startswith("+++ "):
+            change["new_marker_count"] += 1
             name = line[4:].split("\t", 1)[0]
             change["new"] = name[2:] if name.startswith("b/") else name
         elif not in_hunk and line.startswith("rename from "):
@@ -165,6 +207,8 @@ def patch_changes(patch: Path) -> list[dict]:
             old_line += 1
             new_line += 1
             addition_anchor = None
+        elif in_hunk:
+            change["structural_invalid"] = True
     return changes
 
 
@@ -1782,6 +1826,178 @@ def path_dependency_cone(
     return selected, known
 
 
+def _stable_json_digest(value: object) -> str | None:
+    try:
+        encoded = json.dumps(
+            value, sort_keys=True, separators=(",", ":")
+        ).encode()
+    except (TypeError, ValueError, OverflowError, RecursionError, MemoryError):
+        return None
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def valid_new_module_model(
+    profile: object, pinned_sha: object, test_digest: str, n: int
+) -> bool:
+    """Validate the complete source/discovery certificate or fail closed."""
+    if not isinstance(profile, dict) or set(profile) != {
+        "a", "b", "d", "f", "i", "k", "m", "n", "p", "r", "sha", "t", "v", "w"
+    }:
+        return False
+    if (
+        profile.get("v") != 1
+        or profile.get("sha") != pinned_sha
+        or profile.get("t") != test_digest
+        or profile.get("n") != n
+        or profile.get("d") != NEW_MODULE_SOURCE_SHA256
+        or profile.get("f") != 363
+        or profile.get("w") != 192226
+        or profile.get("k") != 5
+        or profile.get("m") != 1 << 21
+        or profile.get("a")
+        != [
+            "sqlglot",
+            "sqlglot/dialects",
+            "sqlglot/executor",
+            "sqlglot/expressions",
+            "sqlglot/generators",
+            "sqlglot/optimizer",
+            "sqlglot/parsers",
+            "sqlglot/typing",
+        ]
+    ):
+        return False
+    inventory = profile.get("i")
+    readers = profile.get("r")
+    if (
+        not isinstance(inventory, list)
+        or len(inventory) != 42
+        or not isinstance(readers, list)
+        or readers != sorted(set(readers))
+        or any(type(reader) is not int or reader < 0 or reader >= n for reader in readers)
+    ):
+        return False
+    for entry in inventory:
+        if (
+            not isinstance(entry, list)
+            or len(entry) != 5
+            or type(entry[0]) is not str
+            or type(entry[1]) is not int
+            or type(entry[2]) is not int
+            or entry[1] <= 0
+            or entry[2] < entry[1]
+            or entry[3]
+            not in {
+                "dynamic-code",
+                "dynamic-import",
+                "directory-listing",
+                "package-reflection",
+                "package-data",
+                "path-probe",
+                "source-reader",
+                "subprocess",
+            }
+            or type(entry[4]) is not str
+        ):
+            return False
+    if _stable_json_digest(inventory) != NEW_MODULE_INVENTORY_SHA256:
+        return False
+    try:
+        bloom = base64.b64decode(profile.get("b", ""), validate=True)
+    except (ValueError, TypeError):
+        return False
+    if len(bloom) != (1 << 21) // 8:
+        return False
+    body = {key: profile[key] for key in ("a", "b", "d", "f", "i", "k", "m", "r", "w")}
+    return (
+        _stable_json_digest(body) == NEW_MODULE_PROFILE_SHA256
+        and profile.get("p") == NEW_MODULE_PROFILE_SHA256
+    )
+
+
+def _new_module_word_present(word: str, profile: dict) -> bool:
+    try:
+        bits = base64.b64decode(profile["b"], validate=True)
+    except (KeyError, ValueError, TypeError):
+        return True
+    digest = hashlib.sha256(word.encode("ascii")).digest()
+    for index in range(profile["k"]):
+        start = index * 4
+        position = int.from_bytes(digest[start : start + 4], "big") & (profile["m"] - 1)
+        if not bits[position >> 3] & (1 << (position & 7)):
+            return False
+    return True
+
+
+def isolated_new_module_indices(
+    changes: list[dict], profile: dict | None
+) -> set[int] | None:
+    """Return conservative discovery readers for one provably isolated module."""
+    if profile is None or len(changes) != 1:
+        return None
+    change = changes[0]
+    path = change.get("new")
+    if (
+        change.get("old") != "/dev/null"
+        or type(path) is not str
+        or not NEW_MODULE_PATH.fullmatch(path)
+        or change.get("diff_old") != path
+        or change.get("diff_new") != path
+        or change.get("new_file_mode") != "100644"
+        or change.get("new_file_mode_count") != 1
+        or change.get("old_marker_count") != 1
+        or change.get("new_marker_count") != 1
+        or change.get("index_count") != 1
+        or not change.get("new_file_index")
+        or change.get("structural_invalid")
+        or change.get("binary")
+        or change.get("non_lf")
+        or change.get("no_newline_marker")
+        or path in pinned_sources()
+    ):
+        return None
+    parent = Path(path).parent.as_posix()
+    stem = Path(path).stem
+    lowered = stem.lower()
+    if (
+        parent not in profile["a"]
+        or not stem.isascii()
+        or not stem.isidentifier()
+        or keyword.iskeyword(stem)
+        or stem.startswith("__")
+        or stem.endswith("__")
+        or lowered == "conftest"
+        or lowered.startswith("test")
+        or lowered.endswith("test")
+        or _new_module_word_present(stem, profile)
+    ):
+        return None
+    hunks = change.get("hunks")
+    added = change.get("added")
+    if (
+        not isinstance(hunks, list)
+        or len(hunks) != 1
+        or hunks[0].get("old_start") != 0
+        or hunks[0].get("old_count") != 0
+        or hunks[0].get("new_start") != 1
+        or not isinstance(added, list)
+        or not added
+        or hunks[0].get("new_count") != len(added)
+        or change.get("removed")
+        or change.get("payload") != added
+        or any(marker != "+" for marker, _text in hunks[0].get("lines", ()))
+        or change.get("added_new_at")
+        != list(zip(range(1, len(added) + 1), added))
+    ):
+        return None
+    source = "\n".join(added) + "\n"
+    try:
+        compile(source, path, "exec", dont_inherit=True)
+    except (SyntaxError, ValueError, OverflowError, MemoryError):
+        return None
+    return set(profile["r"])
+
+
 def selected_indices(
     patch: Path,
     model: dict,
@@ -1795,6 +2011,7 @@ def selected_indices(
     none_static_profile: dict | None = None,
     binary_preimages: dict | None = None,
     tpc_entry_provenance: dict | None = None,
+    new_module_model: dict | None = None,
 ) -> set[int]:
     if BINARY_FIXTURE_ENABLED and binary_preimages is not None:
         try:
@@ -1810,6 +2027,13 @@ def selected_indices(
     changes = patch_changes(patch)
     if not changes:
         return set(all_indices)
+    new_module_readers = (
+        isolated_new_module_indices(changes, new_module_model)
+        if NEW_MODULE_PROOF_ENABLED
+        else None
+    )
+    if new_module_readers is not None:
+        return new_module_readers & all_indices
     helper_changes = [
         change for change in changes
         if TPC_ENTRY_PATH in (change.get("old"), change.get("new"))
@@ -2043,6 +2267,20 @@ def main() -> None:
     tpc_entry_provenance = load_tpc_entry_provenance(
         TPC_ENTRY_PROVENANCE, MODEL, model, model.get("t")
     )
+    try:
+        with gzip.open(NEW_MODULE_MODEL, "rt", encoding="utf-8") as new_module_file:
+            new_module_model = json.load(new_module_file)
+    except (
+        OSError,
+        EOFError,
+        UnicodeError,
+        json.JSONDecodeError,
+        ValueError,
+        TypeError,
+        RecursionError,
+        MemoryError,
+    ):
+        new_module_model = None
     test_digest = hashlib.sha256(
         "\0".join(test["id"] for test in tests).encode("utf-8")
     ).hexdigest()
@@ -2087,6 +2325,10 @@ def main() -> None:
         or fresh_alias_model.get("t") != test_digest
     ):
         fresh_alias_model = {"d": {}}
+    if not valid_new_module_model(
+        new_module_model, model.get("sha"), test_digest, len(tests)
+    ):
+        new_module_model = None
     mapped_tests = [tests_by_id.get(test_id) for test_id in model["t"]]
     all_indices = {index for index, test in enumerate(mapped_tests) if test is not None}
     test_file_indices: dict[str, set[int]] = {}
@@ -2111,6 +2353,7 @@ def main() -> None:
             none_static_profile,
             binary_preimages,
             tpc_entry_provenance,
+            new_module_model,
         )
         selected = [mapped_tests[index] for index in indices if mapped_tests[index] is not None]
         selected.extend(unmapped_tests)
