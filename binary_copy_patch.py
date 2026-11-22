@@ -1,4 +1,4 @@
-"""Default-off research classifier for binary fixture replacements.
+"""Conservative classifier for authenticated binary fixture replacements.
 
 The admitted language is intentionally much narrower than Git's patch format:
 one existing, same-path, same-mode binary replacement of an authenticated
@@ -10,15 +10,18 @@ from __future__ import annotations
 
 import re
 import hashlib
+import gzip
 import json
 import zlib
 from dataclasses import dataclass
+from pathlib import Path
 from pathlib import PurePosixPath
 
 
-FEATURE_ENABLED = False
+FEATURE_ENABLED = True
 PINNED_REVISION = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
 SELECTOR_MODEL_SHA256 = "d61c504e9a4a1006217e6702e1c6f05c04846b3dd5a09ec5572523fd8b2cb382"
+PREIMAGE_ARTIFACT_SHA256 = "10a70ad881f5b273b3277bd0cca553fcf6996485211c3b7544429c2e06d9bd5f"
 SAFE_PATH = re.compile(r"[A-Za-z0-9._@+/-]+\Z")
 DIFF = re.compile(r"diff --git a/([^ ]+) b/([^ ]+)\Z")
 BINARY_DIFFER = re.compile(r"Binary files a/([^ ]+) and b/([^ ]+) differ\Z")
@@ -366,6 +369,38 @@ def fixture_binary_union(
         paths.add(replacement.path)
         selected.update(readers)
     return selected
+
+
+def binary_patch_readers(
+    document: str, model: dict, test_ids: list[str], preimages: dict
+) -> set[int] | None:
+    """Recognize an entire patch made only of certified binary replacements."""
+    if type(document) is not str or "\x00" in document or "\r" in document:
+        return None
+    lines = document.splitlines()
+    starts = [index for index, line in enumerate(lines) if line.startswith("diff --git ")]
+    if not starts or starts[0] != 0:
+        return None
+    starts.append(len(lines))
+    sections = ["\n".join(lines[start:end]) for start, end in zip(starts, starts[1:])]
+    if any(not section for section in sections):
+        return None
+    return fixture_binary_union(sections, model, test_ids, preimages)
+
+
+def load_preimages(path: Path, model_path: Path, model: dict, test_ids: list[str]) -> dict | None:
+    """Load the pinned artifact only when both compressed inputs are exact."""
+    try:
+        if (
+            hashlib.sha256(path.read_bytes()).hexdigest() != PREIMAGE_ARTIFACT_SHA256
+            or hashlib.sha256(model_path.read_bytes()).hexdigest() != SELECTOR_MODEL_SHA256
+        ):
+            return None
+        with gzip.open(path, "rt", encoding="utf-8") as stream:
+            document = json.load(stream)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return document if valid_preimages(document, model, test_ids) is not None else None
 
 
 def valid_preimages(document: object, model: dict, test_ids: list[str]) -> dict[str, str] | None:

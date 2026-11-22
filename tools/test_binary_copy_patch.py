@@ -1,11 +1,13 @@
 import gzip
 import copy
 import json
+import tempfile
 import unittest
 import zlib
 from pathlib import Path
 
 import binary_copy_patch as binary
+import selector
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -254,8 +256,57 @@ class BinaryCopyPatchTest(unittest.TestCase):
         self.assertIsNone(binary.fixture_binary_union([tpc, tpc], MODEL, TEST_IDS, PREIMAGES))
         self.assertIsNone(binary.fixture_binary_union([tpc, cts + "copy from x\n"], MODEL, TEST_IDS, PREIMAGES))
 
-    def test_default_off(self):
-        self.assertFalse(binary.FEATURE_ENABLED)
+    def test_complete_patch_classifier_accepts_binary_only_and_rejects_mixed_or_prefixed(self):
+        tpc = binary_differ()
+        cts = binary_differ("tests/fixtures/jsonpath/cts.json")
+        expected = (
+            binary.fixture_binary_readers(tpc, MODEL, TEST_IDS, PREIMAGES)
+            | binary.fixture_binary_readers(cts, MODEL, TEST_IDS, PREIMAGES)
+        )
+        self.assertEqual(binary.binary_patch_readers(tpc + "\n" + cts, MODEL, TEST_IDS, PREIMAGES), expected)
+        self.assertIsNone(binary.binary_patch_readers("subject line\n" + tpc, MODEL, TEST_IDS, PREIMAGES))
+        self.assertIsNone(binary.binary_patch_readers(tpc + "\n" + "diff --git a/x.py b/x.py\n", MODEL, TEST_IDS, PREIMAGES))
+
+    def test_selector_integration_uses_binary_result_and_mixed_patch_fails_closed(self):
+        tpc = binary_differ()
+        expected = binary.fixture_binary_readers(tpc, MODEL, TEST_IDS, PREIMAGES)
+        all_indices = set(range(len(TEST_IDS)))
+        text = (
+            "diff --git a/sqlglot/helper.py b/sqlglot/helper.py\n"
+            "index 0000000..1111111 100644\n"
+            "--- a/sqlglot/helper.py\n+++ b/sqlglot/helper.py\n"
+            "@@ -1 +1 @@\n-old\n+new\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            patch = Path(directory) / "change.patch"
+            patch.write_text(tpc, encoding="utf-8")
+            self.assertEqual(
+                selector.selected_indices(
+                    patch, MODEL, all_indices, binary_preimages=PREIMAGES
+                ),
+                expected,
+            )
+            patch.write_text(tpc + "\n" + text, encoding="utf-8")
+            self.assertEqual(
+                selector.selected_indices(
+                    patch, MODEL, all_indices, binary_preimages=PREIMAGES
+                ),
+                all_indices,
+            )
+
+    def test_pinned_artifact_loader(self):
+        self.assertEqual(
+            binary.load_preimages(
+                ROOT / "fixture_binary_preimages.json.gz",
+                ROOT / "selector_model.json.gz",
+                MODEL,
+                TEST_IDS,
+            ),
+            PREIMAGES,
+        )
+
+    def test_feature_enabled_after_integration(self):
+        self.assertTrue(binary.FEATURE_ENABLED)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 # decide which sqlglot tests run, so keep it if your image runs them.
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 COPY selector.py /app/selector.py
+COPY binary_copy_patch.py /app/binary_copy_patch.py
 COPY semantic.py /app/semantic.py
 COPY shared_arg_write_runtime.py /app/shared_arg_write_runtime.py
 COPY none_static_runtime.py /app/none_static_runtime.py
@@ -15,4 +16,5 @@ COPY class_attribute_model.json.gz /app/class_attribute_model.json.gz
 COPY fresh_alias_profile.json.gz /app/fresh_alias_profile.json.gz
 COPY shared_arg_write_model.json.gz /app/shared_arg_write_model.json.gz
 COPY none_static_profile.json.gz /app/none_static_profile.json.gz
+COPY fixture_binary_preimages.json.gz /app/fixture_binary_preimages.json.gz
 CMD ["python", "/app/selector.py"]

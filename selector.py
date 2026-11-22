@@ -9,6 +9,8 @@ import sys
 import types
 from pathlib import Path
 
+from binary_copy_patch import FEATURE_ENABLED as BINARY_FIXTURE_ENABLED
+from binary_copy_patch import binary_patch_readers, load_preimages
 from semantic import SemanticProof
 from none_static_runtime import load_profile as load_none_static_profile
 from none_static_runtime import match as match_none_static
@@ -28,6 +30,7 @@ ARG_TYPE_DERIVATION_MODEL = Path(__file__).with_name(
 CLASS_ATTRIBUTE_MODEL = Path(__file__).with_name("class_attribute_model.json.gz")
 FRESH_ALIAS_PROFILE = Path(__file__).with_name("fresh_alias_profile.json.gz")
 SHARED_ARG_WRITE_MODEL = Path(__file__).with_name("shared_arg_write_model.json.gz")
+BINARY_FIXTURE_PREIMAGES = Path(__file__).with_name("fixture_binary_preimages.json.gz")
 # The artifact admits only calls whose exact-formal identity and non-escape
 # fixed point proves that mutations stay within a fresh owned object graph.
 SHARED_ARG_WRITE_ENABLED = True
@@ -1715,7 +1718,18 @@ def selected_indices(
     attribute_model: dict | None = None,
     fresh_alias_model: dict | None = None,
     none_static_profile: dict | None = None,
+    binary_preimages: dict | None = None,
 ) -> set[int]:
+    if BINARY_FIXTURE_ENABLED and binary_preimages is not None:
+        try:
+            binary_indices = binary_patch_readers(
+                patch.read_text(encoding="utf-8"), model, model.get("t"), binary_preimages
+            )
+        except (OSError, UnicodeError):
+            binary_indices = None
+        if binary_indices is not None:
+            return binary_indices
+
     selected: set[int] = set()
     changes = patch_changes(patch)
     if not changes:
@@ -1927,6 +1941,9 @@ def main() -> None:
         attribute_model = json.load(attribute_model_file)
     with gzip.open(FRESH_ALIAS_PROFILE, "rt", encoding="utf-8") as fresh_alias_file:
         fresh_alias_model = json.load(fresh_alias_file)
+    binary_preimages = load_preimages(
+        BINARY_FIXTURE_PREIMAGES, MODEL, model, model.get("t")
+    )
     test_digest = hashlib.sha256(
         "\0".join(test["id"] for test in tests).encode("utf-8")
     ).hexdigest()
@@ -1993,6 +2010,7 @@ def main() -> None:
             attribute_model,
             fresh_alias_model,
             none_static_profile,
+            binary_preimages,
         )
         selected = [mapped_tests[index] for index in indices if mapped_tests[index] is not None]
         selected.extend(unmapped_tests)
