@@ -2444,7 +2444,7 @@ def main() -> None:
     modeled_ids = set(model["t"])
     unmapped_tests = [test for test in tests if test["id"] not in modeled_ids]
 
-    selection_count = 0
+    jobs = []
     for patch in sorted((DATA / "commits").glob("*.patch")):
         indices = selected_indices(
             patch,
@@ -2466,7 +2466,26 @@ def main() -> None:
         tpc_ids = set().union(*TPC_PLAN_TESTS.values())
         without_all_tpc = [test for test in selected if test["id"] not in tpc_ids]
         prospective_saving = best_cost_ms(selected) - best_cost_ms(without_all_tpc)
-        if prospective_saving > 16_000 and tpc_plan_patch_eligible(patch):
+        jobs.append(
+            {
+                "patch": patch,
+                "selected": selected,
+                "prospective_saving": prospective_saving,
+                "eligible": prospective_saving > 16_000
+                and tpc_plan_patch_eligible(patch),
+            }
+        )
+
+    execution_order = sorted(
+        range(len(jobs)),
+        key=lambda index: jobs[index]["prospective_saving"],
+        reverse=True,
+    )
+    for index in execution_order:
+        job = jobs[index]
+        if job["eligible"]:
+            selected = job["selected"]
+            patch = job["patch"]
             verdicts, verifier_cpu = verify_tpc_plan_patch(patch)
             if verdicts is not None:
                 removable = set().union(
@@ -2479,12 +2498,16 @@ def main() -> None:
                 narrowed = [test for test in selected if test["id"] not in removable]
                 realized = best_cost_ms(selected) - best_cost_ms(narrowed)
                 if realized > round(verifier_cpu * 1_200):
-                    selected = narrowed
+                    job["selected"] = narrowed
+
+    selection_count = 0
+    for job in jobs:
+        selected = job["selected"]
         selection_count += len(selected)
         workers = best_split(selected)
         print(
             json.dumps(
-                {"commit": patch.stem, "workers": workers},
+                {"commit": job["patch"].stem, "workers": workers},
                 separators=(",", ":"),
             )
         )
