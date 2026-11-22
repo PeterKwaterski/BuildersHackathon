@@ -26,11 +26,14 @@ class EnumIdentityEqualityTest(unittest.TestCase):
         )
 
     def dialect_change(self, line, old, new):
+        return self.source_change("sqlglot/dialects/dialect.py", line, old, new)
+
+    def source_change(self, path, line, old, new):
         patch = (
-            "diff --git a/sqlglot/dialects/dialect.py b/sqlglot/dialects/dialect.py\n"
+            f"diff --git a/{path} b/{path}\n"
             "index fed01b2..508980a 100644\n"
-            "--- a/sqlglot/dialects/dialect.py\n"
-            "+++ b/sqlglot/dialects/dialect.py\n"
+            f"--- a/{path}\n"
+            f"+++ b/{path}\n"
             f"@@ -{line},1 +{line},1 @@\n"
             f"-{old}\n"
             f"+{new}\n"
@@ -39,7 +42,7 @@ class EnumIdentityEqualityTest(unittest.TestCase):
             path = Path(directory) / "candidate.patch"
             path.write_text(patch, encoding="utf-8")
             change = selector.patch_changes(path)[0]
-        return self.admitted(change)
+        return selector.proven_enum_identity_equality(change, change["old"], set())
 
     def test_exact_operator_only_edit_accepts(self):
         self.assertTrue(self.admitted(self.change()))
@@ -166,6 +169,71 @@ class C:
                 "        alias = self.value\n"
                 "        return False"
             ),
+            [],
+        )
+
+    def test_closed_parser_class_enum_sites_accept(self):
+        for line, member in (
+            (6399, "HIGH"),
+            (6493, "LOW"),
+            (6495, "EQUALITY"),
+            (6497, "COMPARISON"),
+        ):
+            old = f"            self.IS_PREDICATE_PRECEDENCE is IsPredicatePrecedence.{member}"
+            prefix = "if " if line != 6399 else ""
+            if line != 6399:
+                old = f"            if self.IS_PREDICATE_PRECEDENCE is IsPredicatePrecedence.{member}:"
+            new = old.replace(" is ", " == ")
+            with self.subTest(line=line):
+                self.assertTrue(self.source_change("sqlglot/parser.py", line, old, new))
+
+    def class_attribute_ranges(self, extra=""):
+        source = f"""\
+from enum import Enum
+class E(Enum):
+    A = 1
+class C:
+    MODE = E.A
+    def f(self):
+        return self.MODE is E.A
+{extra}
+"""
+        return SemanticProof({"sqlglot/x.py": source})._safe_ranges("sqlglot/x.py")
+
+    def test_closed_class_enum_accepts(self):
+        self.assertEqual(self.class_attribute_ranges(), [(7, 7)])
+
+    def test_closed_class_enum_rejects_instance_write(self):
+        self.assertEqual(
+            self.class_attribute_ranges("def hostile(item):\n    item.MODE = object()"),
+            [],
+        )
+
+    def test_closed_class_enum_rejects_destructured_instance_write(self):
+        self.assertEqual(
+            self.class_attribute_ranges(
+                "def hostile(item):\n    item.MODE, other = (E.A, None)"
+            ),
+            [],
+        )
+
+    def test_closed_class_enum_rejects_dynamic_setattr(self):
+        self.assertEqual(
+            self.class_attribute_ranges("def hostile(item, name):\n    setattr(item, name, object())"),
+            [],
+        )
+
+    def test_closed_class_enum_rejects_namespace_literal(self):
+        self.assertEqual(
+            self.class_attribute_ranges(
+                "def hostile(item):\n    vars(item)['MODE'] = object()"
+            ),
+            [],
+        )
+
+    def test_closed_class_enum_rejects_non_enum_override(self):
+        self.assertEqual(
+            self.class_attribute_ranges("class D(C):\n    MODE = object()"),
             [],
         )
 

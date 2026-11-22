@@ -38,6 +38,7 @@ class SemanticProof:
         self.self_assignments = defaultdict(list)
         self.loaded_class_names = set()
         self.safe_ranges = {}
+        self.class_enum_attributes = {}
 
     def _tree(self, path: str) -> ast.Module | None:
         if path in self.trees:
@@ -263,6 +264,139 @@ class SemanticProof:
         except ValueError:
             return False
 
+    def _closed_class_enum_attribute(
+        self, path: str, node: ast.AST, enum_name: str
+    ) -> bool:
+        """Prove every fixed-tree write to ``self.<name>`` is an Enum member.
+
+        The proof is deliberately whole-tree: all direct class-body definitions
+        of the attribute must be members of the same Enum, and every instance,
+        reflective, deletion, descriptor, or dynamic-class write rejects it.
+        """
+        if not (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "self"
+        ):
+            return False
+        key = (node.attr, enum_name)
+        if key in self.class_enum_attributes:
+            return self.class_enum_attributes[key]
+
+        definitions = []
+        safe = True
+        for source_path in self.sources:
+            tree = self._tree(source_path)
+            if tree is None:
+                safe = False
+                break
+            for candidate in ast.walk(tree):
+                if isinstance(candidate, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                    targets = (
+                        candidate.targets
+                        if isinstance(candidate, ast.Assign)
+                        else [candidate.target]
+                    )
+                    for target in targets:
+                        if any(
+                            isinstance(part, ast.Attribute) and part.attr == node.attr
+                            for part in ast.walk(target)
+                        ):
+                            safe = False
+                        elif isinstance(target, ast.Name) and target.id == node.attr:
+                            parent = self.parents.get((source_path, candidate))
+                            if not isinstance(parent, ast.ClassDef) or isinstance(
+                                candidate, ast.AugAssign
+                            ):
+                                continue
+                            value = candidate.value
+                            if not (
+                                isinstance(value, ast.Attribute)
+                                and isinstance(value.value, ast.Name)
+                                and value.value.id == enum_name
+                            ):
+                                safe = False
+                            definitions.append((source_path, parent.name, value))
+                elif isinstance(candidate, (ast.Delete, ast.NamedExpr)):
+                    targets = (
+                        candidate.targets
+                        if isinstance(candidate, ast.Delete)
+                        else [candidate.target]
+                    )
+                    if any(
+                        any(
+                            isinstance(part, ast.Attribute) and part.attr == node.attr
+                            for part in ast.walk(target)
+                        )
+                        for target in targets
+                    ):
+                        safe = False
+                elif isinstance(candidate, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    if (
+                        candidate.name == node.attr
+                        and isinstance(
+                            self.parents.get((source_path, candidate)), ast.ClassDef
+                        )
+                    ):
+                        safe = False
+                elif (
+                    isinstance(candidate, ast.Call)
+                    and isinstance(candidate.func, ast.Name)
+                    and candidate.func.id in {"setattr", "delattr"}
+                ):
+                    if len(candidate.args) < 2 or not (
+                        isinstance(candidate.args[1], ast.Constant)
+                        and isinstance(candidate.args[1].value, str)
+                        and candidate.args[1].value != node.attr
+                    ):
+                        safe = False
+                elif isinstance(candidate, ast.Constant) and candidate.value == node.attr:
+                    # Attribute names used by ordinary syntax are AST strings,
+                    # not Constant nodes.  A literal spelling can feed a
+                    # namespace, ``vars`` or reflection write.
+                    safe = False
+                elif (
+                    isinstance(candidate, ast.Call)
+                    and isinstance(candidate.func, ast.Attribute)
+                    and candidate.func.attr in {"__setattr__", "__delattr__"}
+                ):
+                    safe = False
+                elif (
+                    isinstance(candidate, ast.Call)
+                    and isinstance(candidate.func, ast.Name)
+                    and candidate.func.id == "type"
+                    and len(candidate.args) >= 3
+                ):
+                    namespace = candidate.args[2]
+                    if not (
+                        isinstance(namespace, ast.Dict)
+                        and all(
+                            isinstance(item, ast.Constant)
+                            and isinstance(item.value, str)
+                            and item.value != node.attr
+                            for item in namespace.keys
+                            if item is not None
+                        )
+                    ):
+                        safe = False
+                if not safe:
+                    break
+            if not safe:
+                break
+
+        owner = self._enclosing_class(path, node)
+        result = bool(
+            safe
+            and owner is not None
+            and definitions
+            and any(
+                source_path == path and class_name == owner.name
+                for source_path, class_name, _value in definitions
+            )
+        )
+        self.class_enum_attributes[key] = result
+        return result
+
     def _identity_or_none(self, path: str, node: ast.AST) -> bool:
         if not (
             isinstance(node, ast.Attribute)
@@ -301,6 +435,7 @@ class SemanticProof:
                 proven = self._is_enum(enum_name) and (
                     self._enum_attribute(path, left, enum_name)
                     or self._local_enum_alias(path, left, enum_name)
+                    or self._closed_class_enum_attribute(path, left, enum_name)
                 )
             else:
                 proven = False
