@@ -35,6 +35,7 @@ import registry_key_research
 import query_modifier_research
 
 DATA = Path("/data")
+PINNED_SOURCE_ROOT = Path("/app/sqlglot-pinned")
 MODEL = Path(__file__).with_name("selector_model.json.gz")
 SEMANTIC_SOURCES = Path(__file__).with_name("semantic_sources.json.gz")
 ZERO_READER_MODEL = Path(__file__).with_name("zero_reader_model.json.gz")
@@ -3536,6 +3537,11 @@ def isolated_new_fixture_indices(
         or change.get("non_lf")
         or change.get("terminal_lf") is not True
         or change.get("no_newline_marker")
+    ):
+        return None
+    if (
+        not PINNED_SOURCE_ROOT.is_dir()
+        or os.path.lexists(PINNED_SOURCE_ROOT / path)
     ):
         return None
     relative = path.removeprefix("tests/fixtures/")

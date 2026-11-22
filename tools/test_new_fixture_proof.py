@@ -20,8 +20,18 @@ class NewFixtureProofTest(unittest.TestCase):
         ) as profile_file:
             cls.profile = json.load(profile_file)
 
+    def setUp(self):
+        self.source_directory = tempfile.TemporaryDirectory()
+        self.source_root = Path(self.source_directory.name)
+        self.source_root_patch = mock.patch.object(
+            selector, "PINNED_SOURCE_ROOT", self.source_root
+        )
+        self.source_root_patch.start()
+
     def tearDown(self):
         selector._PINNED_SOURCES = None
+        self.source_root_patch.stop()
+        self.source_directory.cleanup()
 
     def changes(
         self,
@@ -165,6 +175,34 @@ class NewFixtureProofTest(unittest.TestCase):
         changes = self.changes()
         self.assertIsNone(
             selector.isolated_new_fixture_indices(changes + changes, self.profile)
+        )
+
+    def test_rejects_missing_source_root_and_existing_unreferenced_path(self):
+        self.sources()
+        self.source_root.rmdir()
+        self.assertIsNone(
+            selector.isolated_new_fixture_indices(self.changes(), self.profile)
+        )
+        self.source_root.mkdir()
+        existing = self.source_root / "tests/fixtures/optimizer/canonicalize.sql"
+        existing.parent.mkdir(parents=True)
+        existing.write_text("SELECT 1;\n", encoding="utf-8")
+        self.assertIsNone(
+            selector.isolated_new_fixture_indices(
+                self.changes(path="tests/fixtures/optimizer/canonicalize.sql"),
+                self.profile,
+            )
+        )
+
+    def test_rejects_existing_broken_symlink(self):
+        self.sources()
+        existing = self.source_root / "tests/fixtures/optimizer/fresh_kashimo.sql"
+        existing.parent.mkdir(parents=True)
+        existing.symlink_to(self.source_root / "missing-target.sql")
+        self.assertFalse(existing.exists())
+        self.assertTrue(existing.is_symlink())
+        self.assertIsNone(
+            selector.isolated_new_fixture_indices(self.changes(), self.profile)
         )
 
 

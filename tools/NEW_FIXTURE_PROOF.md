@@ -9,6 +9,10 @@ marker paths, one zero-old-lines add-only hunk starting at new line one,
 exactly one new-file mode and index record, LF-only bytes with a terminal LF,
 and no rename, copy, mode-change, binary, symlink, no-newline, second-hunk, or
 second-file metadata.  Empty files and payloads larger than 64 KiB reject.
+The exact pinned checkout root must exist as a directory, and `os.path.lexists`
+must prove the sanitized destination absent below it.  Existing regular files,
+directories, symlinks (including broken symlinks), or a missing checkout root
+therefore reject before the proof can narrow selection.
 
 The full path, fixture-relative path, basename, and qualified forms without
 the `.sql` suffix must be absent from the complete pinned Python source
@@ -56,8 +60,9 @@ passed the exact ordered 1,620-test roster plus all 25,440 subtests with zero
 failures in 275.98 seconds.  Eight focused tests cover admission, selector
 precedence, authenticated-census corruption, name/path collision, path shape,
 terminal LF, size, mode/symlink/copy/rename/binary metadata, mismatched paths
-and markers, multiple hunks, and multiple files.  The complete repository test
-suite is 220 green with ten intentional skips.
+and markers, multiple hunks, multiple files, missing source roots, existing
+unreferenced files, and broken destination symlinks.  The complete repository
+test suite is 222 green with ten intentional skips.
 
 The exact image selects 125 readers for every one of the eight public patches.
 Two official-limit sample runs remain byte-identical at SHA-256
