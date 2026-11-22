@@ -3,11 +3,13 @@
 import ast
 import gzip
 import hashlib
+import io
 import json
 import base64
 import keyword
 import re
 import sys
+import tokenize
 import types
 from collections import deque
 from pathlib import Path
@@ -25,6 +27,7 @@ from shared_arg_write_runtime import (
     fresh_receiver_candidate,
     load_model as load_shared_arg_model,
 )
+from tpc_plan_runtime import verify_patch as verify_tpc_plan_patch
 
 DATA = Path("/data")
 MODEL = Path(__file__).with_name("selector_model.json.gz")
@@ -85,6 +88,103 @@ def best_split(tests: list[dict]) -> list[list[int]]:
 
     candidates = (split(tests, count) for count in range(1, MAX_WORKERS + 1))
     return min(candidates, key=lambda candidate: candidate[1])[0]
+
+
+def best_cost_ms(tests: list[dict]) -> int:
+    if not tests:
+        return 0
+    return min(split(tests, count)[1] for count in range(1, MAX_WORKERS + 1))
+
+
+TPC_PLAN_TESTS = {
+    "tpcds_executor": {"tests/test_executor.py::TestExecutor::test_execute_tpcds"},
+    "tpcds_optimizer": {"tests/test_optimizer.py::TestOptimizer::test_tpcds"},
+    "tpch_executor": {"tests/test_executor.py::TestExecutor::test_execute_tpch"},
+    "tpch_optimizer": {
+        "tests/test_optimizer.py::TestOptimizer::test_tpch",
+        "tests/test_executor.py::TestExecutor::test_optimized_tpch",
+    },
+}
+
+
+def tpc_plan_patch_eligible(patch: Path) -> bool:
+    """Admit one ordinary optimizer function-body edit to prospective replay."""
+    try:
+        changes = patch_changes(patch)
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return False
+    if len(changes) != 1:
+        return False
+    change = changes[0]
+    path = change.get("old")
+    if (
+        type(path) is not str
+        or change.get("new") != path
+        or change.get("diff_old") != path
+        or change.get("diff_new") != path
+        or not path.startswith("sqlglot/optimizer/")
+        or not path.endswith(".py")
+        or change.get("new_file_mode_count")
+        or not change.get("lines")
+        or invalid_python_patch(change, path)
+    ):
+        return False
+    tree = source_tree(path)
+    old_source = pinned_sources().get(path)
+    new_source = patched_source(change, path)
+    if tree is None or old_source is None or new_source is None:
+        return False
+    try:
+        old_tokens = [
+            token
+            for token in tokenize.generate_tokens(io.StringIO(old_source).readline)
+            if token.type not in {tokenize.ENCODING, tokenize.ENDMARKER}
+        ]
+        new_tokens = [
+            token
+            for token in tokenize.generate_tokens(io.StringIO(new_source).readline)
+            if token.type not in {tokenize.ENCODING, tokenize.ENDMARKER}
+        ]
+    except (tokenize.TokenError, IndentationError):
+        return False
+    differences = [
+        (left, right)
+        for left, right in zip(old_tokens, new_tokens)
+        if (left.type, left.string) != (right.type, right.string)
+    ]
+    if len(old_tokens) != len(new_tokens) or len(differences) != 1:
+        return False
+    left, right = differences[0]
+    allowed_names = {"is", "not", "in", "True", "False", "None"}
+    if left.type == tokenize.NAME or right.type == tokenize.NAME:
+        if left.string not in allowed_names or right.string not in allowed_names:
+            return False
+    elif left.type not in {tokenize.OP, tokenize.NUMBER, tokenize.STRING} or right.type not in {
+        tokenize.OP,
+        tokenize.NUMBER,
+        tokenize.STRING,
+    }:
+        return False
+    functions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and all(
+            node.lineno < line <= (node.end_lineno or node.lineno)
+            for line in change["lines"]
+        )
+    ]
+    if not functions:
+        return False
+    owner = min(
+        functions,
+        key=lambda node: ((node.end_lineno or node.lineno) - node.lineno, node.col_offset),
+    )
+    if owner.decorator_list or isinstance(owner, ast.AsyncFunctionDef):
+        return False
+    return all(
+        preserves_function_bindings(change, path, line) for line in change["lines"]
+    )
 
 
 def patch_changes(patch: Path) -> list[dict]:
@@ -2363,6 +2463,23 @@ def main() -> None:
         )
         selected = [mapped_tests[index] for index in indices if mapped_tests[index] is not None]
         selected.extend(unmapped_tests)
+        tpc_ids = set().union(*TPC_PLAN_TESTS.values())
+        without_all_tpc = [test for test in selected if test["id"] not in tpc_ids]
+        prospective_saving = best_cost_ms(selected) - best_cost_ms(without_all_tpc)
+        if prospective_saving > 16_000 and tpc_plan_patch_eligible(patch):
+            verdicts, verifier_cpu = verify_tpc_plan_patch(patch)
+            if verdicts is not None:
+                removable = set().union(
+                    *(
+                        TPC_PLAN_TESTS[name]
+                        for name, equal in verdicts.items()
+                        if equal
+                    )
+                )
+                narrowed = [test for test in selected if test["id"] not in removable]
+                realized = best_cost_ms(selected) - best_cost_ms(narrowed)
+                if realized > round(verifier_cpu * 1_200):
+                    selected = narrowed
         selection_count += len(selected)
         workers = best_split(selected)
         print(

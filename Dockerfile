@@ -4,7 +4,7 @@
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONHASHSEED=0 SKIP_INTEGRATION=0 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_ROOT_USER_ACTION=ignore \
-    BLAST_RADIUS_TPC_MEMO=0
+    BLAST_RADIUS_TPC_MEMO=0 BLAST_RADIUS_TPC_PLAN=1
 COPY requirements.lock /app/requirements.lock
 RUN pip install --no-cache-dir -r /app/requirements.lock
 # Default-off prospective research needs the exact public source and fixtures.
@@ -38,4 +38,6 @@ COPY tools/build_executor_result_memo.py /app/build_executor_result_memo.py
 COPY tools/executor_result_memo.json.gz /app/executor_result_memo.json.gz
 COPY tools/verify_prospective_executor_memo.py /app/verify_prospective_executor_memo.py
 COPY tools/run_prospective_executor_memo.py /app/run_prospective_executor_memo.py
+COPY tpc_plan_runtime.py /app/tpc_plan_runtime.py
+COPY tpc_plan_profile.json.gz /app/tpc_plan_profile.json.gz
 CMD ["python", "/app/selector.py"]

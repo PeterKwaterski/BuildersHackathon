@@ -79,7 +79,13 @@ def parse_patch(path: Path) -> list[dict]:
     return changes
 
 
-def apply_change(root: Path, change: dict) -> str:
+def apply_change(
+    root: Path, base_tree: Path | dict, change: dict | None = None
+) -> str:
+    if change is None:
+        change = base_tree
+        base_tree = root
+    assert isinstance(base_tree, Path) and isinstance(change, dict)
     old_name, new_name = change["old"], change["new"]
     if old_name is not None and new_name is not None and old_name != new_name:
         raise PatchRejected("renames are outside the closed applier")
@@ -87,7 +93,10 @@ def apply_change(root: Path, change: dict) -> str:
     assert relative is not None
     target = root / relative
     if target.is_symlink():
-        raise PatchRejected("symlink targets are outside the closed applier")
+        try:
+            target.resolve(strict=True).relative_to(base_tree.resolve(strict=True))
+        except (OSError, ValueError):
+            raise PatchRejected("symlink target escapes the pinned tree") from None
     if old_name is None:
         original = []
         trailing_newline = True
@@ -129,6 +138,8 @@ def apply_change(root: Path, change: dict) -> str:
         target.unlink()
     else:
         target.parent.mkdir(parents=True, exist_ok=True)
+        if target.is_symlink():
+            target.unlink()
         target.write_text("\n".join(output) + ("\n" if trailing_newline or old_name is None else ""), encoding="utf-8")
     return relative
 
@@ -144,15 +155,31 @@ def main() -> None:
     try:
         changes = parse_patch(args.patch)
         with tempfile.TemporaryDirectory(prefix="tpc-memo-") as directory:
-            prospective = Path(directory) / "sqlglot"
-            shutil.copytree(args.base_tree, prospective, symlinks=True)
-            changed_paths = [apply_change(prospective, change) for change in changes]
+            prospective = Path(directory) / "overlay"
+            prospective.mkdir()
+            for change in changes:
+                relative = change.get("new") or change.get("old")
+                if relative is None:
+                    raise PatchRejected("patch has no materialized target")
+                source = args.base_tree / relative
+                destination = prospective / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if not source.is_file():
+                    raise PatchRejected("patch target is absent from pinned tree")
+                destination.symlink_to(source)
+            changed_paths = [
+                apply_change(prospective, args.base_tree, change) for change in changes
+            ]
+            if len(changed_paths) != 1:
+                raise PatchRejected("prospective verifier accepts one changed source")
             verifier = Path(__file__).with_name("verify_prospective_executor_memo.py")
             command = [
                 sys.executable,
                 str(verifier),
                 "--tree",
-                str(prospective),
+                str(args.base_tree),
+                "--override-source",
+                str(prospective / changed_paths[0]),
                 "--artifact",
                 str(args.artifact),
                 "--deadline-s",
@@ -162,7 +189,7 @@ def main() -> None:
                 command.extend(("--changed-path", path))
             completed = subprocess.run(
                 command,
-                env={**os.environ, "PYTHONPATH": os.pathsep.join((str(prospective), str(Path(__file__).parent)))},
+                env={**os.environ, "PYTHONPATH": os.pathsep.join((str(args.base_tree), str(Path(__file__).parent)))},
                 text=True,
                 capture_output=True,
                 timeout=max(1.0, args.deadline_s - (time.monotonic() - started) + 2.0),
