@@ -10,6 +10,8 @@ import types
 from pathlib import Path
 
 from semantic import SemanticProof
+from none_static_runtime import load_profile as load_none_static_profile
+from none_static_runtime import match as match_none_static
 from shared_arg_write_runtime import (
     fresh_receiver_candidate,
     load_model as load_shared_arg_model,
@@ -33,10 +35,8 @@ _SHARED_ARG_WRITE_MODEL = None
 MAX_WORKERS = 8
 WORKER_COST_MS = 2_000
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
-COMPARISON_OPERATOR = re.compile(r"\bis\s+not\b|\bis\b|==|!=")
 COMMENT_DIRECTIVE = re.compile(r"(?i)(coding\s*[:=]|type:|noqa|pragma|fmt:|pyright|mypy)")
 PROCESS_SERIALIZATION_FILES = {"sqlglot/serde.py"}
-_SEMANTIC_PROOF = None
 _PINNED_SOURCES = None
 _SOURCE_TREES = {}
 _IMPORT_DEFINITION_RANGES = {}
@@ -73,8 +73,10 @@ def patch_changes(patch: Path) -> list[dict]:
     new_line = 0
     addition_anchor = None
     in_hunk = False
+    non_lf = b"\r" in patch.read_bytes()
     for line in patch.read_text().splitlines():
         if line.startswith("diff --git "):
+            header = line.split(" ")
             change = {
                 "old": None,
                 "new": None,
@@ -85,19 +87,38 @@ def patch_changes(patch: Path) -> list[dict]:
                 "added_at": [],
                 "added_new_at": [],
                 "hunks": [],
+                "diff_old": header[2][2:] if len(header) == 4 and header[2].startswith("a/") else None,
+                "diff_new": header[3][2:] if len(header) == 4 and header[3].startswith("b/") else None,
+                "new_file_mode": None,
+                "binary": False,
+                "non_lf": non_lf,
+                "no_newline_marker": False,
             }
             changes.append(change)
             hunk = None
             in_hunk = False
         elif change is None:
             continue
+        elif line.startswith("GIT binary patch") or line.startswith("Binary files "):
+            change["binary"] = True
+        elif line.startswith("\\ No newline at end of file"):
+            change["no_newline_marker"] = True
+        elif not in_hunk and line.startswith("new file mode "):
+            change["new_file_mode"] = line.removeprefix("new file mode ")
         elif match := HUNK.match(line):
             old_start = int(match.group(1))
             old_count = int(match.group(2) or 1)
             old_line = old_start + (old_count == 0)
             new_line = int(match.group(3))
+            new_count = int(match.group(4) or 1)
             addition_anchor = None
-            hunk = {"old_start": old_start, "old_count": old_count, "lines": []}
+            hunk = {
+                "old_start": old_start,
+                "old_count": old_count,
+                "new_start": int(match.group(3)),
+                "new_count": new_count,
+                "lines": [],
+            }
             change["hunks"].append(hunk)
             in_hunk = True
         elif not in_hunk and line.startswith("--- "):
@@ -779,32 +800,6 @@ def inert_comment_addition(change: dict, path: str) -> bool:
     )
 
 
-def proven_identity_equality(change: dict, path: str, model: dict) -> bool:
-    """Use source-derived proofs where identity and equality coincide."""
-    if len(change["removed"]) != 1 or len(change["added"]) != 1:
-        return False
-    old, new = change["removed"][0], change["added"][0]
-    old_operators = COMPARISON_OPERATOR.findall(old)
-    new_operators = COMPARISON_OPERATOR.findall(new)
-    if len(old_operators) != 1 or len(new_operators) != 1:
-        return False
-    positive = {"is", "=="}
-    if (old_operators[0] in positive) != (new_operators[0] in positive):
-        return False
-    if COMPARISON_OPERATOR.sub("<comparison>", old) != COMPARISON_OPERATOR.sub(
-        "<comparison>", new
-    ):
-        return False
-    global _SEMANTIC_PROOF
-    if _SEMANTIC_PROOF is None:
-        _SEMANTIC_PROOF = SemanticProof(
-            {
-                source_path: source
-                for source_path, source in pinned_sources().items()
-                if source_path.startswith("sqlglot/")
-            }
-        )
-    return _SEMANTIC_PROOF.covers(path, change["lines"])
 
 
 def fresh_table_alias_copy_edit(
@@ -1719,11 +1714,20 @@ def selected_indices(
     derivation_model: dict | None = None,
     attribute_model: dict | None = None,
     fresh_alias_model: dict | None = None,
+    none_static_profile: dict | None = None,
 ) -> set[int]:
     selected: set[int] = set()
     changes = patch_changes(patch)
     if not changes:
         return set(all_indices)
+    if len(changes) == 1:
+        only = changes[0]
+        only_path = only.get("old")
+        original = pinned_sources().get(only_path) if isinstance(only_path, str) else None
+        prospective = patched_source(only, only_path) if isinstance(only_path, str) else None
+        retained = match_none_static(changes, none_static_profile, original, prospective)
+        if retained is not None:
+            return retained & all_indices
     for change in changes:
         old_path = change["old"]
         new_path = change["new"]
@@ -1760,8 +1764,6 @@ def selected_indices(
             selected.update(all_indices)
             continue
         if inert_comment_addition(change, path):
-            continue
-        if proven_identity_equality(change, path, model):
             continue
         if fresh_alias_model is not None and len(changes) == 1 and fresh_table_alias_copy_edit(
             change, path, fresh_alias_model, model.get("h")
@@ -1928,6 +1930,11 @@ def main() -> None:
     test_digest = hashlib.sha256(
         "\0".join(test["id"] for test in tests).encode("utf-8")
     ).hexdigest()
+    none_static_profile = (
+        load_none_static_profile(test_digest, len(tests))
+        if model.get("t") == [test["id"] for test in tests]
+        else None
+    )
     if (
         zero_model.get("v") != 2
         or zero_model.get("sha") != model.get("sha")
@@ -1985,6 +1992,7 @@ def main() -> None:
             derivation_model,
             attribute_model,
             fresh_alias_model,
+            none_static_profile,
         )
         selected = [mapped_tests[index] for index in indices if mapped_tests[index] is not None]
         selected.extend(unmapped_tests)

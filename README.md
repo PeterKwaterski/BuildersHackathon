@@ -55,13 +55,12 @@ those answer-independent inputs into `selector_model.json.gz`; runtime test IDs
 are resolved against `/data/tests.json` rather than assuming fixed test
 numbers.
 
-At runtime, a general semantic analyzer derives identity/equality equivalence
-from the committed pinned source. It is used only when a one-line patch changes
-`is` to `==` (or the negative equivalents) and complete assignment flow proves
-an Enum singleton or an object-identity class. Ordinary added comments are
-skipped only when applying their full unified diff produces the same Python AST
-(including type comments); directives and compile errors stay conservative.
-These are source analyses, not sample-patch or answer lookups.
+At runtime, identity/equality edits are skipped only at the two exact None
+comparison sites certified in `tools/NONE_STATIC_V3_AUDIT.md`. The former broad
+identity-flow shortcut is removed. Ordinary added comments are skipped only
+when applying their full unified diff produces the same Python AST (including
+type comments); directives and compile errors stay conservative. These are
+source analyses, not sample-patch or answer lookups.
 
 `tools/collect_fresh_alias_profile.py` and
 `tools/build_fresh_alias_profile.py` reproduce the complete inline
