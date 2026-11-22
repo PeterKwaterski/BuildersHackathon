@@ -464,6 +464,7 @@ def patch_changes(patch: Path) -> list[dict]:
                 "new_marker_count": 0,
                 "index_count": 0,
                 "new_file_index": False,
+                "ordinary_file_index": False,
                 "structural_invalid": False,
                 "binary": False,
                 "non_lf": non_lf,
@@ -485,6 +486,11 @@ def patch_changes(patch: Path) -> list[dict]:
             change["index_count"] += 1
             change["new_file_index"] = bool(
                 re.fullmatch(r"index 0{7,64}\.\.[0-9a-f]{7,64}", line)
+            )
+            change["ordinary_file_index"] = bool(
+                re.fullmatch(
+                    r"index [0-9a-f]{7,64}\.\.[0-9a-f]{7,64} 100644", line
+                )
             )
         elif not in_hunk and line.startswith("rename from "):
             change["old"] = line.removeprefix("rename from ")
@@ -1479,6 +1485,51 @@ def load_import_line_profile(
 def inert_comment_addition(change: dict, path: str) -> bool:
     """Prove an added comment leaves the complete executable AST unchanged."""
     if not comment_only_addition(change):
+        return False
+    hunks = change.get("hunks")
+    if (
+        change.get("old") != path
+        or change.get("new") != path
+        or change.get("diff_old") != path
+        or change.get("diff_new") != path
+        or change.get("new_file_mode") is not None
+        or change.get("new_file_mode_count") != 0
+        or change.get("old_marker_count") != 1
+        or change.get("new_marker_count") != 1
+        or change.get("index_count") != 1
+        or not change.get("ordinary_file_index")
+        or change.get("structural_invalid")
+        or change.get("binary")
+        or change.get("non_lf")
+        or change.get("no_newline_marker")
+        or not isinstance(hunks, list)
+        or not hunks
+        or change.get("removed")
+        or change.get("payload") != change.get("added")
+    ):
+        return False
+    delta = 0
+    expected_added_new_at = []
+    for hunk in hunks:
+        lines = hunk.get("lines")
+        if (
+            not isinstance(lines, list)
+            or hunk.get("old_start", 0) < 1
+            or hunk.get("new_start") != hunk["old_start"] + delta
+            or hunk.get("old_count")
+            != sum(marker == " " for marker, _text in lines)
+            or hunk.get("new_count")
+            != sum(marker in {" ", "+"} for marker, _text in lines)
+            or any(marker not in {" ", "+"} for marker, _text in lines)
+        ):
+            return False
+        new_line = hunk["new_start"]
+        for marker, text in lines:
+            if marker == "+":
+                expected_added_new_at.append((new_line, text))
+            new_line += 1
+        delta += hunk["new_count"] - hunk["old_count"]
+    if change.get("added_new_at") != expected_added_new_at:
         return False
     directive = any(COMMENT_DIRECTIVE.search(line) for line in change["added"])
     if directive and (

@@ -16,6 +16,11 @@ file under `sqlglot/` or `tests/`. Every added line must be exactly `# noqa` or
 encoding declarations, directive suffixes, formatter/coverage pragmas,
 non-comment edits, paths under `sqlglot/typing/`, and `tests/test_typing.py`.
 The full unified diff must apply to the authenticated pinned source.
+The envelope additionally requires identical old/new diff and marker paths,
+one canonical existing-`100644` index line, exactly one old/new marker, no
+new/deleted/mode/copy/rename/symlink/binary/CRLF/no-newline metadata, and
+strictly count- and coordinate-consistent add/context hunks. Any structural
+ambiguity rejects before source normalization.
 
 Both complete sources are parsed with `type_comments=True`. After discarding
 only `Module.type_ignores`, which CPython retains for static-analysis consumers
@@ -64,10 +69,10 @@ and an additional recursive compiled fingerprint.
   `uepk`, `aw9b`, `dpg5`, and `uccw`.
 - The combined eleven-patch adversary (including both compiled-fingerprint
   rejects) passed the exact ordered 1,620-test roster and all 25,440 subtests.
-- Nine focused tests cover ordinary-comment compatibility, exact `noqa` and
+- Twelve focused tests cover ordinary-comment compatibility, exact `noqa` and
   type-ignore admission, encoding/formatter/pragma/suffix/typing rejection,
   executable changes, and corrupt line attribution.
-- The complete repository suite is 201 green with ten intentional skips, and
+- The complete repository suite is 204 green with ten intentional skips, and
   two exact-image sample runs remain
   byte-identical to the frozen candidate output SHA-256 `56db9765…`.
 - On the eleven-patch adversarial batch, three metered frozen runs used

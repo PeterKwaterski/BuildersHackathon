@@ -17,6 +17,7 @@ class DirectiveCommentTest(unittest.TestCase):
     def change(self, added: str) -> dict:
         patch = (
             "diff --git a/{0} b/{0}\n"
+            "index 0000000..1111111 100644\n"
             "--- a/{0}\n"
             "+++ b/{0}\n"
             "@@ -1,2 +1,3 @@\n"
@@ -80,6 +81,48 @@ class DirectiveCommentTest(unittest.TestCase):
         change = self.change("# noqa")
         change["added_new_at"] = [(99, "    # noqa")]
         self.assertFalse(selector.inert_comment_addition(change, PATH))
+
+    def test_mismatched_paths_and_markers_remain_rejected(self):
+        selector._PINNED_SOURCES = {PATH: "class C:\n    value = 1\n"}
+        for key, value in (
+            ("old", "sqlglot/other.py"),
+            ("new", "sqlglot/other.py"),
+            ("diff_old", "sqlglot/other.py"),
+            ("diff_new", "sqlglot/other.py"),
+            ("old_marker_count", 2),
+            ("new_marker_count", 2),
+            ("index_count", 2),
+            ("ordinary_file_index", False),
+        ):
+            change = self.change("# noqa")
+            change[key] = value
+            self.assertFalse(selector.inert_comment_addition(change, PATH), key)
+
+    def test_structural_and_file_flags_remain_rejected(self):
+        selector._PINNED_SOURCES = {PATH: "class C:\n    value = 1\n"}
+        for key, value in (
+            ("new_file_mode", "100644"),
+            ("new_file_mode_count", 1),
+            ("structural_invalid", True),
+            ("binary", True),
+            ("non_lf", True),
+            ("no_newline_marker", True),
+        ):
+            change = self.change("# type: ignore")
+            change[key] = value
+            self.assertFalse(selector.inert_comment_addition(change, PATH), key)
+
+    def test_mismatched_hunk_counts_and_coordinates_remain_rejected(self):
+        selector._PINNED_SOURCES = {PATH: "class C:\n    value = 1\n"}
+        for key, value in (
+            ("old_start", 0),
+            ("new_start", 2),
+            ("old_count", 99),
+            ("new_count", 99),
+        ):
+            change = self.change("# noqa")
+            change["hunks"][0][key] = value
+            self.assertFalse(selector.inert_comment_addition(change, PATH), key)
 
 
 if __name__ == "__main__":
