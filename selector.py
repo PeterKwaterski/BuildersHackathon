@@ -91,7 +91,7 @@ NEW_MODULE_INVENTORY_SHA256 = "b30749cd488217746916b61c0eb138d46ab9f3543b32e0dbb
 TPC_RULE_REPLAY_PROFILE = Path(__file__).with_name("tpc_rule_replay_profile.json.gz")
 TPC_RULE_REPLAY_PROFILE_SHA256 = ""
 TPC_RULE_FAST_PROFILE = Path(__file__).with_name("tpc_rule_fast_profile.json.gz")
-TPC_RULE_FAST_PROFILE_SHA256 = "d6248cb7c44b9c0a5dfe9ca30bf58030fd5a8eb8ba3f6e254ee584db21d69797"
+TPC_RULE_FAST_PROFILE_SHA256 = "51b2e6cefc9bf1b916e265dae28ab706b1f0a5c053be91018bb9e160b6dedd1d"
 TPC_RULE_FAST_ENABLED = os.environ.get("BR_TPC_RULE_FAST", "1") != "0"
 MAX_WORKERS = 8
 WORKER_COST_MS = 2_000

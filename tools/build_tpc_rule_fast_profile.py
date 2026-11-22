@@ -22,6 +22,22 @@ from tools.collect_tpc_rule_profile import tree_digest
 
 
 READERS = {
+    "qualify": [1, 2, 3, 4, 6, 7, 9, 10, 11, 15, 17, 19, 23, 24,
+        25, 26, 29, 31, 33, 34, 35, 38, 42, 43, 45, 46, 48, 50, 52, 54, 55,
+        56, 59, 60, 62, 65, 66, 68, 69, 71, 73, 74, 75, 76, 78, 79, 81, 83,
+        84, 85, 87, 88, 91, 93, 96, 97, 99],
+    "qualify_tables": [1, 2, 3, 4, 6, 7, 9, 10, 11, 15, 17, 19, 23, 24,
+        25, 26, 29, 31, 33, 34, 35, 38, 42, 43, 45, 46, 48, 50, 52, 54, 55,
+        56, 59, 60, 62, 65, 66, 68, 69, 71, 73, 74, 75, 76, 78, 79, 81, 83,
+        84, 85, 87, 88, 91, 93, 96, 97, 99],
+    "qualify_columns": [1, 2, 3, 4, 6, 7, 9, 10, 11, 15, 17, 19, 23, 24,
+        25, 26, 29, 31, 33, 34, 35, 38, 42, 43, 45, 46, 48, 50, 52, 54, 55,
+        56, 59, 60, 62, 65, 66, 68, 69, 71, 73, 74, 75, 76, 78, 79, 81, 83,
+        84, 85, 87, 88, 91, 93, 96, 97, 99],
+    "validate_qualify_columns": [1, 2, 3, 4, 6, 7, 9, 10, 11, 15, 17, 19, 23, 24,
+        25, 26, 29, 31, 33, 34, 35, 38, 42, 43, 45, 46, 48, 50, 52, 54, 55,
+        56, 59, 60, 62, 65, 66, 68, 69, 71, 73, 74, 75, 76, 78, 79, 81, 83,
+        84, 85, 87, 88, 91, 93, 96, 97, 99],
     "_convert_columns_to_dots": [1, 2, 3, 4, 6, 7, 9, 10, 11, 15, 17, 19, 23, 24,
         25, 26, 29, 31, 33, 34, 35, 38, 42, 43, 45, 46, 48, 50, 52, 54, 55,
         56, 59, 60, 62, 65, 66, 68, 69, 71, 73, 74, 75, 76, 78, 79, 81, 83,
@@ -31,11 +47,20 @@ READERS = {
         56, 59, 60, 62, 65, 66, 68, 69, 71, 73, 74, 75, 76, 78, 79, 81, 83,
         84, 85, 87, 88, 91, 93, 96, 97, 99],
     "decorrelate": [1, 6, 10, 35, 69, 81],
+    "unnest_subqueries": [1, 2, 3, 4, 6, 7, 9, 10, 11, 15, 17, 19, 23, 24,
+        25, 26, 29, 31, 33, 34, 35, 38, 42, 43, 45, 46, 48, 50, 52, 54, 55,
+        56, 59, 60, 62, 65, 66, 68, 69, 71, 73, 74, 75, 76, 78, 79, 81, 83,
+        84, 85, 87, 88, 91, 93, 96, 97, 99],
 }
 OWNERS = (
+    ("sqlglot/optimizer/qualify.py", "qualify", RULES[0]),
+    ("sqlglot/optimizer/qualify_tables.py", "qualify_tables", RULES[0]),
+    ("sqlglot/optimizer/qualify_columns.py", "qualify_columns", RULES[0]),
+    ("sqlglot/optimizer/qualify_columns.py", "validate_qualify_columns", RULES[0]),
     ("sqlglot/optimizer/qualify_columns.py", "_convert_columns_to_dots", RULES[0]),
     ("sqlglot/optimizer/isolate_table_selects.py", "isolate_table_selects", RULES[0]),
     ("sqlglot/optimizer/unnest_subqueries.py", "decorrelate", RULES[1]),
+    ("sqlglot/optimizer/unnest_subqueries.py", "unnest_subqueries", RULES[1]),
 )
 
 

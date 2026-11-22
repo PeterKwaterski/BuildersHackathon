@@ -66,7 +66,7 @@ class FastRuleTests(unittest.TestCase):
         selected = [{"id": fast.TARGET, "number": 1, "seconds": 18.0}]
         self.assertEqual(
             selector.TPC_RULE_FAST_PROFILE_SHA256,
-            "d6248cb7c44b9c0a5dfe9ca30bf58030fd5a8eb8ba3f6e254ee584db21d69797",
+            "51b2e6cefc9bf1b916e265dae28ab706b1f0a5c053be91018bb9e160b6dedd1d",
         )
         self.assertIsNotNone(selector.load_tpc_rule_fast_profile())
         with mock.patch.object(selector, "TPC_RULE_FAST_ENABLED", False):
@@ -76,6 +76,36 @@ class FastRuleTests(unittest.TestCase):
                 ),
                 selected,
             )
+
+    def test_expanded_profile_covers_complete_executor_query_roster(self):
+        profile = selector.load_tpc_rule_fast_profile()
+        self.assertIsNotNone(profile)
+        owners = {owner["qualname"]: owner for owner in profile["owners"].values()}
+        self.assertEqual(
+            set(owners),
+            {
+                "qualify",
+                "qualify_tables",
+                "qualify_columns",
+                "validate_qualify_columns",
+                "_convert_columns_to_dots",
+                "isolate_table_selects",
+                "unnest_subqueries",
+                "decorrelate",
+            },
+        )
+        execute_queries = owners["qualify"]["readers"]
+        self.assertEqual(len(execute_queries), 57)
+        for name in (
+            "qualify",
+            "qualify_tables",
+            "qualify_columns",
+            "validate_qualify_columns",
+            "_convert_columns_to_dots",
+            "isolate_table_selects",
+            "unnest_subqueries",
+        ):
+            self.assertEqual(owners[name]["readers"], execute_queries)
 
 
 if __name__ == "__main__":
