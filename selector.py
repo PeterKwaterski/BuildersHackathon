@@ -35,6 +35,7 @@ from tpc_fixture_verify import FIXTURE as TPCDS_FIXTURE_PATH
 from tpc_fixture_verify import verify as verify_tpcds_fixture
 import registry_key_research
 import query_modifier_research
+import tokenizer_setting_branch
 
 DATA = Path("/data")
 PINNED_SOURCE_ROOT = Path("/app/sqlglot-pinned")
@@ -45,6 +46,12 @@ SEMANTIC_SOURCES = Path(__file__).with_name("semantic_sources.json.gz")
 ZERO_READER_MODEL = Path(__file__).with_name("zero_reader_model.json.gz")
 REGISTRY_KEY_MODEL = Path(__file__).with_name("registry_key_research_model.json.gz")
 QUERY_MODIFIER_MODEL = Path(__file__).with_name("query_modifier_model.json.gz")
+TOKENIZER_SETTING_BRANCH_MODEL = Path(__file__).with_name(
+    "tokenizer_setting_branch_model.json.gz"
+)
+TOKENIZER_SETTING_BRANCH_MODEL_SHA256 = (
+    "f880e1b1bc35259be001a8606fa1d2684815e8cdf1249228d8bd5951fd6cc909"
+)
 PREDICATE_PROFILE = Path(__file__).with_name("predicate_profile.json.gz")
 PREDICATE_PROFILE_SHA256 = (
     "3788b4984b69da4fc8aa52428754d9e109070cae112c69b24c00978389d3fb70"
@@ -3843,6 +3850,7 @@ def selected_indices(
     import_line_profile: dict | None = None,
     registry_key_model: dict | None = None,
     query_modifier_model: dict | None = None,
+    tokenizer_setting_branch_model: dict | None = None,
 ) -> set[int]:
     if BINARY_FIXTURE_ENABLED and binary_preimages is not None:
         try:
@@ -3939,6 +3947,16 @@ def selected_indices(
             )
             if registry_indices is not None:
                 return registry_indices & all_indices
+        if original is not None and prospective is not None:
+            tokenizer_indices = tokenizer_setting_branch.readers(
+                only_path,
+                original,
+                prospective,
+                only,
+                tokenizer_setting_branch_model,
+            )
+            if tokenizer_indices is not None:
+                return tokenizer_indices & all_indices
         retained = match_none_static(changes, none_static_profile, original, prospective)
         if retained is not None:
             return retained & all_indices
@@ -4159,6 +4177,12 @@ def _main() -> None:
         "eb11aec4be8cb2122afe713a4816662c3f0fb2fa",
         test_ids,
     )
+    tokenizer_setting_branch_model = tokenizer_setting_branch.load_profile(
+        TOKENIZER_SETTING_BRANCH_MODEL,
+        TOKENIZER_SETTING_BRANCH_MODEL_SHA256,
+        tests,
+        model.get("sha"),
+    )
     binary_preimages = load_preimages(
         BINARY_FIXTURE_PREIMAGES, MODEL, model, model.get("t")
     )
@@ -4280,6 +4304,7 @@ def _main() -> None:
             import_line_profile=import_line_profile,
             registry_key_model=registry_key_model,
             query_modifier_model=query_modifier_model,
+            tokenizer_setting_branch_model=tokenizer_setting_branch_model,
         )
         selected = [mapped_tests[index] for index in indices if mapped_tests[index] is not None]
         selected.extend(unmapped_tests)
