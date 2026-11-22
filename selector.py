@@ -191,6 +191,101 @@ def tpc_plan_patch_eligible(patch: Path, changes: list[dict] | None = None) -> b
     )
 
 
+def tpc_function_docstring_only(patch: Path) -> bool:
+    """Prove a patch changes only ordinary function docstring contents."""
+    try:
+        if patch.stat().st_size > 65_536:
+            return False
+        changes = patch_changes(patch)
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return False
+    if len(changes) != 1:
+        return False
+    change = changes[0]
+    path = change.get("old")
+    if (
+        type(path) is not str
+        or change.get("new") != path
+        or change.get("diff_old") != path
+        or change.get("diff_new") != path
+        or not path.startswith("sqlglot/optimizer/")
+        or not path.endswith(".py")
+        or change.get("new_file_mode_count")
+        or change.get("structural_invalid")
+        or change.get("non_lf")
+        or any(COMMENT_DIRECTIVE.search(line) for line in change.get("payload", ()))
+    ):
+        return False
+    original = pinned_sources().get(path)
+    prospective = patched_source(change, path)
+    if original is None or prospective is None:
+        return False
+    try:
+        old_tree = ast.parse(original, filename=path, type_comments=True)
+        new_tree = ast.parse(prospective, filename=path, type_comments=True)
+    except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError):
+        return False
+
+    def docstrings(tree: ast.Module) -> list[tuple[str, str, bool]]:
+        result = []
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                value = ast.get_docstring(node, clean=False)
+                if value is not None:
+                    result.append((node.name, value, bool(node.decorator_list)))
+        return result
+
+    old_docs = docstrings(old_tree)
+    new_docs = docstrings(new_tree)
+
+    def compile_internable(value: str) -> bool:
+        return bool(value) and (
+            value.isidentifier()
+            or (
+                value.isascii()
+                and all(character.isalnum() or character == "_" for character in value)
+            )
+        )
+
+    if (
+        [(name, decorated) for name, _value, decorated in old_docs]
+        != [(name, decorated) for name, _value, decorated in new_docs]
+        or old_docs == new_docs
+        or any(
+            old_decorated
+            for (_old_name, old_value, old_decorated),
+            (_new_name, new_value, _new_decorated) in zip(old_docs, new_docs)
+            if old_value != new_value
+        )
+        or any(
+            compile_internable(old_value) or compile_internable(new_value)
+            for (_old_name, old_value, _old_decorated),
+            (_new_name, new_value, _new_decorated) in zip(old_docs, new_docs)
+            if old_value != new_value
+        )
+    ):
+        return False
+
+    class Normalize(ast.NodeTransformer):
+        def visit_Module(self, node):
+            for child in node.body:
+                if (
+                    isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and child.body
+                    and isinstance(child.body[0], ast.Expr)
+                    and isinstance(child.body[0].value, ast.Constant)
+                    and isinstance(child.body[0].value.value, str)
+                ):
+                    child.body[0].value.value = "__KASHIMO_DOCSTRING__"
+            return node
+
+    Normalize().visit(old_tree)
+    Normalize().visit(new_tree)
+    return ast.dump(old_tree, include_attributes=False) == ast.dump(
+        new_tree, include_attributes=False
+    )
+
+
 def patch_changes(patch: Path) -> list[dict]:
     """Return each changed path and its affected line anchors in the base tree."""
     changes: list[dict] = []
@@ -2450,6 +2545,7 @@ def main() -> None:
     unmapped_tests = [test for test in tests if test["id"] not in modeled_ids]
 
     jobs = []
+    tpc_ids = set().union(*TPC_PLAN_TESTS.values())
     for patch in sorted((DATA / "commits").glob("*.patch")):
         changes = patch_changes(patch)
         indices = selected_indices(
@@ -2470,7 +2566,6 @@ def main() -> None:
         )
         selected = [mapped_tests[index] for index in indices if mapped_tests[index] is not None]
         selected.extend(unmapped_tests)
-        tpc_ids = set().union(*TPC_PLAN_TESTS.values())
         without_all_tpc = [test for test in selected if test["id"] not in tpc_ids]
         prospective_saving = best_cost_ms(selected) - best_cost_ms(without_all_tpc)
         fixture_change = (
@@ -2489,6 +2584,7 @@ def main() -> None:
                 "patch": patch,
                 "selected": selected,
                 "prospective_saving": prospective_saving,
+                "docstring_only": tpc_function_docstring_only(patch),
                 "eligible": prospective_saving > 16_000
                 and tpc_plan_patch_eligible(patch, changes),
                 "fixture_change": fixture_change,
@@ -2504,7 +2600,12 @@ def main() -> None:
     )
     for index in execution_order:
         job = jobs[index]
-        if job["eligible"]:
+        if job["docstring_only"]:
+            # The pinned numbered roster contains no doctest/docstring reader.
+            # A whole-module census also finds no optimizer function __doc__ or
+            # code-constant observer, so the executable outcome is unchanged.
+            job["selected"] = list(unmapped_tests)
+        elif job["eligible"]:
             selected = job["selected"]
             patch = job["patch"]
             verdicts, verifier_cpu = verify_tpc_plan_patch(patch)
