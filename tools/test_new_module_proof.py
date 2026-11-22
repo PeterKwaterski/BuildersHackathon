@@ -184,6 +184,12 @@ class NewModuleProofTests(unittest.TestCase):
             self.changes(index_line=""),
             self.changes(extra_metadata=("new file mode 100644",)),
             self.changes(extra_metadata=("copy from sqlglot/old.py",)),
+            self.changes(
+                extra_metadata=(
+                    "rename from sqlglot/old.py",
+                    "rename to sqlglot/fresh_kashimo_module.py",
+                )
+            ),
             self.changes(extra_metadata=("old mode 100755",)),
             self.changes(duplicate_markers=True),
             self.changes(trailing_garbage="unexpected patch payload"),
@@ -191,6 +197,25 @@ class NewModuleProofTests(unittest.TestCase):
             self.assertIsNone(
                 selector.isolated_new_module_indices(changes, self.profile)
             )
+
+    def test_ordinary_rename_paths_remain_bound_for_dependency_fallback(self):
+        patch = (
+            "diff --git a/sqlglot/old.py b/sqlglot/new.py\n"
+            "similarity index 100%\n"
+            "rename from sqlglot/old.py\n"
+            "rename to sqlglot/new.py\n"
+        )
+        with tempfile.NamedTemporaryFile("w", delete=False) as patch_file:
+            patch_file.write(patch)
+            path = Path(patch_file.name)
+        try:
+            changes = selector.patch_changes(path)
+        finally:
+            path.unlink()
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["old"], "sqlglot/old.py")
+        self.assertEqual(changes[0]["new"], "sqlglot/new.py")
+        self.assertTrue(changes[0]["structural_invalid"])
 
     def test_rejects_archive_words_and_bad_source(self):
         # Both names occur in pinned imports/data, including from-import sites.

@@ -140,6 +140,12 @@ def patch_changes(patch: Path) -> list[dict]:
             change["new_file_index"] = bool(
                 re.fullmatch(r"index 0{7,64}\.\.[0-9a-f]{7,64}", line)
             )
+        elif not in_hunk and line.startswith("rename from "):
+            change["old"] = line.removeprefix("rename from ")
+            change["structural_invalid"] = True
+        elif not in_hunk and line.startswith("rename to "):
+            change["new"] = line.removeprefix("rename to ")
+            change["structural_invalid"] = True
         elif not in_hunk and line.startswith(
             (
                 "old mode ",
@@ -147,8 +153,6 @@ def patch_changes(patch: Path) -> list[dict]:
                 "deleted file mode ",
                 "similarity index ",
                 "dissimilarity index ",
-                "rename from ",
-                "rename to ",
                 "copy from ",
                 "copy to ",
             )
@@ -179,10 +183,6 @@ def patch_changes(patch: Path) -> list[dict]:
             change["new_marker_count"] += 1
             name = line[4:].split("\t", 1)[0]
             change["new"] = name[2:] if name.startswith("b/") else name
-        elif not in_hunk and line.startswith("rename from "):
-            change["old"] = line.removeprefix("rename from ")
-        elif not in_hunk and line.startswith("rename to "):
-            change["new"] = line.removeprefix("rename to ")
         elif line.startswith(("-", "+", " ")) and hunk is None:
             # A rejected binary or malformed structural body can contain
             # payload-looking lines without a unified text hunk. Never index a
