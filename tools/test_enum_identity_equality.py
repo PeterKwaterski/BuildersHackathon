@@ -105,6 +105,70 @@ class C:
             SemanticProof({"sqlglot/x.py": hostile}).covers("sqlglot/x.py", {9})
         )
 
+    def local_alias_ranges(self, body, signature="self, flag=True"):
+        source = f"""\
+from enum import Enum
+class E(Enum):
+    A = 1
+class C:
+    def __init__(self):
+        self.value = E.A
+    def f({signature}):
+{body}
+"""
+        return SemanticProof({"sqlglot/x.py": source})._safe_ranges("sqlglot/x.py")
+
+    def test_local_alias_conditional_store_rejects(self):
+        self.assertEqual(
+            self.local_alias_ranges(
+                "        if flag:\n"
+                "            alias = self.value\n"
+                "        return alias is E.A"
+            ),
+            [],
+        )
+
+    def test_local_alias_parameter_rejects(self):
+        self.assertEqual(
+            self.local_alias_ranges(
+                "        alias = self.value\n        return alias is E.A",
+                signature="self, alias",
+            ),
+            [],
+        )
+
+    def test_local_alias_comprehension_rebind_rejects(self):
+        self.assertEqual(
+            self.local_alias_ranges(
+                "        alias = self.value\n"
+                "        values = [alias for alias in ()]\n"
+                "        return alias is E.A"
+            ),
+            [],
+        )
+
+    def test_local_alias_nested_use_rejects(self):
+        self.assertEqual(
+            self.local_alias_ranges(
+                "        alias = self.value\n"
+                "        def nested():\n"
+                "            return alias is E.A\n"
+                "        return nested()"
+            ),
+            [],
+        )
+
+    def test_local_alias_use_before_store_rejects(self):
+        self.assertEqual(
+            self.local_alias_ranges(
+                "        if alias is E.A:\n"
+                "            return True\n"
+                "        alias = self.value\n"
+                "        return False"
+            ),
+            [],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
