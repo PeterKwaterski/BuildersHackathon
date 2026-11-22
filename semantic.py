@@ -168,6 +168,101 @@ class SemanticProof:
             self._value_is_enum(path, value, enum_name, cls) for value, _ in assignments
         )
 
+    def _local_enum_alias(self, path: str, node: ast.AST, enum_name: str) -> bool:
+        """Prove one top-level Enum-attribute store dominates this local use."""
+        if not isinstance(node, ast.Name):
+            return False
+        comparison = self.parents.get((path, node))
+        if not isinstance(comparison, ast.Compare):
+            return False
+
+        cursor = comparison
+        function = None
+        while (parent := self.parents.get((path, cursor))) is not None:
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                function = parent
+                break
+            if isinstance(
+                parent,
+                (
+                    ast.ClassDef,
+                    ast.Lambda,
+                    ast.ListComp,
+                    ast.SetComp,
+                    ast.DictComp,
+                    ast.GeneratorExp,
+                ),
+            ):
+                return False
+            cursor = parent
+        if function is None:
+            return False
+
+        arguments = (
+            *function.args.posonlyargs,
+            *function.args.args,
+            *function.args.kwonlyargs,
+        )
+        if (
+            any(argument.arg == node.id for argument in arguments)
+            or function.args.vararg is not None
+            and function.args.vararg.arg == node.id
+            or function.args.kwarg is not None
+            and function.args.kwarg.arg == node.id
+            or any(
+                isinstance(candidate, (ast.Global, ast.Nonlocal))
+                and node.id in candidate.names
+                for candidate in ast.walk(function)
+            )
+        ):
+            return False
+
+        stores = [
+            candidate
+            for candidate in ast.walk(function)
+            if isinstance(candidate, ast.Name)
+            and candidate.id == node.id
+            and isinstance(candidate.ctx, (ast.Store, ast.Del))
+        ]
+        if len(stores) != 1:
+            return False
+        target = stores[0]
+        assignment = self.parents.get((path, target))
+        if not isinstance(assignment, (ast.Assign, ast.AnnAssign)):
+            return False
+        targets = assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
+        if (
+            self.parents.get((path, assignment)) is not function
+            or len(targets) != 1
+            or targets[0] is not target
+            or assignment.value is None
+            or not self._enum_attribute(path, assignment.value, enum_name)
+        ):
+            return False
+
+        top = comparison
+        while self.parents.get((path, top)) is not function:
+            parent = self.parents.get((path, top))
+            if parent is None or isinstance(
+                parent,
+                (
+                    ast.FunctionDef,
+                    ast.AsyncFunctionDef,
+                    ast.ClassDef,
+                    ast.Lambda,
+                    ast.ListComp,
+                    ast.SetComp,
+                    ast.DictComp,
+                    ast.GeneratorExp,
+                ),
+            ):
+                return False
+            top = parent
+        try:
+            return function.body.index(assignment) < function.body.index(top)
+        except ValueError:
+            return False
+
     def _identity_or_none(self, path: str, node: ast.AST) -> bool:
         if not (
             isinstance(node, ast.Attribute)
@@ -203,8 +298,9 @@ class SemanticProof:
                 proven = self._identity_or_none(path, left)
             elif isinstance(right, ast.Attribute) and isinstance(right.value, ast.Name):
                 enum_name = right.value.id
-                proven = self._is_enum(enum_name) and self._enum_attribute(
-                    path, left, enum_name
+                proven = self._is_enum(enum_name) and (
+                    self._enum_attribute(path, left, enum_name)
+                    or self._local_enum_alias(path, left, enum_name)
                 )
             else:
                 proven = False
