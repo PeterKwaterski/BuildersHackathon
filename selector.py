@@ -83,6 +83,12 @@ NEW_MODULE_PATH = re.compile(
     r"sqlglot(?:/[A-Za-z_][A-Za-z0-9_]*)*/[A-Za-z_][A-Za-z0-9_]*\.py\Z"
 )
 NEW_TEST_MODULE_PATH = re.compile(r"tests/test_[A-Za-z_][A-Za-z0-9_]*\.py\Z")
+NUMBERED_TEST_MODULE_PATH = re.compile(
+    r"tests/(?:[A-Za-z_][A-Za-z0-9_]*/)*test_[A-Za-z_][A-Za-z0-9_]*\.py\Z"
+)
+MOVED_TEST_MODULE_PATH = re.compile(
+    r"tests/(?:[A-Za-z_][A-Za-z0-9_]*/)*moved_test_[A-Za-z_][A-Za-z0-9_]*\.py\Z"
+)
 NEW_SQL_FIXTURE_PATH = re.compile(
     r"tests/fixtures/(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_][A-Za-z0-9_.-]*\.sql\Z"
 )
@@ -3712,6 +3718,111 @@ def isolated_mypy_config_indices(
     return set()
 
 
+def isolated_renamed_test_indices(
+    changes: list[dict],
+    test_file_indices: dict[str, set[int]] | None,
+    discovery_profile: dict | None,
+) -> set[int] | None:
+    """Retain one nondiscoverable renamed test and dynamic discovery readers."""
+    if (
+        len(changes) != 1
+        or test_file_indices is None
+        or not isinstance(discovery_profile, dict)
+        or not canonical_text_changes(changes)
+    ):
+        return None
+    try:
+        discovery_body = {
+            key: discovery_profile[key]
+            for key in ("a", "b", "d", "f", "i", "k", "m", "r", "w")
+        }
+    except KeyError:
+        return None
+    readers = discovery_profile.get("r")
+    if (
+        discovery_profile.get("d") != NEW_MODULE_SOURCE_SHA256
+        or discovery_profile.get("p") != NEW_MODULE_PROFILE_SHA256
+        or _stable_json_digest(discovery_profile.get("i"))
+        != NEW_MODULE_INVENTORY_SHA256
+        or _stable_json_digest(discovery_body) != NEW_MODULE_PROFILE_SHA256
+        or not isinstance(readers, list)
+        or readers != sorted(set(readers))
+        or any(type(reader) is not int or reader < 0 for reader in readers)
+    ):
+        return None
+    change = changes[0]
+    old_path = change.get("old")
+    new_path = change.get("new")
+    if (
+        type(old_path) is not str
+        or NUMBERED_TEST_MODULE_PATH.fullmatch(old_path) is None
+        or old_path not in pinned_sources()
+        or old_path not in test_file_indices
+        or not test_file_indices[old_path]
+        or type(new_path) is not str
+        or MOVED_TEST_MODULE_PATH.fullmatch(new_path) is None
+        or Path(new_path).parent != Path(old_path).parent
+    ):
+        return None
+    old_file = PINNED_SOURCE_ROOT / old_path
+    try:
+        if (
+            not PINNED_SOURCE_ROOT.is_dir()
+            or not old_file.is_file()
+            or old_file.is_symlink()
+            or os.path.lexists(PINNED_SOURCE_ROOT / new_path)
+        ):
+            return None
+    except (OSError, ValueError, OverflowError, MemoryError):
+        return None
+    if change.get("hunks") or change.get("similarity_index") != "100%":
+        return None
+
+    dotted = old_path.removesuffix(".py").replace("/", ".")
+    parent_dotted, stem = dotted.rsplit(".", 1)
+    new_dotted = new_path.removesuffix(".py").replace("/", ".")
+    new_parent_dotted, new_stem = new_dotted.rsplit(".", 1)
+    for source_path, source in pinned_sources().items():
+        if source_path == old_path:
+            continue
+        if any(
+            reference in source
+            for reference in (old_path, dotted, new_path, new_dotted)
+        ):
+            return None
+        if stem not in source and new_stem not in source:
+            continue
+        tree = source_tree(source_path)
+        if tree is None:
+            return None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import) and any(
+                alias.name in {dotted, stem, new_dotted, new_stem}
+                for alias in node.names
+            ):
+                return None
+            if isinstance(node, ast.ImportFrom) and (
+                node.module in {dotted, new_dotted}
+                or (
+                    node.module in {parent_dotted, new_parent_dotted}
+                    and any(alias.name in {stem, new_stem} for alias in node.names)
+                )
+                or (
+                    node.level
+                    and any(alias.name in {stem, new_stem} for alias in node.names)
+                )
+            ):
+                return None
+            if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and node.value
+                in {old_path, dotted, stem, new_path, new_dotted, new_stem}
+            ):
+                return None
+    return set(readers) | set(test_file_indices[old_path])
+
+
 def selected_indices(
     patch: Path,
     model: dict,
@@ -3776,6 +3887,11 @@ def selected_indices(
     mypy_config_readers = isolated_mypy_config_indices(changes, new_module_model)
     if mypy_config_readers is not None:
         return mypy_config_readers
+    renamed_test_readers = isolated_renamed_test_indices(
+        changes, test_file_indices, new_module_model
+    )
+    if renamed_test_readers is not None:
+        return renamed_test_readers & all_indices
     helper_changes = [
         change for change in changes
         if TPC_ENTRY_PATH in (change.get("old"), change.get("new"))
