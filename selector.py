@@ -2,6 +2,7 @@
 
 import ast
 import configparser
+import gc
 import gzip
 import hashlib
 import io
@@ -4131,6 +4132,11 @@ def selected_indices(
 
 
 def main() -> None:
+    # Model loading and the subsequent analysis allocate large acyclic JSON,
+    # AST and index graphs. Reference counting owns their lifetime; cyclic GC
+    # would only rescan the growing immutable graph during this short process.
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     tests_by_id = {test["id"]: test for test in tests}
     test_ids = [test["id"] for test in tests]
@@ -4403,6 +4409,8 @@ def main() -> None:
         f"{len(list((DATA / 'commits').glob('*.patch')))} commits",
         file=sys.stderr,
     )
+    if gc_was_enabled:
+        gc.enable()
 
 
 if __name__ == "__main__":
