@@ -7,6 +7,7 @@ import io
 import json
 import base64
 import keyword
+import os
 import re
 import sys
 import tokenize
@@ -28,6 +29,8 @@ from shared_arg_write_runtime import (
     load_model as load_shared_arg_model,
 )
 from tpc_plan_runtime import verify_patch as verify_tpc_plan_patch
+from tpc_fixture_verify import FIXTURE as TPCDS_FIXTURE_PATH
+from tpc_fixture_verify import verify as verify_tpcds_fixture
 
 DATA = Path("/data")
 MODEL = Path(__file__).with_name("selector_model.json.gz")
@@ -105,12 +108,13 @@ TPC_PLAN_TESTS = {
         "tests/test_executor.py::TestExecutor::test_optimized_tpch",
     },
 }
+TPCDS_EXECUTOR_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 
 
-def tpc_plan_patch_eligible(patch: Path) -> bool:
+def tpc_plan_patch_eligible(patch: Path, changes: list[dict] | None = None) -> bool:
     """Admit one ordinary optimizer function-body edit to prospective replay."""
     try:
-        changes = patch_changes(patch)
+        changes = patch_changes(patch) if changes is None else changes
     except (OSError, UnicodeError, ValueError, TypeError):
         return False
     if len(changes) != 1:
@@ -2118,6 +2122,7 @@ def selected_indices(
     binary_preimages: dict | None = None,
     tpc_entry_provenance: dict | None = None,
     new_module_model: dict | None = None,
+    parsed_changes: list[dict] | None = None,
 ) -> set[int]:
     if BINARY_FIXTURE_ENABLED and binary_preimages is not None:
         try:
@@ -2130,7 +2135,7 @@ def selected_indices(
             return binary_indices
 
     selected: set[int] = set()
-    changes = patch_changes(patch)
+    changes = patch_changes(patch) if parsed_changes is None else parsed_changes
     if not changes:
         return set(all_indices)
     new_module_readers = (
@@ -2446,6 +2451,7 @@ def main() -> None:
 
     jobs = []
     for patch in sorted((DATA / "commits").glob("*.patch")):
+        changes = patch_changes(patch)
         indices = selected_indices(
             patch,
             model,
@@ -2460,19 +2466,34 @@ def main() -> None:
             binary_preimages,
             tpc_entry_provenance,
             new_module_model,
+            changes,
         )
         selected = [mapped_tests[index] for index in indices if mapped_tests[index] is not None]
         selected.extend(unmapped_tests)
         tpc_ids = set().union(*TPC_PLAN_TESTS.values())
         without_all_tpc = [test for test in selected if test["id"] not in tpc_ids]
         prospective_saving = best_cost_ms(selected) - best_cost_ms(without_all_tpc)
+        fixture_change = (
+            changes[0]
+            if len(changes) == 1
+            and changes[0].get("old")
+            == changes[0].get("new")
+            == TPCDS_FIXTURE_PATH
+            else None
+        )
+        without_tpcds_executor = [
+            test for test in selected if test["id"] != TPCDS_EXECUTOR_ID
+        ]
         jobs.append(
             {
                 "patch": patch,
                 "selected": selected,
                 "prospective_saving": prospective_saving,
                 "eligible": prospective_saving > 16_000
-                and tpc_plan_patch_eligible(patch),
+                and tpc_plan_patch_eligible(patch, changes),
+                "fixture_change": fixture_change,
+                "fixture_saving": best_cost_ms(selected)
+                - best_cost_ms(without_tpcds_executor),
             }
         )
 
@@ -2499,6 +2520,49 @@ def main() -> None:
                 realized = best_cost_ms(selected) - best_cost_ms(narrowed)
                 if realized > round(verifier_cpu * 1_200):
                     job["selected"] = narrowed
+
+    # Fixture-only edits cannot enter the optimizer-plan lane above. Keep this
+    # independently budgeted pass after plan scheduling so it cannot reorder or
+    # consume the plan verifier's opportunities.
+    fixture_order = sorted(
+        range(len(jobs)),
+        key=lambda index: jobs[index]["fixture_saving"],
+        reverse=True,
+    )
+    for index in fixture_order:
+        job = jobs[index]
+        change = job["fixture_change"]
+        if change is None or job["fixture_saving"] <= 0:
+            continue
+        passed, verifier_cpu, _reason = verify_tpcds_fixture(change)
+        accepted = False
+        realized = 0
+        if passed:
+            selected = job["selected"]
+            narrowed = [
+                test for test in selected if test["id"] != TPCDS_EXECUTOR_ID
+            ]
+            realized = best_cost_ms(selected) - best_cost_ms(narrowed)
+            if realized > round(verifier_cpu * 1_200):
+                job["selected"] = narrowed
+                accepted = True
+        if os.environ.get("BR_TPC_FIXTURE_TRACE") == "1":
+            print(
+                "tpc_fixture_verify="
+                + json.dumps(
+                    {
+                        "accepted": accepted,
+                        "commit": job["patch"].stem,
+                        "cpu": round(verifier_cpu, 6),
+                        "passed": passed,
+                        "realized": round(realized / 1_000, 6),
+                        "reason": _reason,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                file=sys.stderr,
+            )
 
     selection_count = 0
     for job in jobs:

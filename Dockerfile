@@ -16,6 +16,10 @@ tarfile.open(fileobj=io.BytesIO(d)).extractall('/app',filter='data'); \
 os.rename('/app/sqlglot-'+sha,'/app/sqlglot-pinned')" \
  && python -m compileall -q --invalidation-mode checked-hash /app/sqlglot-pinned/sqlglot /app/sqlglot-pinned/tests
 COPY selector.py /app/selector.py
+COPY tpc_fixture_verify.py /app/tpc_fixture_verify.py
+COPY tpc_fixture_verify_child.py /app/tpc_fixture_verify_child.py
+COPY broad_verify_manifest.json.gz /app/broad_verify_manifest.json.gz
+COPY vendor/sqlglot-eb11aec.tar.xz /app/sqlglot-eb11aec.tar.xz
 COPY binary_copy_patch.py /app/binary_copy_patch.py
 COPY tpc_entry_key_access.py /app/tpc_entry_key_access.py
 COPY semantic.py /app/semantic.py
