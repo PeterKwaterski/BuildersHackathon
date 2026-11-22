@@ -443,7 +443,9 @@ def patch_changes(patch: Path) -> list[dict]:
     new_line = 0
     addition_anchor = None
     in_hunk = False
-    non_lf = b"\r" in patch.read_bytes()
+    raw_patch = patch.read_bytes()
+    non_lf = b"\r" in raw_patch
+    terminal_lf = raw_patch.endswith(b"\n")
     for line in patch.read_text().splitlines():
         if line.startswith("diff --git "):
             header = line.split(" ")
@@ -469,6 +471,7 @@ def patch_changes(patch: Path) -> list[dict]:
                 "structural_invalid": False,
                 "binary": False,
                 "non_lf": non_lf,
+                "terminal_lf": terminal_lf,
                 "no_newline_marker": False,
             }
             changes.append(change)
@@ -3113,6 +3116,7 @@ def isolated_new_test_indices(
         or change.get("structural_invalid")
         or change.get("binary")
         or change.get("non_lf")
+        or change.get("terminal_lf") is not True
         or change.get("no_newline_marker")
         or path in pinned_sources()
         or path in test_file_indices

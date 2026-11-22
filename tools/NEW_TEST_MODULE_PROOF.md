@@ -10,7 +10,8 @@ or collected and cannot change an existing numbered test's outcome.
 
 The patch must be a single regular `100644` new file with one exact add-only
 hunk, canonical `/dev/null`, index, path and marker metadata, LF source no
-larger than 64 KiB, and valid Python. Nested test packages, helpers,
+larger than 64 KiB, an exact terminal LF in the raw patch, and valid Python.
+Nested test packages, helpers,
 `conftest.py`, package initializers, plugins, existing source/roster paths,
 mode/symlink/copy/rename metadata, malformed counts, multiple hunks or files,
 and syntax failures reject. The new module stem, dotted module name, and path
@@ -45,13 +46,13 @@ all 1,620 tests at 36.817s; the proof emits no modeled test, for 110.451s
 aggregate gross upside before selector CPU.
 
 The two unique transformations were applied together and passed the exact
-ordered 1,620-test roster plus all 25,440 subtests with zero failures. Focused
-tests cover admission, selector precedence, top-level path/name/source/roster
+ordered 1,620-test roster plus all 25,440 subtests with zero failures. Eight
+focused tests cover admission, selector precedence, top-level path/name/source/roster
 collisions, discovery-evidence corruption, plugin content, mode/symlink/copy/
 rename metadata, multiple hunks/files, size and syntax failure. Malformed or
 ambiguous input always falls through to the ordinary selector.
 
-The complete combined repository suite is 211 green with ten intentional
+The complete combined repository suite is 212 green with ten intentional
 skips. Two official-limit sample runs remain byte-identical at SHA-256
 `56db9765…`, and the three-case public image run emits zero modeled tests.
 Three metered repaired-base runs used 0.535/1.302/1.769 process CPU seconds;

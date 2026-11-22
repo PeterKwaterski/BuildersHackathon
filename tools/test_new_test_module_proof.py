@@ -30,6 +30,7 @@ class NewTestModuleProofTest(unittest.TestCase):
         mode="100644",
         extra_metadata=(),
         second_hunk=False,
+        terminal_lf=True,
     ):
         lines = body.splitlines()
         patch_lines = [
@@ -45,6 +46,8 @@ class NewTestModuleProofTest(unittest.TestCase):
         if second_hunk:
             patch_lines.extend(("@@ -0,0 +10,1 @@", "+VALUE = 1"))
         patch = "\n".join((*patch_lines, ""))
+        if not terminal_lf:
+            patch = patch.rstrip("\n")
         with tempfile.NamedTemporaryFile("w", delete=False) as patch_file:
             patch_file.write(patch)
             patch_path = Path(patch_file.name)
@@ -159,6 +162,15 @@ class NewTestModuleProofTest(unittest.TestCase):
         )
         self.assertIsNone(
             selector.isolated_new_test_indices(self.changes(), roster, {})
+        )
+
+    def test_rejects_patch_without_terminal_lf(self):
+        roster = self.sources()
+        changes = self.changes(terminal_lf=False)
+        self.assertEqual(len(changes), 1)
+        self.assertIs(changes[0].get("terminal_lf"), False)
+        self.assertIsNone(
+            selector.isolated_new_test_indices(changes, roster, self.profile)
         )
 
 
