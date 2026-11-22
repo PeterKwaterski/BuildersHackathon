@@ -1923,7 +1923,7 @@ def profile_equivalent_predicate_edit(
     predicate_model: dict,
     hook_attributes: set[str] | None = None,
 ) -> bool:
-    """Prove the changed ordering operator is equivalent on the raw profile."""
+    """Prove one changed comparison operator equivalent on the raw profile."""
     entries = predicate_model.get("d", {}).get(path)
     source = pinned_sources().get(path)
     changed = patched_source(change, path)
@@ -1997,6 +1997,8 @@ def profile_equivalent_predicate_edit(
             and len(original_compare.ops) == 1
             and len(changed_compare.ops) == 1
             and type(original_compare.ops[0]).__name__ == source_operator
+            and ast.dump(original_compare, include_attributes=False)
+            != ast.dump(changed_compare, include_attributes=False)
         ):
             candidates.append(
                 (
@@ -2021,45 +2023,105 @@ def profile_equivalent_predicate_edit(
         return False
     if type(changed_compare.ops[0]).__name__ != new_operator:
         return False
-    adjacent = {
-        ("Lt", "LtE"),
-        ("LtE", "Lt"),
-        ("Gt", "GtE"),
-        ("GtE", "Gt"),
-    }
-    if (old_operator, new_operator) not in adjacent:
+    outcome_order = (
+        "Lt",
+        "LtE",
+        "Gt",
+        "GtE",
+        "Eq",
+        "NotEq",
+        "Is",
+        "IsNot",
+        "In",
+        "NotIn",
+    )
+    if (
+        old_operator == new_operator
+        or old_operator not in outcome_order
+        or new_operator not in outcome_order
+    ):
         return False
-    outcome_index = {"Lt": 0, "LtE": 1, "Gt": 2, "GtE": 3, "Eq": 4, "NotEq": 5}
+    outcome_index = {name: index for index, name in enumerate(outcome_order)}
+    safe_domains = {
+        ("builtins", name)
+        for name in (
+            "NoneType",
+            "bool",
+            "int",
+            "float",
+            "str",
+            "bytes",
+            "type",
+            "tuple",
+        )
+    }
+
+    def valid_domain(domain) -> bool:
+        return (
+            isinstance(domain, list)
+            and len(domain) == 2
+            and tuple(domain) in safe_domains
+        )
+
+    def valid_result(result) -> bool:
+        return (
+            isinstance(result, list)
+            and len(result) == 3
+            and all(isinstance(item, str) for item in result)
+            and (
+                result[0] == "value"
+                and result[1] == "bool"
+                and result[2] in {"True", "False"}
+                or result[0] == "error"
+                and bool(result[1])
+                and bool(result[2])
+            )
+        )
+
     if (
         state != "safe"
         or not isinstance(observations, list)
         or not observations
         or any(
-            not isinstance(outcome, list)
-            or len(outcome) != len(outcome_index)
-            or any(type(value) is not bool for value in outcome)
-            or outcome[outcome_index[old_operator]]
-            != outcome[outcome_index[new_operator]]
-            for outcome in observations
+            not isinstance(observation, list)
+            or len(observation) != 3
+            or not valid_domain(observation[0])
+            or not valid_domain(observation[1])
+            or not isinstance(observation[2], list)
+            or len(observation[2]) != len(outcome_order)
+            or any(not valid_result(result) for result in observation[2])
+            or observation[2][outcome_index[old_operator]][:2] != ["value", "bool"]
+            or observation[2][outcome_index[old_operator]]
+            != observation[2][outcome_index[new_operator]]
+            for observation in observations
         )
     ):
         return False
 
-    def literal(node: ast.AST) -> bool:
-        try:
-            ast.literal_eval(node)
-        except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+    identity_pairs = {
+        ("Is", "Eq"),
+        ("Eq", "Is"),
+        ("IsNot", "NotEq"),
+        ("NotEq", "IsNot"),
+    }
+    if "Is" in {old_operator, new_operator} or "IsNot" in {
+        old_operator,
+        new_operator,
+    }:
+        if (old_operator, new_operator) not in identity_pairs:
             return False
-        return True
-
-    if not (
-        literal(original_compare.left)
-        or literal(original_compare.comparators[0])
-    ):
-        return False
+        for left_domain, right_domain, _outcomes in observations:
+            left_type = left_domain[1]
+            right_type = right_domain[1]
+            if not (
+                "NoneType" in {left_type, right_type}
+                or "type" in {left_type, right_type}
+                or left_type == right_type == "bool"
+            ):
+                return False
 
     # The certificate is usable only when normalizing the one approved
-    # operator makes the complete executable trees identical.  Operands,
+    # operator makes the complete executable trees identical. Operands,
     # evaluation order, surrounding expressions, bindings and type comments
     # therefore cannot change under this shortcut.
     original_compare.ops[0] = ast.Eq()
@@ -3201,7 +3263,7 @@ def main() -> None:
     ):
         zero_model = {"d": {}}
     if (
-        predicate_model.get("v") != 2
+        predicate_model.get("v") != 3
         or predicate_model.get("sha") != model.get("sha")
         or predicate_model.get("n") != len(tests)
         or predicate_model.get("t") != test_digest

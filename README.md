@@ -116,14 +116,16 @@ edit; missing-required-key owners are retained globally to preserve possible
 set-order effects. Both complete passing suite modes are required.
 
 `tools/collect_predicate_values.py` and
-`tools/build_predicate_profile.py` reproduce the still narrower ordering
-predicate execution profile documented in `tools/PREDICATE_PROFILE.md`. It
-contains every instrumented source site and all six observed boolean outcomes;
-unsafe, unobserved, incomplete, or unattributed sites explicitly force fallback.
-It is not filtered by a candidate edit and contains no replacement operators or
-test ownership. Runtime use requires an adjacent operator pair whose old and new
-outcomes match across the raw profile, plus whole-file AST equality after normalizing only that operator,
-plus the ordinary compile, directive, import and function-binding gates.
+`tools/build_predicate_profile.py` reproduce the comparison predicate
+execution profile documented in `tools/PREDICATE_PROFILE.md`. It
+contains every single-comparison source site, typed exact-builtin operand
+domains, and all ten observed result-or-exception outcomes. Unsafe, unobserved,
+incomplete, or unattributed sites explicitly force fallback. It is not filtered
+by a candidate edit and contains no replacement operators, patches, or answers.
+Runtime use requires an operator-only edit whose old and new outcomes match
+across all three complete-suite traces, plus whole-file AST equality after
+normalizing only that operator and the ordinary compile, directive, import,
+identity-domain, and function-binding gates.
 
 `tools/collect_class_attribute_reads.py` and
 `tools/build_class_attribute_model.py` reproduce the complete owner-aware
