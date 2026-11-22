@@ -50,6 +50,13 @@ set in `selector_model.x`. The model is bound to revision
 digest `31a019981e19c3d1b18d929066da7e118fcf3d57696a360f7b9d31ce3a87bc89`.
 The compressed selector-model SHA-256 is
 `d61c504e9a4a1006217e6702e1c6f05c04846b3dd5a09ec5572523fd8b2cb382`.
+The independently rebuilt 62-path preimage/size artifact is
+`fixture_binary_preimages.json.gz`, compressed SHA-256
+`10a70ad881f5b273b3277bd0cca553fcf6996485211c3b7544429c2e06d9bd5f`
+and signed-profile SHA-256
+`aaf46b0238b7640e16f92f88ccbe391d3b206e0054f80835ef0d1f8c827bf2b0`.
+It is reproduced by `tools/build_fixture_binary_preimages.py` from the pinned
+tree and selector model and stores full Git blob IDs and exact byte sizes.
 
 Pinned source/test filesystem consumers are limited to:
 
@@ -80,6 +87,21 @@ Using the public manifest and candidate packer:
 | Existing TPC CSV binary replacement | 36.817s / all 1,620 | 25.454s / 61 | **11.363s** |
 | Existing `tests/fixtures/jsonpath/cts.json` binary replacement | 36.817s | 2.089s / 1 | **34.728s** |
 
+Exact per-path owners, IDs, packed costs and savings for all 62 authenticated
+fixtures are in `fixture_binary_economics.json.gz` (compressed SHA-256
+`8568ad78dd4051e7d0d4ae78992a278dc2f03c918d1521b571b40af16a125290`,
+profile SHA-256
+`89b2222edf94a60402adbc39cc0ab996f988614d4476fea453a1a75404ccd7a7`).
+It is answer-free and reproduced by `tools/build_fixture_binary_economics.py`.
+
+| Fixture class | Paths | Owners/path | Packed/path | Saving/path |
+|---|---:|---:|---:|---:|
+| TPC-DS/TPC-H table `.csv.gz` | 32 | 61 | 25.454s | 11.363s |
+| TPC-DS suite SQL | 1 | 3 | 25.454s | 11.363s |
+| TPC-H suite SQL | 1 | 3 | 7.582s | 29.235s |
+| `identity.sql` | 1 | 2 | 2.835s | 33.982s |
+| Exact single-owner fixture | 27 | 1 | 2.003–3.963s | 32.854–34.814s |
+
 Across the 30 sample patches and 683 public val1–14 patches there are exactly
 zero `GIT binary patch`, `Binary files ... differ`, `copy from`, or `copy to`
 sections. Answer-free public applicability and packed marginal are therefore
@@ -99,11 +121,12 @@ it. `pkgutil` walks only package directories; README references are not rendered
 by a collected test. Exact-preimage, same-path, unchanged-`100644` content
 replacement is therefore inert.
 
-Recommended parser hardening for that prototype:
+Parser hardening implemented in this isolated prototype:
 
 1. bind both `Binary files` marker paths to the diff paths;
-2. require a structurally valid `literal`/`delta` header and payload for
-   `GIT binary patch`;
+2. decode Git base85, enforce line sizes/alphabet, inflate both zlib streams,
+   bind declared lengths, validate delta instructions and cross-check
+   forward/reverse old/new sizes;
 3. reject a second index or structural header after the marker; and
 4. continue requiring one marker, full preimage, changed new blob, no hunks,
    no CRLF/no-newline marker and no copy/rename/mode metadata.
@@ -113,9 +136,10 @@ Recommended parser hardening for that prototype:
 Independently certified existing in-place replacements may stack by unioning
 their reader sets. An inert `sqlglot.png` section contributes no owners and can
 stack with a certified fixture section. Every section must validate; one
-unknown section falls back through the ordinary global logic. The prototype in
-this branch accepts one section only, keeping integration mechanics out of the
-research boundary.
+unknown section falls back through the ordinary global logic. The per-section
+parser accepts exactly one section. `fixture_binary_union` accepts a nonempty
+list only when every member certifies, rejects duplicate paths and unions the
+reader sets.
 
 Copy/add/delete/move cannot yet stack safely. A copy leaves its source intact
 and adds the destination name; without a complete destination-directory and
@@ -127,10 +151,13 @@ remain global.
 `binary_copy_patch.py` is default-off and disconnected from `selector.py`. It
 requires exact full blob preimage, changed new blob, regular mode, same normalized
 path, one binary marker, no textual/structural metadata, pinned-path membership,
-model identity and valid reader indices.
+model identity and valid reader indices. Literal chunks additionally bind
+their actual Git blob hashes to the index line; delta chunks are structurally
+validated and size-bound in both directions.
 
-Nine focused tests cover both binary encodings, complete TPC class expansion,
-copy/rename/add/delete/mode attacks, symlink/gitlink/text/mixed sections,
-quoted/traversal/absolute/backslash/path mismatches, unknown assets, malformed
-payload, preimage/new-blob/mode tampering, model corruption and the default-off
-kill switch. `py_compile` and `git diff --check` pass.
+Sixteen focused tests cover both binary encodings, base85/zlib/literal/delta
+malformation, complete TPC expansion, safe union and duplicate rejection,
+copy/rename/add/delete/move/mode attacks, symlink/gitlink/text/mixed sections,
+quoted/traversal/absolute/backslash/marker-path mismatches, unknown assets,
+preimage/new-blob/payload/mode/profile tampering, model corruption and the
+default-off kill switch. `py_compile` and `git diff --check` pass.
