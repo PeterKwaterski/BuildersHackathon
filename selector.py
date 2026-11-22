@@ -78,6 +78,7 @@ CODE_OBSERVER = re.compile(
 NEW_MODULE_PATH = re.compile(
     r"sqlglot(?:/[A-Za-z_][A-Za-z0-9_]*)*/[A-Za-z_][A-Za-z0-9_]*\.py\Z"
 )
+NEW_TEST_MODULE_PATH = re.compile(r"tests/test_[A-Za-z_][A-Za-z0-9_]*\.py\Z")
 PROCESS_SERIALIZATION_FILES = {"sqlglot/serde.py"}
 _PINNED_SOURCES = None
 _SOURCE_TREES = {}
@@ -3078,6 +3079,81 @@ def isolated_new_module_indices(
     return set(profile["r"])
 
 
+def isolated_new_test_indices(
+    changes: list[dict],
+    test_file_indices: dict[str, set[int]] | None,
+    discovery_profile: dict | None,
+) -> set[int] | None:
+    """Prove one fresh test module is outside the exact numbered roster."""
+    if (
+        test_file_indices is None
+        or len(changes) != 1
+        or not isinstance(discovery_profile, dict)
+        or discovery_profile.get("d") != NEW_MODULE_SOURCE_SHA256
+        or discovery_profile.get("p") != NEW_MODULE_PROFILE_SHA256
+        or _stable_json_digest(discovery_profile.get("i"))
+        != NEW_MODULE_INVENTORY_SHA256
+    ):
+        return None
+    change = changes[0]
+    path = change.get("new")
+    if (
+        change.get("old") != "/dev/null"
+        or type(path) is not str
+        or not NEW_TEST_MODULE_PATH.fullmatch(path)
+        or change.get("diff_old") != path
+        or change.get("diff_new") != path
+        or change.get("new_file_mode") != "100644"
+        or change.get("new_file_mode_count") != 1
+        or change.get("old_marker_count") != 1
+        or change.get("new_marker_count") != 1
+        or change.get("index_count") != 1
+        or not change.get("new_file_index")
+        or change.get("ordinary_file_index")
+        or change.get("structural_invalid")
+        or change.get("binary")
+        or change.get("non_lf")
+        or change.get("no_newline_marker")
+        or path in pinned_sources()
+        or path in test_file_indices
+    ):
+        return None
+    stem = Path(path).stem
+    dotted = f"tests.{stem}"
+    if any(
+        stem in source or dotted in source or path in source
+        for source in pinned_sources().values()
+    ):
+        return None
+    hunks = change.get("hunks")
+    added = change.get("added")
+    if (
+        not isinstance(hunks, list)
+        or len(hunks) != 1
+        or hunks[0].get("old_start") != 0
+        or hunks[0].get("old_count") != 0
+        or hunks[0].get("new_start") != 1
+        or not isinstance(added, list)
+        or not added
+        or hunks[0].get("new_count") != len(added)
+        or len(hunks[0].get("lines", ())) != len(added)
+        or change.get("removed")
+        or change.get("payload") != added
+        or any(marker != "+" for marker, _text in hunks[0].get("lines", ()))
+        or change.get("added_new_at")
+        != list(zip(range(1, len(added) + 1), added))
+    ):
+        return None
+    source = "\n".join(added) + "\n"
+    if len(source.encode("utf-8")) > 65_536 or "pytest_plugins" in source:
+        return None
+    try:
+        compile(source, path, "exec", dont_inherit=True)
+    except (SyntaxError, ValueError, OverflowError, MemoryError, RecursionError):
+        return None
+    return set()
+
+
 def selected_indices(
     patch: Path,
     model: dict,
@@ -3112,6 +3188,11 @@ def selected_indices(
     changes = patch_changes(patch) if parsed_changes is None else parsed_changes
     if not changes:
         return set(all_indices)
+    new_test_readers = isolated_new_test_indices(
+        changes, test_file_indices, new_module_model
+    )
+    if new_test_readers is not None:
+        return new_test_readers
     new_module_readers = (
         isolated_new_module_indices(changes, new_module_model)
         if NEW_MODULE_PROOF_ENABLED
