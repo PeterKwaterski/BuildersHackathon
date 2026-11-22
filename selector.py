@@ -41,6 +41,7 @@ ARG_TYPE_DERIVATION_MODEL = Path(__file__).with_name(
     "arg_type_derivation_model.json.gz"
 )
 CLASS_ATTRIBUTE_MODEL = Path(__file__).with_name("class_attribute_model.json.gz")
+MODULE_CONSTANT_MODEL = Path(__file__).with_name("module_constant_model.json.gz")
 FRESH_ALIAS_PROFILE = Path(__file__).with_name("fresh_alias_profile.json.gz")
 IMPORT_LINE_PROFILE = Path(__file__).with_name("import_line_profile.json.gz")
 IMPORT_LINE_PROFILE_SHA256 = "7c95117f6c5bee66bf0931a1ee2668367f1d9f937df41066efd07fa7a6fe2a74"
@@ -2174,6 +2175,180 @@ def class_attribute_edit(
     return set(readers)
 
 
+def module_constant_edit(
+    change: dict,
+    path: str,
+    constant_model: dict,
+) -> set[int] | None:
+    """Narrow one immutable module-literal edit to its traced readers."""
+    data = constant_model.get("d", {})
+    entries = data.get(path) if isinstance(data, dict) else None
+    source = pinned_sources().get(path)
+    changed = patched_source(change, path)
+    if (
+        not entries
+        or source is None
+        or changed is None
+        or any(COMMENT_DIRECTIVE.search(line) for line in change["payload"])
+    ):
+        return None
+    try:
+        original_tree = ast.parse(source, filename=path, type_comments=True)
+        changed_tree = ast.parse(changed, filename=path, type_comments=True)
+    except (SyntaxError, ValueError):
+        return None
+
+    def assignments(tree: ast.Module):
+        result = {}
+        for statement in tree.body:
+            if isinstance(statement, ast.Assign):
+                targets = statement.targets
+            elif isinstance(statement, ast.AnnAssign):
+                targets = [statement.target]
+            else:
+                continue
+            if len(targets) == 1 and isinstance(targets[0], ast.Name):
+                name = targets[0].id
+                result[name] = statement if name not in result else None
+        return result
+
+    original_assignments = assignments(original_tree)
+    changed_assignments = assignments(changed_tree)
+    candidates = []
+    for entry in entries:
+        if not isinstance(entry, list) or len(entry) not in {6, 7}:
+            continue
+        if len(entry) == 6:
+            start, end, name, value_dump, state, readers = entry
+            kind = "literal"
+        else:
+            start, end, name, value_dump, kind, state, readers = entry
+        if (
+            type(start) is not int
+            or type(end) is not int
+            or type(name) is not str
+            or type(value_dump) is not str
+            or type(kind) is not str
+        ):
+            continue
+        if state != "safe" or not any(start <= line <= end for line in change["lines"]):
+            continue
+        statement = original_assignments.get(name)
+        if (
+            statement is None
+            or statement.lineno != start
+            or (statement.end_lineno or statement.lineno) != end
+            or ast.dump(statement.value, include_attributes=False) != value_dump
+        ):
+            continue
+        if kind not in {"literal", "class-tuple", "re-pattern"}:
+            continue
+        candidates.append((name, statement, kind, readers))
+    if len(candidates) != 1:
+        return None
+    name, original_statement, kind, readers = candidates[0]
+    changed_statement = changed_assignments.get(name)
+    if changed_statement is None:
+        return None
+    def safe_literal(value) -> bool:
+        return type(value) in (type(None), bool, int, float, complex, str, bytes) or (
+            type(value) is tuple and all(safe_literal(item) for item in value)
+        )
+
+    if kind == "literal":
+        try:
+            old_literal = ast.literal_eval(original_statement.value)
+            new_literal = ast.literal_eval(changed_statement.value)
+        except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+            return None
+        valid_values = (
+            safe_literal(old_literal)
+            and safe_literal(new_literal)
+            and type(old_literal) is type(new_literal)
+            and old_literal != new_literal
+        )
+    elif kind == "class-tuple":
+        old_value = original_statement.value
+        new_value = changed_statement.value
+        old_names = (
+            [item.id for item in old_value.elts]
+            if isinstance(old_value, ast.Tuple)
+            and old_value.elts
+            and all(isinstance(item, ast.Name) for item in old_value.elts)
+            else None
+        )
+        new_names = (
+            [item.id for item in new_value.elts]
+            if isinstance(new_value, ast.Tuple)
+            and new_value.elts
+            and all(isinstance(item, ast.Name) for item in new_value.elts)
+            else None
+        )
+        valid_values = bool(
+            old_names
+            and new_names
+            and old_names != new_names
+            and set(new_names) <= set(old_names)
+        )
+    else:
+        def pattern_call(node: ast.AST):
+            if (
+                not isinstance(node, ast.Call)
+                or not isinstance(node.func, ast.Attribute)
+                or not isinstance(node.func.value, ast.Name)
+                or node.func.value.id != "re"
+                or node.func.attr != "compile"
+                or node.keywords
+                or not 1 <= len(node.args) <= 2
+                or not isinstance(node.args[0], ast.Constant)
+                or type(node.args[0].value) is not str
+                or (len(node.args) == 2 and not (
+                    isinstance(node.args[1], ast.Constant)
+                    and type(node.args[1].value) is int
+                ))
+            ):
+                return None
+            return node.args[0].value, node.args[1].value if len(node.args) == 2 else 0
+
+        old_pattern = pattern_call(original_statement.value)
+        new_pattern = pattern_call(changed_statement.value)
+        valid_values = (
+            old_pattern is not None
+            and new_pattern is not None
+            and old_pattern != new_pattern
+            and len(new_pattern[0]) <= 100_000
+        )
+        if valid_values:
+            try:
+                re.compile(*new_pattern)
+            except (re.error, OverflowError, ValueError, MemoryError, RecursionError):
+                valid_values = False
+
+    if (
+        not valid_values
+        or not isinstance(readers, list)
+        or not readers
+        or any(
+            type(index) is not int
+            or index < 0
+            or index >= constant_model.get("n", 0)
+            for index in readers
+        )
+    ):
+        return None
+
+    # Erasing exactly the approved values must make the complete executable
+    # trees identical. This excludes target, annotation, type-comment,
+    # neighboring statement, and all other simultaneous changes.
+    original_statement.value = ast.Constant(value=None)
+    changed_statement.value = ast.Constant(value=None)
+    if ast.dump(original_tree, include_attributes=False) != ast.dump(
+        changed_tree, include_attributes=False
+    ):
+        return None
+    return set(readers)
+
+
 def derived_arg_types_edit(
     change: dict,
     path: str,
@@ -2528,6 +2703,7 @@ def selected_indices(
     predicate_model: dict | None = None,
     derivation_model: dict | None = None,
     attribute_model: dict | None = None,
+    constant_model: dict | None = None,
     fresh_alias_model: dict | None = None,
     none_static_profile: dict | None = None,
     binary_preimages: dict | None = None,
@@ -2669,6 +2845,12 @@ def selected_indices(
                 selected.update(attribute_indices)
                 continue
 
+        if constant_model is not None:
+            constant_indices = module_constant_edit(change, path, constant_model)
+            if constant_indices is not None:
+                selected.update(constant_indices)
+                continue
+
         entry = model["f"].get(path)
         if entry is None and new_path not in (None, "/dev/null"):
             entry = model["f"].get(new_path)
@@ -2787,6 +2969,8 @@ def main() -> None:
         derivation_model = json.load(derivation_model_file)
     with gzip.open(CLASS_ATTRIBUTE_MODEL, "rt", encoding="utf-8") as attribute_model_file:
         attribute_model = json.load(attribute_model_file)
+    with gzip.open(MODULE_CONSTANT_MODEL, "rt", encoding="utf-8") as constant_model_file:
+        constant_model = json.load(constant_model_file)
     with gzip.open(FRESH_ALIAS_PROFILE, "rt", encoding="utf-8") as fresh_alias_file:
         fresh_alias_model = json.load(fresh_alias_file)
     binary_preimages = load_preimages(
@@ -2854,6 +3038,15 @@ def main() -> None:
     ):
         attribute_model = {"d": {}}
     if (
+        not isinstance(constant_model, dict)
+        or constant_model.get("v") not in {1, 2}
+        or constant_model.get("sha") != model.get("sha")
+        or constant_model.get("n") != len(tests)
+        or constant_model.get("t") != test_digest
+        or not isinstance(constant_model.get("d"), dict)
+    ):
+        constant_model = {"d": {}}
+    if (
         fresh_alias_model.get("v") != 1
         or fresh_alias_model.get("sha") != model.get("sha")
         or fresh_alias_model.get("n") != len(tests)
@@ -2886,6 +3079,7 @@ def main() -> None:
             predicate_model,
             derivation_model,
             attribute_model,
+            constant_model,
             fresh_alias_model,
             none_static_profile,
             binary_preimages,
