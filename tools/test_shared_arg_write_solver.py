@@ -139,6 +139,7 @@ class SharedArgumentSolverTests(unittest.TestCase):
             "unknown([instance])\n",
             "getattr(instance, 'value')\n",
             "raise ValueError(instance)\n",
+            "try:\n        raise ValueError(instance)\n    except ValueError:\n        raise\n",
             "try:\n        unknown(instance)\n    except Exception:\n        pass\n",
             "alias = instance\n    for _ in ():\n        alias = None\n    unknown(alias)\n",
             "if saved:\n        alias = instance\n    else:\n        alias = None\n    unknown(alias)\n",
@@ -194,6 +195,140 @@ class SharedArgumentSolverTests(unittest.TestCase):
             "    item.set('key', True)\n"
         )[1]
         self.assertEqual(partial_return["stats"]["contained_fresh_receiver_calls"], 0)
+
+    def test_extended_alias_escape_forms_reject(self):
+        bodies = (
+            "holder = [instance]\n",
+            "holder = [value for value in [instance]]\n",
+            "holder = (alias := instance)\n",
+            "external.value = instance\n",
+            "def nested(value=instance):\n        return value\n",
+            "try:\n        return instance\n    finally:\n        saved.append(instance)\n",
+            "with manager(instance):\n        pass\n",
+            "match instance:\n        case _:\n            pass\n",
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                document = self.solve(
+                    "saved = []\n"
+                    "class Box:\n"
+                    "    def set(self, key, value):\n"
+                    "        self.value = value\n"
+                    "def identity(instance):\n"
+                    f"    {body}"
+                    "    return instance\n"
+                    "def candidate():\n"
+                    "    item = identity(Box())\n"
+                    "    item.set('key', True)\n"
+                )[1]
+                self.assertEqual(
+                    document["stats"]["contained_fresh_receiver_calls"], 0
+                )
+
+    def test_branch_join_cannot_upgrade_maybe_alias_to_identity(self):
+        variants = (
+            "saved = Box()\n",
+            "saved = None\n",
+        )
+        for declaration in variants:
+            with self.subTest(declaration=declaration):
+                document = self.solve(
+                    declaration
+                    + "class Box:\n"
+                    "    def set(self, key, value):\n"
+                    "        self.value = value\n"
+                    "def identity(instance, flag):\n"
+                    "    if flag:\n"
+                    "        alias = instance\n"
+                    "    else:\n"
+                    "        alias = saved\n"
+                    "    return alias\n"
+                    "def candidate(flag):\n"
+                    "    item = identity(Box(), flag)\n"
+                    "    item.set('key', True)\n"
+                )[1]
+                self.assertEqual(
+                    document["stats"]["contained_fresh_receiver_calls"], 0
+                )
+
+        loop_bodies = (
+            "while flag:\n        alias = saved\n        break\n",
+            "for _ in (1,):\n        alias = saved\n        continue\n",
+        )
+        for body in loop_bodies:
+            with self.subTest(body=body):
+                document = self.solve(
+                    "saved = Box()\n"
+                    "class Box:\n"
+                    "    def set(self, key, value):\n"
+                    "        self.value = value\n"
+                    "def identity(instance, flag):\n"
+                    "    alias = instance\n"
+                    f"    {body}"
+                    "    return alias\n"
+                    "def candidate(flag):\n"
+                    "    item = identity(Box(), flag)\n"
+                    "    item.set('key', True)\n"
+                )[1]
+                self.assertEqual(
+                    document["stats"]["contained_fresh_receiver_calls"], 0
+                )
+
+    def test_conditional_fresh_assignment_does_not_dominate_later_call(self):
+        document = self.solve(
+            "class Box:\n"
+            "    def set(self, key, value):\n"
+            "        self.value = value\n"
+            "def candidate(shared, flag):\n"
+            "    item = shared\n"
+            "    if flag:\n"
+            "        item = Box()\n"
+            "        return\n"
+            "    item.set('key', True)\n"
+        )[1]
+        self.assertEqual(document["stats"]["contained_fresh_receiver_calls"], 0)
+
+    def test_attribute_protocol_and_descriptor_escapes_reject(self):
+        variants = (
+            "saved = []\n"
+            "class Box:\n"
+            "    def __getattribute__(self, name):\n"
+            "        saved.append(self)\n"
+            "        return object.__getattribute__(self, name)\n"
+            "    def set(self, key, value):\n"
+            "        self.value = value\n",
+            "saved = []\n"
+            "class Base:\n"
+            "    def __getattr__(self, name):\n"
+            "        saved.append(self)\n"
+            "        return None\n"
+            "class Box(Base):\n"
+            "    def set(self, key, value):\n"
+            "        self.value = value\n",
+            "saved = []\n"
+            "class Leak:\n"
+            "    def __get__(self, instance, owner):\n"
+            "        saved.append(instance)\n"
+            "        return None\n"
+            "class Box:\n"
+            "    value = Leak()\n"
+            "    def set(self, key, value):\n"
+            "        self.value = value\n",
+        )
+        for classes in variants:
+            with self.subTest(classes=classes):
+                document = self.solve(
+                    classes
+                    + "def identity(instance):\n"
+                    "    instance.value\n"
+                    "    return instance\n"
+                    "def candidate():\n"
+                    "    item = identity(Box())\n"
+                    "    item.set('key', True)\n"
+                )[1]
+                self.assertEqual(
+                    document["stats"]["contained_fresh_receiver_calls"], 0
+                )
     def test_alias_and_container_escape(self):
         _, _, functions = self.solve(
             "def sink(value):\n"

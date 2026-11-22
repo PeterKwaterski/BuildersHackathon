@@ -515,6 +515,44 @@ class OwnershipAnalyzer:
             or self.index.method(*domain, "__len__")
         )
 
+    def _plain_attribute_read(self, domain: tuple[str, str], name: str) -> bool:
+        if (
+            self.index.method(*domain, "__getattribute__")
+            or self.index.method(*domain, "__getattr__")
+        ):
+            return False
+        pending = [domain]
+        seen = set()
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                return False
+            seen.add(current)
+            cls = self.index.classes.get(current)
+            if cls is None:
+                return False
+            for statement in cls.body:
+                if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                    continue
+                targets = (
+                    statement.targets
+                    if isinstance(statement, ast.Assign)
+                    else [statement.target]
+                )
+                if any(
+                    isinstance(target, ast.Name) and target.id == name
+                    for target in targets
+                ) and not isinstance(statement.value, ast.Constant):
+                    return False
+            for base in self.index.class_bases.get(current, ()):
+                candidates = self.index.global_classes_by_name.get(
+                    base.rsplit(".", 1)[-1], ()
+                )
+                if len(candidates) != 1:
+                    return False
+                pending.append(candidates[0])
+        return True
+
     def _known(
         self,
         node: ast.AST | None,
@@ -805,6 +843,8 @@ class OwnershipAnalyzer:
         if isinstance(node, ast.Name) and node.id in aliases:
             return OwnershipResult(True, identity=True)
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in aliases:
+            if not self._plain_attribute_read(domain, node.attr):
+                return self._reject("dynamic-attribute-read")
             methods = self.index.method(*domain, node.attr)
             if methods:
                 if len(methods) != 1:
@@ -910,9 +950,12 @@ class OwnershipAnalyzer:
                     set(state[0]), dict(state[1]), dict(state[2]), set(state[3])
                 )
 
-            def join(states) -> None:
+            def join(states) -> bool:
                 nonlocal aliases, values, fields, written
-                aliases = set().union(*(state[0] for state in states))
+                if any(state[0] != states[0][0] for state in states[1:]):
+                    self.failures["ambiguous-alias-join"] += 1
+                    return False
+                aliases = set(states[0][0])
                 common_values = set.intersection(*(set(state[1]) for state in states))
                 values = {
                     name: states[0][1][name]
@@ -934,6 +977,7 @@ class OwnershipAnalyzer:
                     )
                 }
                 written = set().union(*(state[3] for state in states))
+                return True
 
             for statement in statements:
                 if isinstance(statement, ast.If):
@@ -951,7 +995,8 @@ class OwnershipAnalyzer:
                             self.failures["unsafe-branch"] += 1
                             return False
                         exits.append(snapshot())
-                    join(exits)
+                    if not join(exits):
+                        return False
                     continue
                 if isinstance(statement, ast.While):
                     condition = self._known(statement.test, aliases, values, domain, fields)
@@ -965,7 +1010,8 @@ class OwnershipAnalyzer:
                         self.failures["unsafe-while-body"] += 1
                         return False
                     after = snapshot()
-                    join([before, after])
+                    if not join([before, after]):
+                        return False
                     continue
                 if isinstance(statement, (ast.For, ast.AsyncFor)):
                     owned_field_iteration = (
@@ -986,7 +1032,8 @@ class OwnershipAnalyzer:
                         self.failures["unsafe-loop-body"] += 1
                         return False
                     after = snapshot()
-                    join([before, after])
+                    if not join([before, after]):
+                        return False
                     continue
                 if isinstance(statement, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
                     value = statement.value
@@ -1483,20 +1530,23 @@ class SharedArgumentSolver:
         for info in self.index.functions.values():
             if not info.fresh_calls:
                 continue
-            assignments: dict[str, ast.AST] = {}
+            assignments: dict[str, list[tuple[ast.AST, ast.AST]]] = defaultdict(list)
             calls: dict[tuple[int, int], ast.Call] = {}
             for node in immediate_nodes(info.node):
                 if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
                     targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                     for target in targets:
                         if isinstance(target, ast.Name):
-                            assignments[target.id] = node.value
+                            assignments[target.id].append((node, node.value))
                 elif isinstance(node, ast.Call):
                     calls[(node.lineno, node.col_offset)] = node
             for line, column, receiver, target_key in sorted(info.fresh_calls):
                 call = calls.get((line, column))
-                value = assignments.get(receiver)
-                if call is None or value is None:
+                receiver_assignments = assignments.get(receiver, ())
+                if call is None or len(receiver_assignments) != 1:
+                    continue
+                assignment, value = receiver_assignments[0]
+                if assignment.lineno >= call.lineno:
                     continue
                 owned = self._owned_expression(analyzer, info, value)
                 if owned is None:
