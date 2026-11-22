@@ -42,6 +42,9 @@ ARG_TYPE_DERIVATION_MODEL = Path(__file__).with_name(
 )
 CLASS_ATTRIBUTE_MODEL = Path(__file__).with_name("class_attribute_model.json.gz")
 FRESH_ALIAS_PROFILE = Path(__file__).with_name("fresh_alias_profile.json.gz")
+IMPORT_LINE_PROFILE = Path(__file__).with_name("import_line_profile.json.gz")
+IMPORT_LINE_PROFILE_SHA256 = "7c95117f6c5bee66bf0931a1ee2668367f1d9f937df41066efd07fa7a6fe2a74"
+IMPORT_PARSER_LINE_COUNT = 11_017
 SHARED_ARG_WRITE_MODEL = Path(__file__).with_name("shared_arg_write_model.json.gz")
 BINARY_FIXTURE_PREIMAGES = Path(__file__).with_name("fixture_binary_preimages.json.gz")
 TPC_ENTRY_PROVENANCE = Path(__file__).with_name("tpc_entry_reader_provenance.json.gz")
@@ -57,6 +60,10 @@ MAX_WORKERS = 8
 WORKER_COST_MS = 2_000
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 COMMENT_DIRECTIVE = re.compile(r"(?i)(coding\s*[:=]|type:|noqa|pragma|fmt:|pyright|mypy)")
+CODE_OBSERVER = re.compile(
+    r"(?i)(__code__|\bco_[a-z0-9_]+|\binspect\b|\bdis\b|\bgetsource\b|"
+    r"\bmarshal\b|\blinecache\b|read_text\s*\(|read_bytes\s*\()"
+)
 NEW_MODULE_PATH = re.compile(
     r"sqlglot(?:/[A-Za-z_][A-Za-z0-9_]*)*/[A-Za-z_][A-Za-z0-9_]*\.py\Z"
 )
@@ -67,6 +74,7 @@ _SOURCE_INDEXES = {}
 _IMPORT_DEFINITION_RANGES = {}
 _SOURCE_CODE = {}
 _INIT_SUBCLASS_ATTRIBUTES = None
+_PARSER_METHOD_CALL_ONLY = None
 
 # Independent review found no opaque package-discovery path reachable from the
 # pinned test manifest and locked pure-Python runtime. Every source-visible
@@ -1235,6 +1243,186 @@ def preserves_function_bindings(change: dict, path: str, line: int) -> bool:
     )
 
 
+def parser_methods_are_call_only() -> bool:
+    """Census package references to the two admitted private parser methods."""
+    global _PARSER_METHOD_CALL_ONLY
+    if _PARSER_METHOD_CALL_ONLY is not None:
+        return _PARSER_METHOD_CALL_ONLY
+    targets = {"_parse_case", "_parse_window"}
+    for path, source in pinned_sources().items():
+        if not any(target in source for target in targets):
+            continue
+        tree = source_tree(path)
+        index = _source_index(path)
+        if tree is None or index is None:
+            _PARSER_METHOD_CALL_ONLY = False
+            return False
+        for node in index.nodes:
+            if isinstance(node, ast.Constant) and node.value in targets:
+                _PARSER_METHOD_CALL_ONLY = False
+                return False
+            if not isinstance(node, ast.Attribute) or node.attr not in targets:
+                continue
+            parent = index.parents.get(node)
+            if not isinstance(parent, ast.Call) or parent.func is not node:
+                _PARSER_METHOD_CALL_ONLY = False
+                return False
+    _PARSER_METHOD_CALL_ONLY = True
+    return True
+
+
+def deferred_import_body_edit(change: dict, path: str, profile: dict | None) -> bool:
+    """Prove a one-line body replacement did not execute during collection.
+
+    The admitted owners have no decorator/metaclass/code-introspection channel
+    in the authenticated source closure. Normal plus synchronous line readers
+    remain selected by the ordinary coverage model.
+    """
+    if profile is None or path != "sqlglot/parser.py":
+        return False
+    files = profile.get("files")
+    if not isinstance(files, dict) or not isinstance(files.get(path), list):
+        return False
+    if (
+        change.get("old") != path
+        or change.get("new") != path
+        or change.get("diff_old") != path
+        or change.get("diff_new") != path
+        or change.get("new_file_mode_count")
+        or change.get("structural_invalid")
+        or change.get("non_lf")
+        or any(
+            "#" in source
+            or COMMENT_DIRECTIVE.search(source)
+            or CODE_OBSERVER.search(source)
+            for source in (*change.get("removed", ()), *change.get("added", ()))
+        )
+        or len(change.get("removed", ())) != 1
+        or len(change.get("added", ())) != 1
+        or len(change.get("lines", ())) != 1
+        or len(change.get("added_new_at", ())) != 1
+    ):
+        return False
+    line = next(iter(change["lines"]))
+    if change["added_new_at"][0][0] != line:
+        return False
+
+    tree = source_tree(path)
+    index = _source_index(path)
+    if tree is None or index is None:
+        return False
+    functions = [
+        node
+        for node in index.functions
+        if node.lineno <= line <= (node.end_lineno or node.lineno)
+    ]
+    if not functions:
+        return False
+    function = min(
+        functions,
+        key=lambda node: ((node.end_lineno or node.lineno) - node.lineno, node.col_offset),
+    )
+    owners = []
+    owner = function
+    while owner is not tree:
+        if isinstance(owner, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            owners.append(owner.name)
+        owner = index.parents.get(owner)
+        if owner is None:
+            return False
+    owner_path = tuple(reversed(owners))
+    allowed = {
+        ("sqlglot/parser.py", ("Parser", "_parse_case")),
+        ("sqlglot/parser.py", ("Parser", "_parse_window")),
+    }
+    if (path, owner_path) not in allowed or not parser_methods_are_call_only():
+        return False
+    if function.decorator_list:
+        return False
+    if not precise_coverage_line(path, line) or not preserves_function_bindings(
+        change, path, line
+    ):
+        return False
+    return line not in files[path]
+
+
+def load_import_line_profile(
+    path: Path,
+    artifact_digest: str,
+    source_sha: str,
+    test_digest: str,
+    tests: list[dict],
+) -> dict | None:
+    """Load and fully authenticate the exact import-line profile."""
+    try:
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != artifact_digest:
+            return None
+        profile = json.loads(gzip.decompress(raw))
+    except (
+        OSError,
+        EOFError,
+        UnicodeError,
+        json.JSONDecodeError,
+        ValueError,
+        TypeError,
+        RecursionError,
+        MemoryError,
+    ):
+        return None
+    expected_modules = sorted(
+        {
+            test["file"].removesuffix(".py").replace("/", ".")
+            for test in tests
+        }
+    )
+    if not (
+        isinstance(profile, dict)
+        and set(profile)
+        == {
+            "v",
+            "sha",
+            "n",
+            "t",
+            "order",
+            "modules",
+            "target_test_references",
+            "parser_test_observers",
+            "files",
+            "failures",
+        }
+        and profile.get("v") == 2
+        and profile.get("sha") == source_sha
+        and profile.get("n") == len(tests)
+        and profile.get("t") == test_digest
+        and profile.get("order") == "fresh-process-per-module"
+        and profile.get("modules") == expected_modules
+        and profile.get("target_test_references") == []
+        and profile.get("parser_test_observers") == []
+        and profile.get("failures") == []
+        and isinstance(profile.get("files"), dict)
+        and set(profile["files"]) == {"sqlglot/parser.py"}
+    ):
+        return None
+    for relative, lines in profile["files"].items():
+        if (
+            not isinstance(relative, str)
+            or relative != "sqlglot/parser.py"
+            or not isinstance(lines, list)
+            or any(
+                not isinstance(line, int)
+                or isinstance(line, bool)
+                or line < 1
+                or line > IMPORT_PARSER_LINE_COUNT
+                for line in lines
+            )
+            or lines != sorted(lines)
+            or len(lines) != len(set(lines))
+        ):
+            return None
+    return profile
+
+
 def inert_comment_addition(change: dict, path: str) -> bool:
     """Prove an added comment leaves the complete executable AST unchanged."""
     if not comment_only_addition(change) or any(
@@ -2346,6 +2534,7 @@ def selected_indices(
     tpc_entry_provenance: dict | None = None,
     new_module_model: dict | None = None,
     parsed_changes: list[dict] | None = None,
+    import_line_profile: dict | None = None,
 ) -> set[int]:
     if BINARY_FIXTURE_ENABLED and binary_preimages is not None:
         try:
@@ -2533,16 +2722,21 @@ def selected_indices(
             selected.update(mapped_set(model, entry["f"]))
 
         expression_hazard = import_expression_hazard(change, path, model.get("h"))
+        deferred_import_body = deferred_import_body_edit(
+            change, path, import_line_profile
+        )
         if (
-            not fresh_receiver_contained
+            not deferred_import_body
+            and not fresh_receiver_contained
             and any(
                 start <= line <= end
                 for start, end in entry.get("i", ())
                 for line in changed_lines
             )
-        ) or any(
-            import_definition_line(path, line) for line in changed_lines
-        ) or expression_hazard:
+        ) or (
+            not deferred_import_body
+            and any(import_definition_line(path, line) for line in changed_lines)
+        ) or (not deferred_import_body and expression_hazard):
             importer_set = model.get("r", {}).get(path)
             if importer_set is not None:
                 selected.update(mapped_set(model, importer_set))
@@ -2618,6 +2812,13 @@ def main() -> None:
     test_digest = hashlib.sha256(
         "\0".join(test["id"] for test in tests).encode("utf-8")
     ).hexdigest()
+    import_line_profile = load_import_line_profile(
+        IMPORT_LINE_PROFILE,
+        IMPORT_LINE_PROFILE_SHA256,
+        model.get("sha"),
+        test_digest,
+        tests,
+    )
     none_static_profile = (
         load_none_static_profile(test_digest, len(tests))
         if model.get("t") == [test["id"] for test in tests]
@@ -2691,6 +2892,7 @@ def main() -> None:
             tpc_entry_provenance,
             new_module_model,
             changes,
+            import_line_profile=import_line_profile,
         )
         selected = [mapped_tests[index] for index in indices if mapped_tests[index] is not None]
         selected.extend(unmapped_tests)

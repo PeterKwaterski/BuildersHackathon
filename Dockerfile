@@ -32,6 +32,7 @@ COPY predicate_profile.json.gz /app/predicate_profile.json.gz
 COPY arg_type_derivation_model.json.gz /app/arg_type_derivation_model.json.gz
 COPY class_attribute_model.json.gz /app/class_attribute_model.json.gz
 COPY fresh_alias_profile.json.gz /app/fresh_alias_profile.json.gz
+COPY import_line_profile.json.gz /app/import_line_profile.json.gz
 COPY shared_arg_write_model.json.gz /app/shared_arg_write_model.json.gz
 COPY none_static_profile.json.gz /app/none_static_profile.json.gz
 COPY fixture_binary_preimages.json.gz /app/fixture_binary_preimages.json.gz
