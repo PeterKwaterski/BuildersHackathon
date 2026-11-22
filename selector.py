@@ -42,6 +42,9 @@ ARG_TYPE_DERIVATION_MODEL = Path(__file__).with_name(
 )
 CLASS_ATTRIBUTE_MODEL = Path(__file__).with_name("class_attribute_model.json.gz")
 MODULE_CONSTANT_MODEL = Path(__file__).with_name("module_constant_model.json.gz")
+# Filled only after the final provenance-bearing v3 artifact is rebuilt twice
+# to identical bytes. An empty or mismatched pin disables this proof family.
+MODULE_CONSTANT_MODEL_SHA256 = "d5b09e7a548935758dcbada36ec14cc170a24518e43fdf964d33f556ddb3b1f8"
 FRESH_ALIAS_PROFILE = Path(__file__).with_name("fresh_alias_profile.json.gz")
 IMPORT_LINE_PROFILE = Path(__file__).with_name("import_line_profile.json.gz")
 IMPORT_LINE_PROFILE_SHA256 = "7c95117f6c5bee66bf0931a1ee2668367f1d9f937df41066efd07fa7a6fe2a74"
@@ -2349,6 +2352,167 @@ def module_constant_edit(
     return set(readers)
 
 
+def valid_module_constant_model(
+    document: object,
+    source_sha: object,
+    test_digest: str,
+    test_count: int,
+) -> bool:
+    """Recursively validate the authenticated module-constant artifact."""
+
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"d", "n", "p", "sha", "t", "v"}
+        or document.get("v") != 3
+        or document.get("sha") != source_sha
+        or document.get("n") != test_count
+        or document.get("t") != test_digest
+    ):
+        return False
+
+    def digest(value: object) -> bool:
+        return (
+            type(value) is str
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+        )
+
+    provenance = document.get("p")
+    if not isinstance(provenance, dict) or set(provenance) != {
+        "builder", "collector", "evidence", "source_inventory"
+    }:
+        return False
+    if not all(digest(provenance.get(key)) for key in (
+        "builder", "collector", "source_inventory"
+    )):
+        return False
+    evidence = provenance.get("evidence")
+    if not isinstance(evidence, dict) or set(evidence) != {
+        "normal", "synchronous-worker"
+    }:
+        return False
+    for mode, record in evidence.items():
+        if (
+            not isinstance(record, dict)
+            or set(record) != {
+                "child_logs", "completed_tasks", "manifest",
+                "standalone_child_logs", "task_workers", "trace"
+            }
+            or not digest(record.get("manifest"))
+            or not digest(record.get("trace"))
+            or type(record.get("child_logs")) is not int
+            or type(record.get("completed_tasks")) is not int
+            or type(record.get("standalone_child_logs")) is not int
+            or type(record.get("task_workers")) is not int
+            or record["child_logs"] < 1
+            or record["completed_tasks"] < 0
+            or record["standalone_child_logs"] != 1
+            or record["task_workers"] < 0
+            or record["child_logs"]
+            != record["task_workers"] + record["standalone_child_logs"]
+            or (mode == "normal" and (
+                record["completed_tasks"] <= 0 or record["task_workers"] <= 0
+            ))
+            or (mode == "synchronous-worker" and (
+                record["completed_tasks"] != 0 or record["task_workers"] != 0
+            ))
+        ):
+            return False
+
+    data = document.get("d")
+    if (
+        not isinstance(data, dict)
+        or not data
+        or any(type(path) is not str for path in data)
+        or list(data) != sorted(data)
+    ):
+        return False
+    known_sources = pinned_sources()
+    states = {
+        "safe", "mutable", "unobserved", "import-read", "static-unsafe",
+        "incomplete",
+    }
+    kinds = {"literal", "class-tuple", "re-pattern"}
+    entry_count = 0
+    for path, entries in data.items():
+        if (
+            type(path) is not str
+            or path not in known_sources
+            or not path.startswith("sqlglot/")
+            or not path.endswith(".py")
+            or "\\" in path
+            or any(part in {"", ".", ".."} for part in path.split("/"))
+            or not isinstance(entries, list)
+            or not entries
+        ):
+            return False
+        prior = None
+        seen = set()
+        for entry in entries:
+            if not isinstance(entry, list) or len(entry) != 7:
+                return False
+            start, end, name, value_dump, kind, state, readers = entry
+            key = (start, name)
+            if (
+                type(start) is not int
+                or type(end) is not int
+                or start <= 0
+                or end < start
+                or type(name) is not str
+                or not name.isidentifier()
+                or type(value_dump) is not str
+                or not value_dump
+                or type(kind) is not str
+                or kind not in kinds
+                or type(state) is not str
+                or state not in states
+                or not isinstance(readers, list)
+                or any(type(index) is not int for index in readers)
+                or readers != sorted(set(readers))
+                or any(
+                    type(index) is not int or index < 0 or index >= test_count
+                    for index in readers
+                )
+                or (state == "safe") != bool(readers)
+                or key in seen
+                or (prior is not None and key < prior)
+            ):
+                return False
+            seen.add(key)
+            prior = key
+            entry_count += 1
+    return entry_count > 0
+
+
+def load_module_constant_model(
+    path: Path = MODULE_CONSTANT_MODEL,
+    expected_sha256: str = MODULE_CONSTANT_MODEL_SHA256,
+) -> dict:
+    """Authenticate compressed bytes before parsing any artifact content."""
+    try:
+        raw = path.read_bytes()
+        if (
+            not expected_sha256
+            or hashlib.sha256(raw).hexdigest() != expected_sha256
+        ):
+            raise ValueError("module-constant artifact digest mismatch")
+        document = json.loads(gzip.decompress(raw).decode("utf-8"))
+        if not isinstance(document, dict):
+            raise TypeError("module-constant artifact is not an object")
+        return document
+    except (
+        OSError,
+        EOFError,
+        UnicodeError,
+        json.JSONDecodeError,
+        ValueError,
+        TypeError,
+        RecursionError,
+        MemoryError,
+    ):
+        return {"d": {}}
+
+
 def derived_arg_types_edit(
     change: dict,
     path: str,
@@ -2969,8 +3133,7 @@ def main() -> None:
         derivation_model = json.load(derivation_model_file)
     with gzip.open(CLASS_ATTRIBUTE_MODEL, "rt", encoding="utf-8") as attribute_model_file:
         attribute_model = json.load(attribute_model_file)
-    with gzip.open(MODULE_CONSTANT_MODEL, "rt", encoding="utf-8") as constant_model_file:
-        constant_model = json.load(constant_model_file)
+    constant_model = load_module_constant_model()
     with gzip.open(FRESH_ALIAS_PROFILE, "rt", encoding="utf-8") as fresh_alias_file:
         fresh_alias_model = json.load(fresh_alias_file)
     binary_preimages = load_preimages(
@@ -3037,13 +3200,8 @@ def main() -> None:
         or attribute_model.get("t") != test_digest
     ):
         attribute_model = {"d": {}}
-    if (
-        not isinstance(constant_model, dict)
-        or constant_model.get("v") not in {1, 2}
-        or constant_model.get("sha") != model.get("sha")
-        or constant_model.get("n") != len(tests)
-        or constant_model.get("t") != test_digest
-        or not isinstance(constant_model.get("d"), dict)
+    if not valid_module_constant_model(
+        constant_model, model.get("sha"), test_digest, len(tests)
     ):
         constant_model = {"d": {}}
     if (

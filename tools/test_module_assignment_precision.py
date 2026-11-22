@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import ast
+import copy
+import gzip
+import hashlib
+import json
 import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from build_module_constant_model import static_unsafe
+from build_module_constant_model import static_unsafe, validated_trace_document
 from collect_module_constant_reads import (
     DERIVED_CLASS_ALIASES_ENABLED,
     TRACKER_TEMPLATE,
+    collector_code_digest,
     class_alias_labels,
     import_maps,
     instrument_file,
@@ -20,6 +28,7 @@ from collect_module_constant_reads import (
     source_candidate_kinds,
     source_candidates,
 )
+import selector
 
 
 class ModuleAssignmentPrecisionTests(unittest.TestCase):
@@ -50,6 +59,145 @@ class ModuleAssignmentPrecisionTests(unittest.TestCase):
         self.assertEqual(qualified[("sqlglot", "VALUE")], label)
         self.assertEqual(modules["sqlglot.user"]["exp"], "sqlglot")
         self.assertNotIn("exp", values["sqlglot.user"])
+
+    def test_public_module_alias_reexport_reaches_qualified_reader(self):
+        self.write("sqlglot/expressions.py", "VALUE = ('a', 'b')\n")
+        self.write(
+            "sqlglot/__init__.py",
+            "from sqlglot import expressions as exp\n",
+        )
+        self.write(
+            "sqlglot/user.py",
+            "from sqlglot import exp\n\ndef read():\n    return exp.VALUE\n",
+        )
+
+        candidates = source_candidates(self.source)
+        values, modules, qualified = import_maps(parsed_files(self.source), candidates)
+        label = candidates[("sqlglot.expressions", "VALUE")]
+
+        self.assertEqual(modules["sqlglot.user"]["exp"], "sqlglot.expressions")
+        self.assertEqual(qualified[("sqlglot.expressions", "VALUE")], label)
+        self.assertNotIn("exp", values["sqlglot.user"])
+
+    def test_trace_task_ledger_rejects_missing_or_unattributed_work(self):
+        normal = {
+            "v": 3,
+            "events": {"label": ["tests/test_owner.py::test_owner"]},
+            "tasks": {
+                "completed": ["task-1"],
+                "submitted": ["task-1"],
+                "workers": {"task-1": [123]},
+            },
+        }
+        events, tasks = validated_trace_document(normal, "normal")
+        self.assertEqual(events, normal["events"])
+        self.assertEqual(tasks, normal["tasks"])
+
+        for mutate in (
+            lambda value: value["tasks"]["completed"].clear(),
+            lambda value: value["tasks"]["workers"].clear(),
+            lambda value: value["tasks"]["workers"]["task-1"].clear(),
+            lambda value: value.update(v=2),
+            lambda value: value.update(extra=True),
+        ):
+            broken = copy.deepcopy(normal)
+            mutate(broken)
+            with self.assertRaises(SystemExit):
+                validated_trace_document(broken, "normal")
+
+        synchronous = copy.deepcopy(normal)
+        synchronous["tasks"] = {"completed": [], "submitted": [], "workers": {}}
+        validated_trace_document(synchronous, "synchronous-worker")
+        with self.assertRaises(SystemExit):
+            validated_trace_document(synchronous, "normal")
+
+    def test_collector_digest_binds_synchronous_rewrite_dependency(self):
+        self.write("collect_module_constant_reads.py", "collector-v1\n")
+        self.write("collect_dict_access.py", "rewrite-v1\n")
+        first = collector_code_digest(self.source)
+        self.write("collect_dict_access.py", "rewrite-v2\n")
+        self.assertNotEqual(first, collector_code_digest(self.source))
+
+    def test_module_model_recursive_validation_rejects_forged_body(self):
+        digest = "a" * 64
+        document = {
+            "v": 3,
+            "sha": "source",
+            "n": 2,
+            "t": "tests",
+            "p": {
+                "builder": digest,
+                "collector": digest,
+                "source_inventory": digest,
+                "evidence": {
+                    "normal": {
+                        "child_logs": 3,
+                        "completed_tasks": 2,
+                        "manifest": digest,
+                        "standalone_child_logs": 1,
+                        "task_workers": 2,
+                        "trace": digest,
+                    },
+                    "synchronous-worker": {
+                        "child_logs": 1,
+                        "completed_tasks": 0,
+                        "manifest": digest,
+                        "standalone_child_logs": 1,
+                        "task_workers": 0,
+                        "trace": digest,
+                    },
+                },
+            },
+            "d": {
+                "sqlglot/executor/env.py": [
+                    [182, 182, "FIRST", "Constant(value=0)", "literal", "safe", [0]]
+                ]
+            },
+        }
+        self.assertTrue(
+            selector.valid_module_constant_model(document, "source", "tests", 2)
+        )
+        mutations = (
+            lambda value: value["d"].update({1: []}),
+            lambda value: value["d"].update({"sqlglot/executor/env.py": 1}),
+            lambda value: value["d"]["sqlglot/executor/env.py"][0].append("extra"),
+            lambda value: value["d"]["sqlglot/executor/env.py"][0][6].append(0),
+            lambda value: value["d"]["sqlglot/executor/env.py"][0][6].append("0"),
+            lambda value: value["d"]["sqlglot/executor/env.py"][0].__setitem__(4, []),
+            lambda value: value["d"]["sqlglot/executor/env.py"][0].__setitem__(5, []),
+            lambda value: value["d"]["sqlglot/executor/env.py"][0].__setitem__(5, "bogus"),
+            lambda value: value["p"]["evidence"]["normal"].__setitem__(
+                "completed_tasks", 0
+            ),
+            lambda value: value.update(extra=True),
+        )
+        for mutate in mutations:
+            broken = copy.deepcopy(document)
+            mutate(broken)
+            self.assertFalse(
+                selector.valid_module_constant_model(broken, "source", "tests", 2)
+            )
+
+    def test_module_model_loader_rejects_raw_and_recompressed_tampering(self):
+        document = {"d": {"path": [[1, 1, "NAME", "Constant(value=1)"]]}}
+        raw = gzip.compress(
+            json.dumps(document, sort_keys=True, separators=(",", ":")).encode(),
+            mtime=0,
+        )
+        path = self.source / "model.json.gz"
+        path.write_bytes(raw)
+        digest = hashlib.sha256(raw).hexdigest()
+        self.assertEqual(selector.load_module_constant_model(path, digest), document)
+
+        for tampered in (
+            raw[:-1] + bytes([raw[-1] ^ 1]),
+            raw + b"append",
+            gzip.compress(b'{"d":{}}', mtime=0),
+        ):
+            path.write_bytes(tampered)
+            self.assertEqual(
+                selector.load_module_constant_model(path, digest), {"d": {}}
+            )
 
     def test_star_reexport_honors_static_dunder_all(self):
         self.write(
@@ -131,6 +279,260 @@ class ModuleAssignmentPrecisionTests(unittest.TestCase):
                     candidates[("sqlglot.core", "VALUE")],
                     static_unsafe(self.source, candidates),
                 )
+
+    def test_sys_modules_membership_does_not_observe_module_values(self):
+        self.write("sqlglot/core.py", "VALUE = 1\n")
+        self.write("sqlglot/__init__.py", "")
+        self.write(
+            "sqlglot/user.py",
+            "import sys\nLOADED = 'sqlglot.core' in sys.modules\n",
+        )
+        candidates = source_candidates(self.source)
+
+        self.assertNotIn(
+            candidates[("sqlglot.core", "VALUE")],
+            static_unsafe(self.source, candidates),
+        )
+
+        self.write(
+            "sqlglot/user.py",
+            "import sys\nEQUAL = {} == sys.modules\n",
+        )
+        candidates = source_candidates(self.source)
+        self.assertIn(
+            candidates[("sqlglot.core", "VALUE")],
+            static_unsafe(self.source, candidates),
+        )
+
+    def test_dynamic_import_literal_prefix_poison_is_package_bounded(self):
+        self.write("sqlglot/core.py", "CORE_VALUE = 1\n")
+        self.write("sqlglot/dialects/a.py", "DIALECT_VALUE = 2\n")
+        self.write("sqlglot/__init__.py", "")
+        self.write("sqlglot/dialects/__init__.py", "")
+        self.write(
+            "sqlglot/user.py",
+            "import importlib\n"
+            "def load(name):\n"
+            "    return importlib.import_module(f'sqlglot.dialects.{name}')\n",
+        )
+        candidates = source_candidates(self.source)
+        unsafe = static_unsafe(self.source, candidates)
+
+        self.assertIn(candidates[("sqlglot.dialects.a", "DIALECT_VALUE")], unsafe)
+        self.assertNotIn(candidates[("sqlglot.core", "CORE_VALUE")], unsafe)
+
+    def test_dynamic_import_poison_follows_reexport_surface(self):
+        self.write("sqlglot/core.py", "VALUE = 1\n")
+        self.write("sqlglot/__init__.py", "")
+        self.write("sqlglot/dialects/__init__.py", "")
+        self.write("sqlglot/dialects/a.py", "from sqlglot.core import VALUE\n")
+        self.write(
+            "sqlglot/user.py",
+            "import importlib\n"
+            "def load(name):\n"
+            "    return importlib.import_module(f'sqlglot.dialects.{name}')\n",
+        )
+        candidates = source_candidates(self.source)
+
+        self.assertIn(
+            candidates[("sqlglot.core", "VALUE")],
+            static_unsafe(self.source, candidates),
+        )
+
+    def test_aliased_dynamic_import_fails_closed(self):
+        self.write("sqlglot/core.py", "VALUE = 1\n")
+        self.write("sqlglot/__init__.py", "")
+        self.write(
+            "sqlglot/user.py",
+            "import importlib as il\n"
+            "loader = il.import_module\n"
+            "def load(name):\n"
+            "    return loader(name)\n",
+        )
+        candidates = source_candidates(self.source)
+
+        self.assertIn(
+            candidates[("sqlglot.core", "VALUE")],
+            static_unsafe(self.source, candidates),
+        )
+
+    def test_unreachable_unnumbered_test_is_outside_authenticated_threat_surface(self):
+        self.write("sqlglot/core.py", "VALUE = 1\n")
+        self.write("sqlglot/__init__.py", "")
+        self.write(
+            "tests/test_docs.py",
+            "import importlib\n"
+            "def test_docs(name):\n"
+            "    return importlib.import_module(name)\n",
+        )
+        candidates = source_candidates(self.source)
+        label = candidates[("sqlglot.core", "VALUE")]
+
+        self.assertIn(label, static_unsafe(self.source, candidates))
+        self.assertNotIn(
+            label,
+            static_unsafe(self.source, candidates, {"tests/test_other.py"}),
+        )
+
+    def test_imported_support_module_remains_in_numbered_threat_surface(self):
+        self.write("sqlglot/core.py", "VALUE = 1\n")
+        self.write("sqlglot/__init__.py", "")
+        self.write(
+            "tests/helpers.py",
+            "import importlib\n"
+            "def acquire(name):\n"
+            "    return importlib.import_module(name)\n",
+        )
+        self.write(
+            "tests/test_owner.py",
+            "from tests.helpers import acquire\n"
+            "def test_owner():\n"
+            "    return acquire('sqlglot.core')\n",
+        )
+        candidates = source_candidates(self.source)
+
+        self.assertIn(
+            candidates[("sqlglot.core", "VALUE")],
+            static_unsafe(
+                self.source,
+                candidates,
+                {"tests/test_owner.py"},
+            ),
+        )
+
+    def test_test_package_setup_and_nested_conftest_are_in_threat_surface(self):
+        self.write("sqlglot/core.py", "VALUE = 1\n")
+        self.write("sqlglot/__init__.py", "")
+        self.write(
+            "tests/dialects/__init__.py",
+            "import importlib\nMODULE = importlib.import_module('sqlglot.core')\n",
+        )
+        self.write(
+            "tests/dialects/conftest.py",
+            "import sys\nMODULE = sys.modules['sqlglot.core']\n",
+        )
+        self.write("tests/dialects/test_owner.py", "def test_owner(): pass\n")
+        candidates = source_candidates(self.source)
+
+        self.assertIn(
+            candidates[("sqlglot.core", "VALUE")],
+            static_unsafe(
+                self.source,
+                candidates,
+                {"tests/dialects/test_owner.py"},
+            ),
+        )
+
+    def test_pinned_exception_shape_mismatch_fails_closed(self):
+        self.write("sqlglot/core.py", "VALUE = 1\n")
+        self.write("sqlglot/__init__.py", "")
+        self.write(
+            "sqlglot/serde.py",
+            "def _load(name):\n"
+            "    module = __import__(name)\n"
+            "    return module.VALUE\n",
+        )
+        candidates = source_candidates(self.source)
+        self.assertIn(
+            candidates[("sqlglot.core", "VALUE")],
+            static_unsafe(self.source, candidates),
+        )
+
+        self.write(
+            "tests/helpers.py",
+            "def is_compiled(module):\n"
+            "    return getattr(module, 'VALUE')\n",
+        )
+        self.write(
+            "tests/test_generator.py",
+            "from tests.helpers import is_compiled\n"
+            "import sqlglot.core as _core_module\n"
+            "RESULT = is_compiled(_core_module)\n",
+        )
+        candidates = source_candidates(self.source)
+        self.assertIn(
+            candidates[("sqlglot.core", "VALUE")],
+            static_unsafe(
+                self.source,
+                candidates,
+                {"tests/test_generator.py"},
+            ),
+        )
+
+    def test_executor_environment_module_escape_requires_pinned_consumers_and_key(self):
+        self.write("sqlglot/__init__.py", "")
+        self.write("sqlglot/expressions.py", "VALUE = 1\n")
+        sources = {
+            "sqlglot/executor/env.py": (
+                "import sqlglot.expressions as exp\nENV = {'exp': exp}\n"
+            ),
+            "sqlglot/executor/python.py": "RESULT = 1\n",
+            "sqlglot/executor/context.py": "RESULT = 1\n",
+            "sqlglot/generators/python.py": "RESULT = 1\n",
+        }
+        for relative, text in sources.items():
+            self.write(relative, text)
+
+        def tree_digest(text):
+            return hashlib.sha256(
+                ast.dump(ast.parse(text), include_attributes=False).encode()
+            ).hexdigest()
+
+        hashes = {
+            "EXECUTOR_ENV_MODULE_AST_SHA256": tree_digest(
+                sources["sqlglot/executor/env.py"]
+            ),
+            "EXECUTOR_PYTHON_MODULE_AST_SHA256": tree_digest(
+                sources["sqlglot/executor/python.py"]
+            ),
+            "EXECUTOR_CONTEXT_MODULE_AST_SHA256": tree_digest(
+                sources["sqlglot/executor/context.py"]
+            ),
+            "PYTHON_GENERATOR_MODULE_AST_SHA256": tree_digest(
+                sources["sqlglot/generators/python.py"]
+            ),
+        }
+        with patch.multiple("build_module_constant_model", **hashes):
+            candidates = source_candidates(self.source)
+            label = candidates[("sqlglot.expressions", "VALUE")]
+            self.assertNotIn(label, static_unsafe(self.source, candidates))
+
+            changed = "import sqlglot.expressions as exp\nENV = {'other': exp}\n"
+            self.write("sqlglot/executor/env.py", changed)
+            hashes["EXECUTOR_ENV_MODULE_AST_SHA256"] = tree_digest(changed)
+            with patch.multiple("build_module_constant_model", **hashes):
+                candidates = source_candidates(self.source)
+                self.assertIn(label, static_unsafe(self.source, candidates))
+
+    def test_patch_object_module_escape_requires_fixed_candidate_name(self):
+        self.write("sqlglot/__init__.py", "")
+        self.write("sqlglot/expressions.py", "VALUE = 1\n")
+        self.write(
+            "tests/test_optimizer.py",
+            "import sqlglot.expressions as exp\n"
+            "from unittest.mock import patch\n"
+            "with patch.object(exp, 'column_table_names', None):\n"
+            "    pass\n",
+        )
+        candidates = source_candidates(self.source)
+        label = candidates[("sqlglot.expressions", "VALUE")]
+        self.assertNotIn(
+            label,
+            static_unsafe(self.source, candidates, {"tests/test_optimizer.py"}),
+        )
+
+        self.write(
+            "tests/test_optimizer.py",
+            "import sqlglot.expressions as exp\n"
+            "from unittest.mock import patch\n"
+            "with patch.object(exp, 'VALUE', None):\n"
+            "    pass\n",
+        )
+        candidates = source_candidates(self.source)
+        self.assertIn(
+            label,
+            static_unsafe(self.source, candidates, {"tests/test_optimizer.py"}),
+        )
 
     def test_star_import_cycle_is_static_unsafe(self):
         self.write("sqlglot/a.py", "VALUE = 1\nfrom sqlglot.b import *\n")

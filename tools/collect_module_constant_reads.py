@@ -35,6 +35,87 @@ RUNTIME_HELPERS = {
 # separate proof exists; direct module readers and class-tuple constants do not
 # depend on it.
 DERIVED_CLASS_ALIASES_ENABLED = False
+TRACE_SCHEMA_VERSION = 3
+TASK_ATTRIBUTION = "submit-wrapper-v3"
+POOL_WORKERS = 2
+
+
+def collector_code_digest(directory: Path | None = None) -> str:
+    """Bind every repository file that can change collection semantics."""
+    directory = directory or Path(__file__).parent
+    digest = hashlib.sha256()
+    for name in ("collect_module_constant_reads.py", "collect_dict_access.py"):
+        raw = (directory / name).read_bytes()
+        encoded_name = name.encode()
+        digest.update(len(encoded_name).to_bytes(4, "big"))
+        digest.update(encoded_name)
+        digest.update(len(raw).to_bytes(8, "big"))
+        digest.update(raw)
+    return digest.hexdigest()
+
+
+def source_inventory_digest(source: Path) -> str:
+    digest = hashlib.sha256()
+    for root_name in ("sqlglot", "tests"):
+        for path in sorted((source / root_name).rglob("*.py")):
+            relative = path.relative_to(source).as_posix().encode()
+            raw = path.read_bytes()
+            digest.update(len(relative).to_bytes(4, "big"))
+            digest.update(relative)
+            digest.update(len(raw).to_bytes(8, "big"))
+            digest.update(raw)
+    return digest.hexdigest()
+
+
+def validated_trace_document(document: object, mode: str) -> tuple[dict, dict]:
+    """Fail closed unless every submitted process-pool task is attributed."""
+    def sorted_unique_strings(value: object) -> bool:
+        return bool(
+            isinstance(value, list)
+            and all(type(item) is str for item in value)
+            and value == sorted(set(value))
+        )
+
+    def sorted_unique_pids(value: object) -> bool:
+        return bool(
+            isinstance(value, list)
+            and value
+            and all(type(item) is int and item > 0 for item in value)
+            and value == sorted(set(value))
+        )
+
+    if not isinstance(document, dict) or set(document) != {"events", "tasks", "v"}:
+        raise SystemExit(f"invalid {mode} trace envelope")
+    if document.get("v") != TRACE_SCHEMA_VERSION:
+        raise SystemExit(f"invalid {mode} trace schema")
+    events = document.get("events")
+    tasks = document.get("tasks")
+    if not isinstance(events, dict) or any(
+        type(label) is not str
+        or not sorted_unique_strings(owners)
+        for label, owners in events.items()
+    ):
+        raise SystemExit(f"invalid {mode} trace events")
+    if (
+        not isinstance(tasks, dict)
+        or set(tasks) != {"completed", "submitted", "workers"}
+        or not sorted_unique_strings(tasks.get("completed"))
+        or not sorted_unique_strings(tasks.get("submitted"))
+        or not isinstance(tasks.get("workers"), dict)
+        or tasks.get("completed") != tasks.get("submitted")
+        or set(tasks.get("workers", ())) != set(tasks.get("completed", ()))
+        or any(
+            type(task) is not str
+            or not sorted_unique_pids(workers)
+            for task, workers in tasks.get("workers", {}).items()
+        )
+    ):
+        raise SystemExit(f"incomplete {mode} task attribution")
+    if mode == "normal" and not tasks["submitted"]:
+        raise SystemExit("normal trace has no authenticated process-pool tasks")
+    if mode == "synchronous-worker" and tasks["submitted"]:
+        raise SystemExit("synchronous trace unexpectedly submitted process-pool tasks")
+    return events, tasks
 
 
 def arguments() -> argparse.Namespace:
@@ -431,6 +512,55 @@ def import_maps(
     exports: dict[str, dict[str, str]] = defaultdict(dict)
     modules = {module for module, _, _ in files.values() if module.startswith("sqlglot")}
     trees = {module: tree for module, _, tree in files.values()}
+    module_metadata = {
+        module: (is_package, tree)
+        for module, is_package, tree in files.values()
+        if module.startswith("sqlglot")
+    }
+
+    # A package can expose a module under a different public name, for example
+    # ``sqlglot.__init__`` binds ``expressions as exp`` and most optimizer
+    # modules later use ``from sqlglot import exp``.  Looking only for the
+    # physical ``sqlglot.exp`` submodule silently misses every qualified read
+    # through that public alias.  Resolve the final top-level import binding
+    # recursively, while rejecting cycles and ambiguous import statements.
+    module_export_cache: dict[tuple[str, str], str | None] = {}
+
+    def exported_module(
+        module: str,
+        name: str,
+        active: frozenset[tuple[str, str]] = frozenset(),
+    ) -> str | None:
+        key = module, name
+        if key in module_export_cache:
+            return module_export_cache[key]
+        if key in active or module not in module_metadata:
+            return None
+        is_package, tree = module_metadata[module]
+        binding = _last_top_level_binding(tree, name, sys.maxsize)
+        options: set[str] = set()
+        if isinstance(binding, ast.Import):
+            for alias in binding.names:
+                local = alias.asname or alias.name.split(".", 1)[0]
+                if local != name:
+                    continue
+                target = alias.name if alias.asname else alias.name.split(".", 1)[0]
+                if target in modules:
+                    options.add(target)
+        elif isinstance(binding, ast.ImportFrom):
+            target = resolve_import(module, is_package, binding.module, binding.level)
+            for alias in binding.names:
+                if alias.name == "*" or (alias.asname or alias.name) != name:
+                    continue
+                direct = f"{target}.{alias.name}" if target else alias.name
+                resolved = direct if direct in modules else exported_module(
+                    target, alias.name, active | {key}
+                )
+                if resolved is not None:
+                    options.add(resolved)
+        result = next(iter(options)) if len(options) == 1 else None
+        module_export_cache[key] = result
+        return result
     for (module, name), label in candidates.items():
         exports[module][name] = label
 
@@ -499,8 +629,13 @@ def import_maps(
                     if label is not None:
                         value_options[local].add(label)
                     submodule = f"{target}.{alias.name}" if target else alias.name
-                    if submodule in modules:
-                        module_options[local].add(submodule)
+                    resolved_module = (
+                        submodule
+                        if submodule in modules
+                        else exported_module(target, alias.name)
+                    )
+                    if resolved_module is not None:
+                        module_options[local].add(resolved_module)
             elif isinstance(statement, ast.ImportFrom):
                 target = resolve_import(module, is_package, statement.module, statement.level)
                 for name in _public_exports(trees.get(target), set(exports.get(target, ()))):
@@ -620,6 +755,7 @@ def class_alias_labels(
 TRACKER_TEMPLATE = r'''from __future__ import annotations
 
 import atexit
+import concurrent.futures
 import json
 import os
 import time
@@ -629,6 +765,11 @@ from pathlib import Path
 CURRENT_TEST = os.environ.get("BR_PARENT_TEST")
 EVENTS = defaultdict(set)
 CLASS_ALIASES = __CLASS_ALIASES__
+SUBMITTED_TASKS = set()
+COMPLETED_TASKS = set()
+TASK_WORKERS = defaultdict(set)
+TASK_SEQUENCE = 0
+ORIGINAL_PROCESS_POOL = concurrent.futures.ProcessPoolExecutor
 
 def owner():
     return CURRENT_TEST or "__NO_TEST__"
@@ -701,20 +842,71 @@ def reflect_call(function, value, *args, **kwargs):
     return function(value, *args, **kwargs)
 
 def document():
-    return {label: sorted(owners) for label, owners in sorted(EVENTS.items())}
+    return {
+        "v": 3,
+        "events": {
+            label: sorted(owners) for label, owners in sorted(EVENTS.items())
+        },
+        "tasks": {
+            "completed": sorted(COMPLETED_TASKS),
+            "submitted": sorted(SUBMITTED_TASKS),
+            "workers": {
+                task: sorted(workers) for task, workers in sorted(TASK_WORKERS.items())
+            },
+        },
+    }
 
 def write_child():
     directory = os.environ.get("MODULE_CONSTANT_CHILD_DIR")
-    if not directory or not CURRENT_TEST:
+    if (
+        not directory
+        or os.getpid() == int(os.environ.get("MODULE_CONSTANT_ROOT_PID", "-1"))
+        or (not CURRENT_TEST and not COMPLETED_TASKS)
+    ):
         return
     path = Path(directory, f"{os.getpid()}-{time.time_ns()}.json")
     temporary = path.with_suffix(".tmp")
     payload = document()
-    for owners in payload.values():
+    for owners in payload["events"].values():
         owners.append("__BR_CHILD__")
         owners.sort()
     temporary.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")))
     temporary.replace(path)
+
+def run_with_owner(function, task, task_owner, args, kwargs):
+    global CURRENT_TEST
+    prior = CURRENT_TEST
+    CURRENT_TEST = task_owner
+    if task_owner:
+        os.environ["BR_PARENT_TEST"] = task_owner
+    else:
+        os.environ.pop("BR_PARENT_TEST", None)
+    try:
+        return function(*args, **kwargs)
+    finally:
+        COMPLETED_TASKS.add(task)
+        TASK_WORKERS[task].add(os.getpid())
+        CURRENT_TEST = prior
+        if prior:
+            os.environ["BR_PARENT_TEST"] = prior
+        else:
+            os.environ.pop("BR_PARENT_TEST", None)
+
+class AttributedProcessPoolExecutor(ORIGINAL_PROCESS_POOL):
+    def __init__(self, *args, **kwargs):
+        if kwargs.get("max_workers") is None:
+            kwargs["max_workers"] = int(os.environ.get("MODULE_CONSTANT_MAX_WORKERS", "2"))
+        super().__init__(*args, **kwargs)
+
+    def submit(self, function, /, *args, **kwargs):
+        global TASK_SEQUENCE
+        task_owner = CURRENT_TEST or os.environ.get("BR_PARENT_TEST")
+        task = f"{os.getpid()}:{task_owner or '__NO_TEST__'}#{TASK_SEQUENCE}"
+        TASK_SEQUENCE += 1
+        SUBMITTED_TASKS.add(task)
+        return super().submit(run_with_owner, function, task, task_owner, args, kwargs)
+
+concurrent.futures.ProcessPoolExecutor = AttributedProcessPoolExecutor
 
 import builtins
 builtins._br_module_constant_read = read
@@ -739,11 +931,12 @@ from pathlib import Path
 import pytest
 import _br_module_constant
 
-EXECUTED = set()
+EXECUTED = []
+os.environ["MODULE_CONSTANT_ROOT_PID"] = str(os.getpid())
 
 @pytest.hookimpl(hookwrapper=True, tryfirst=True)
 def pytest_runtest_protocol(item, nextitem):
-    EXECUTED.add(item.nodeid)
+    EXECUTED.append(item.nodeid)
     _br_module_constant.CURRENT_TEST = item.nodeid
     os.environ["BR_PARENT_TEST"] = item.nodeid
     try:
@@ -754,22 +947,81 @@ def pytest_runtest_protocol(item, nextitem):
 
 def pytest_sessionfinish(session, exitstatus):
     child_count = 0
+    standalone_child_logs = 0
     for path in sorted(Path(os.environ["MODULE_CONSTANT_CHILD_DIR"]).glob("*.json")):
         child_count += 1
-        for label, owners in json.loads(path.read_text()).items():
+        document = json.loads(path.read_text())
+        if (
+            not isinstance(document, dict)
+            or set(document) != {"events", "tasks", "v"}
+            or document.get("v") != 3
+            or not isinstance(document.get("events"), dict)
+            or not isinstance(document.get("tasks"), dict)
+            or set(document["tasks"]) != {"completed", "submitted", "workers"}
+        ):
+            raise RuntimeError(f"malformed child trace: {path.name}")
+        for label, owners in document["events"].items():
+            if (
+                type(label) is not str
+                or not isinstance(owners, list)
+                or any(type(owner) is not str for owner in owners)
+                or owners != sorted(set(owners))
+            ):
+                raise RuntimeError(f"malformed child events: {path.name}")
             _br_module_constant.EVENTS[label].update(owners)
+        tasks = document["tasks"]
+        completed = tasks["completed"]
+        submitted = tasks["submitted"]
+        workers = tasks["workers"]
+        if (
+            not isinstance(completed, list)
+            or not isinstance(submitted, list)
+            or not isinstance(workers, dict)
+            or any(type(task) is not str for task in completed + submitted)
+            or completed != sorted(set(completed))
+            or submitted != sorted(set(submitted))
+            or set(workers) != set(completed)
+            or any(
+                type(task) is not str
+                or not isinstance(pids, list)
+                or any(type(pid) is not int or pid <= 0 for pid in pids)
+                or pids != sorted(set(pids))
+                or not pids
+                for task, pids in workers.items()
+            )
+        ):
+            raise RuntimeError(f"malformed child task ledger: {path.name}")
+        if not completed:
+            standalone_child_logs += 1
+        _br_module_constant.SUBMITTED_TASKS.update(submitted)
+        _br_module_constant.COMPLETED_TASKS.update(completed)
+        for task, pids in workers.items():
+            _br_module_constant.TASK_WORKERS[task].update(pids)
     encoded = json.dumps(
         _br_module_constant.document(), sort_keys=True, separators=(",", ":")
     ).encode()
     Path(os.environ["MODULE_CONSTANT_TRACE"]).write_bytes(encoded)
     Path(os.environ["MODULE_CONSTANT_MANIFEST"]).write_text(json.dumps({
         "child_logs": child_count,
+        "collector_sha256": os.environ["MODULE_CONSTANT_COLLECTOR_SHA256"],
+        "completed_tasks": len(_br_module_constant.COMPLETED_TASKS),
         "exitstatus": exitstatus,
         "mode": os.environ["MODULE_CONSTANT_MODE"],
+        "pool_workers": int(os.environ["MODULE_CONSTANT_MAX_WORKERS"]),
         "source_sha": os.environ["MODULE_CONSTANT_SOURCE_SHA"],
+        "source_inventory_digest": os.environ["MODULE_CONSTANT_SOURCE_INVENTORY"],
+        "standalone_child_logs": standalone_child_logs,
+        "submitted_tasks": len(_br_module_constant.SUBMITTED_TASKS),
+        "task_attribution": "submit-wrapper-v3",
+        "task_workers": len({
+            worker
+            for workers in _br_module_constant.TASK_WORKERS.values()
+            for worker in workers
+        }),
         "test_digest": os.environ["MODULE_CONSTANT_TEST_DIGEST"],
+        "tracker_version": 3,
         "trace_sha256": hashlib.sha256(encoded).hexdigest(),
-        "tests": sorted(EXECUTED),
+        "tests": EXECUTED,
     }, sort_keys=True, separators=(",", ":")))
 '''
 
@@ -999,6 +1251,8 @@ def main() -> None:
     output = args.output.resolve()
     manifest = args.manifest.resolve()
     validate_source(source)
+    collector_sha256 = collector_code_digest()
+    inventory_digest = source_inventory_digest(source)
     test_ids = [test["id"] for test in json.loads(args.tests.read_text())["tests"]]
     test_digest = hashlib.sha256("\0".join(test_ids).encode()).hexdigest()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -1050,9 +1304,12 @@ def main() -> None:
         environment = os.environ.copy()
         environment.update({
             "MODULE_CONSTANT_CHILD_DIR": str(children),
+            "MODULE_CONSTANT_COLLECTOR_SHA256": collector_sha256,
             "MODULE_CONSTANT_MANIFEST": str(manifest),
             "MODULE_CONSTANT_MODE": "synchronous-worker" if args.synchronous_workers else "normal",
+            "MODULE_CONSTANT_MAX_WORKERS": "2",
             "MODULE_CONSTANT_SOURCE_SHA": PINNED_SHA,
+            "MODULE_CONSTANT_SOURCE_INVENTORY": inventory_digest,
             "MODULE_CONSTANT_TEST_DIGEST": test_digest,
             "MODULE_CONSTANT_TRACE": str(output),
             "PYTHONPATH": os.pathsep.join((str(support), str(work), environment.get("PYTHONPATH", ""))).rstrip(os.pathsep),
@@ -1060,21 +1317,61 @@ def main() -> None:
         })
         command = [str(python), "-m", "pytest", "-q", "-p", "module_constant_plugin"]
         command.extend(argument for argument in args.pytest_args if argument != "--")
+        command.extend(test_ids)
         result = subprocess.run(command, cwd=work, env=environment, check=False)
         if result.returncode:
             raise SystemExit(f"pytest exited {result.returncode}; trace is not admissible")
 
     document = json.loads(manifest.read_text())
-    expected = {test["id"] for test in json.loads(args.tests.read_text())["tests"]}
-    missing = expected - set(document.get("tests", ()))
-    if document.get("exitstatus") != 0 or missing:
-        raise SystemExit(f"inadmissible suite manifest; {len(missing)} tests missing")
+    expected_manifest_keys = {
+        "child_logs", "collector_sha256", "completed_tasks", "exitstatus", "mode",
+        "pool_workers", "source_inventory_digest", "source_sha",
+        "standalone_child_logs", "submitted_tasks", "task_attribution",
+        "task_workers", "test_digest", "tests", "trace_sha256", "tracker_version",
+    }
+    expected_mode = "synchronous-worker" if args.synchronous_workers else "normal"
+    executed = document.get("tests") if isinstance(document, dict) else None
     if (
-        document.get("source_sha") != PINNED_SHA
-        or document.get("test_digest") != test_digest
-        or document.get("trace_sha256") != hashlib.sha256(output.read_bytes()).hexdigest()
+        not isinstance(document, dict)
+        or set(document) != expected_manifest_keys
+        or document.get("exitstatus") != 0
+        or executed != test_ids
     ):
-        raise SystemExit("suite manifest is not bound to its source/tests/trace")
+        missing = set(test_ids) - set(executed or ())
+        extras = set(executed or ()) - set(test_ids)
+        raise SystemExit(
+            "inadmissible exact-roster manifest; "
+            f"missing={len(missing)} extras={len(extras)} order_match={executed == test_ids}"
+        )
+    raw = output.read_bytes()
+    trace_document = json.loads(raw)
+    _events, tasks = validated_trace_document(trace_document, expected_mode)
+    worker_count = len({
+        worker for workers in tasks["workers"].values() for worker in workers
+    })
+    if (
+        document.get("mode") != expected_mode
+        or
+        document.get("source_sha") != PINNED_SHA
+        or document.get("collector_sha256") != collector_sha256
+        or document.get("source_inventory_digest") != inventory_digest
+        or document.get("test_digest") != test_digest
+        or document.get("trace_sha256") != hashlib.sha256(raw).hexdigest()
+        or document.get("tracker_version") != TRACE_SCHEMA_VERSION
+        or document.get("task_attribution") != TASK_ATTRIBUTION
+        or document.get("pool_workers") != POOL_WORKERS
+        or type(document.get("child_logs")) is not int
+        or type(document.get("standalone_child_logs")) is not int
+        or document.get("standalone_child_logs") != 1
+        or type(document.get("submitted_tasks")) is not int
+        or type(document.get("completed_tasks")) is not int
+        or type(document.get("task_workers")) is not int
+        or document.get("submitted_tasks") != len(tasks["submitted"])
+        or document.get("completed_tasks") != len(tasks["completed"])
+        or document.get("task_workers") != worker_count
+        or document.get("child_logs") != worker_count + 1
+    ):
+        raise SystemExit("suite manifest has incomplete source/trace/task binding")
     print(
         f"wrote {output} from {len(candidates)} module constants, "
         f"{instrumented} read sites, and {len(document['tests'])} tests"

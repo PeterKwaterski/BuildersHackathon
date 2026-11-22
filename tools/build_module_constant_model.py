@@ -15,6 +15,7 @@ from pathlib import Path
 from collect_module_constant_reads import (
     DERIVED_CLASS_ALIASES_ENABLED,
     class_alias_labels,
+    collector_code_digest,
     flatten_attribute,
     import_maps,
     module_name,
@@ -22,12 +23,27 @@ from collect_module_constant_reads import (
     resolve_import,
     source_candidate_kinds,
     source_candidates,
+    source_inventory_digest,
     unresolved_star_labels,
+    validated_trace_document,
 )
 
 
 PINNED_SHA = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
 CHILD_SENTINEL = "__BR_CHILD__"
+SERDE_LOAD_AST_SHA256 = "659b519ac3e700459bcf6b1b0e733dc220a9437e818dd34dbf529415b80cddaa"
+SUBCLASSES_AST_SHA256 = "86e955dd0d21cbfb62e080f063b8a87b81fb6f28a42fde3b6342c97ad2a314bf"
+IS_COMPILED_AST_SHA256 = "cee552b88c482f8a2cfbc3be92d9f7240880fd0b2426338d54517747f6a5e4c7"
+OPTIMIZER_GETATTR_AST_SHA256 = "ab523efc4eb936a0e59bdec0156428904a2107c287d32c9aa8b316cbd5ec2f14"
+TYPING_METADATA_TEST_AST_SHA256 = "52f8b14e75cc44673d10d8d926c29fb10c4bb88ed0c2829324301748c0f84e27"
+SQLGLOTC_MODULE_PATCH_AST_SHA256 = "de6305a412c38ccafb4b58c860d08a2cdbfaba1dd4590bc9e62b9845ce2d06c0"
+DIALECT_IMPORT_CACHE_TEST_AST_SHA256 = "87152a12c9abc3a5eb774a882924031a627b04f143e4c5b720a84e085473aa03"
+EXECUTOR_ENV_MODULE_AST_SHA256 = "8b0919c9be54766a3586593dcee1ccc5097ed6aef1afb568f1590ab21a5ab1f8"
+EXECUTOR_PYTHON_MODULE_AST_SHA256 = "72444981bcfa62f6a082d0fdf2ad3b8464d2b11b67088c1f7a95b9901aea8695"
+EXECUTOR_CONTEXT_MODULE_AST_SHA256 = "baa03f665069c9b814230a0448eba0ed9f7af8961beee75d2d8dfe0ab3d5dd50"
+PYTHON_GENERATOR_MODULE_AST_SHA256 = "afaf387a9833002d3b0475a721699ca27f393b90a5e5cd109e6c639364217128"
+TRACE_SCHEMA_VERSION = 3
+MODEL_SCHEMA_VERSION = 3
 
 
 def arguments() -> argparse.Namespace:
@@ -203,10 +219,94 @@ def opaque_class_aliases(
     return unsafe
 
 
-def static_unsafe(source: Path, candidates: dict[tuple[str, str], str]) -> set[str]:
+def static_unsafe(
+    source: Path,
+    candidates: dict[tuple[str, str], str],
+    test_files: set[str] | None = None,
+) -> set[str]:
     """Reject reads the source rewriter cannot owner-resolve without guessing."""
 
-    files = parsed_files(source)
+    all_files = parsed_files(source)
+    active_test_paths = set(test_files or ())
+    if test_files is not None:
+        # Pytest imports conftest/package setup independently of numbered test
+        # ownership. Numbered owner modules also import support modules such as
+        # tests.helpers which have no direct manifest IDs but execute in the
+        # same process and therefore remain part of the threat surface.
+        active_test_paths.update({"tests/__init__.py", "tests/conftest.py"})
+        path_by_module = {
+            module: path.relative_to(source).as_posix()
+            for path, (module, _is_package, _tree) in all_files.items()
+            if path.is_relative_to(source / "tests")
+        }
+        available_test_paths = set(path_by_module.values())
+
+        def add_test_ancestors(relative: str) -> bool:
+            added = False
+            parent = Path(relative).parent
+            while parent.as_posix().startswith("tests"):
+                for name in ("__init__.py", "conftest.py"):
+                    candidate = (parent / name).as_posix()
+                    if (
+                        candidate in available_test_paths
+                        and candidate not in active_test_paths
+                    ):
+                        active_test_paths.add(candidate)
+                        added = True
+                if parent.as_posix() == "tests":
+                    break
+                parent = parent.parent
+            return added
+
+        changed = True
+        while changed:
+            changed = False
+            for relative in tuple(active_test_paths):
+                changed |= add_test_ancestors(relative)
+            for path, (module, is_package, tree) in all_files.items():
+                relative = path.relative_to(source).as_posix()
+                if relative not in active_test_paths:
+                    continue
+                imported_modules = set()
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Import):
+                        imported_modules.update(alias.name for alias in node.names)
+                    elif isinstance(node, ast.ImportFrom):
+                        target = resolve_import(
+                            module, is_package, node.module, node.level
+                        )
+                        imported_modules.add(target)
+                        imported_modules.update(
+                            f"{target}.{alias.name}"
+                            for alias in node.names
+                            if alias.name != "*"
+                        )
+                    elif (
+                        isinstance(node, ast.Call)
+                        and (
+                            isinstance(node.func, ast.Name)
+                            and node.func.id == "__import__"
+                            or isinstance(node.func, ast.Attribute)
+                            and node.func.attr == "import_module"
+                        )
+                        and node.args
+                        and isinstance(node.args[0], ast.Constant)
+                        and type(node.args[0].value) is str
+                    ):
+                        imported_modules.add(node.args[0].value)
+                for imported in imported_modules:
+                    imported_path = path_by_module.get(imported)
+                    if imported_path and imported_path not in active_test_paths:
+                        active_test_paths.add(imported_path)
+                        changed = True
+
+    files = {
+        path: value
+        for path, value in all_files.items()
+        if not path.is_relative_to(source / "tests")
+        or test_files is None
+        or path.relative_to(source).as_posix() in active_test_paths
+    }
     values, module_aliases, qualified = import_maps(files, candidates)
     unsafe = set(unresolved_star_labels(files, candidates))
     aliases = (
@@ -218,6 +318,66 @@ def static_unsafe(source: Path, candidates: dict[tuple[str, str], str]) -> set[s
     labels_by_module: dict[str, dict[str, str]] = defaultdict(dict)
     for (module, name), label in candidates.items():
         labels_by_module[module][name] = label
+    export_modules = {module for module, _name in qualified}
+
+    def module_surface(module: str, descendants: bool = False) -> set[str]:
+        return {
+            label
+            for (exporter, _name), label in qualified.items()
+            if exporter == module
+            or descendants
+            and exporter.startswith(module + ".")
+        }
+
+    def function_sha(tree: ast.Module, name: str) -> str | None:
+        matches = [
+            statement
+            for statement in ast.walk(tree)
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and statement.name == name
+        ]
+        if len(matches) != 1:
+            return None
+        payload = ast.dump(matches[0], include_attributes=False).encode()
+        return hashlib.sha256(payload).hexdigest()
+
+    authenticated_functions = {
+        (module, name): function_sha(tree, name) == expected
+        for module, _is_package, tree in files.values()
+        for name, expected in (
+            (("_load", SERDE_LOAD_AST_SHA256),)
+            if module == "sqlglot.serde"
+            else (("subclasses", SUBCLASSES_AST_SHA256),)
+            if module == "sqlglot.helper"
+            else (("is_compiled", IS_COMPILED_AST_SHA256),)
+            if module == "tests.helpers"
+            else (("__getattr__", OPTIMIZER_GETATTR_AST_SHA256),)
+            if module == "sqlglot.optimizer"
+            else (("test_no_redundant_expression_metadata", TYPING_METADATA_TEST_AST_SHA256),)
+            if module == "tests.test_typing"
+            else (("setUpClass", SQLGLOTC_MODULE_PATCH_AST_SHA256),)
+            if module == "tests.test_sqlglotc"
+            else (("test_dialect_attribute_access_is_cached", DIALECT_IMPORT_CACHE_TEST_AST_SHA256),)
+            if module == "tests.test_dialect_imports"
+            else ()
+        )
+    }
+    module_ast_hashes = {
+        module: hashlib.sha256(
+            ast.dump(tree, include_attributes=False).encode()
+        ).hexdigest()
+        for module, _is_package, tree in files.values()
+    }
+    executor_module_escape_authenticated = (
+        module_ast_hashes.get("sqlglot.executor.env")
+        == EXECUTOR_ENV_MODULE_AST_SHA256
+        and module_ast_hashes.get("sqlglot.executor.python")
+        == EXECUTOR_PYTHON_MODULE_AST_SHA256
+        and module_ast_hashes.get("sqlglot.executor.context")
+        == EXECUTOR_CONTEXT_MODULE_AST_SHA256
+        and module_ast_hashes.get("sqlglot.generators.python")
+        == PYTHON_GENERATOR_MODULE_AST_SHA256
+    )
 
     dynamic_packages = {
         module
@@ -228,9 +388,8 @@ def static_unsafe(source: Path, candidates: dict[tuple[str, str], str]) -> set[s
             for statement in tree.body
         )
     }
-    for (module, _name), label in candidates.items():
-        if any(module == package or module.startswith(package + ".") for package in dynamic_packages):
-            unsafe.add(label)
+    for package in dynamic_packages:
+        unsafe.update(module_surface(package, descendants=True))
 
     # A second binding changes which object a later Name load denotes. Ignore
     # the unique candidate assignment itself; reject module bindings and
@@ -281,7 +440,7 @@ def static_unsafe(source: Path, candidates: dict[tuple[str, str], str]) -> set[s
             if len(values) > 1 or len(modules) > 1 or (values and modules):
                 unsafe.update(values)
                 for imported in modules:
-                    unsafe.update(labels_by_module.get(imported, {}).values())
+                    unsafe.update(module_surface(imported))
 
         reflective = {
             "getattr", "hasattr", "setattr", "delattr", "vars",
@@ -331,7 +490,7 @@ def static_unsafe(source: Path, candidates: dict[tuple[str, str], str]) -> set[s
             else:
                 target = resolve_import(module, is_package, node.module, node.level)
                 if any(alias.name == "*" for alias in node.names):
-                    unsafe.update(labels_by_module.get(target, {}).values())
+                    unsafe.update(module_surface(target))
                 for alias in node.names:
                     label = candidates.get((target, alias.name))
                     if label:
@@ -362,7 +521,7 @@ def static_unsafe(source: Path, candidates: dict[tuple[str, str], str]) -> set[s
                 possible.add(previous)
             if len(possible) != 1:
                 for imported in possible:
-                    unsafe.update(labels_by_module.get(imported, {}).values())
+                    unsafe.update(module_surface(imported))
                 aliases.pop(local, None)
             else:
                 aliases[local] = possible.pop()
@@ -373,6 +532,107 @@ def static_unsafe(source: Path, candidates: dict[tuple[str, str], str]) -> set[s
             for child in ast.iter_child_nodes(parent)
         }
 
+        def enclosing_function(node: ast.AST) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+            parent = parents.get(node)
+            while parent is not None:
+                if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    return parent
+                parent = parents.get(parent)
+            return None
+
+        def in_authenticated_function(node: ast.AST, name: str) -> bool:
+            owner = enclosing_function(node)
+            return bool(
+                owner is not None
+                and owner.name == name
+                and authenticated_functions.get((module, name))
+            )
+
+        def in_authenticated_scope(node: ast.AST, name: str) -> bool:
+            parent = parents.get(node)
+            while parent is not None:
+                if (
+                    isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and parent.name == name
+                ):
+                    return bool(authenticated_functions.get((module, name)))
+                parent = parents.get(parent)
+            return False
+
+        def safe_module_sink(node: ast.AST) -> bool:
+            """Recognize pinned consumers that inspect module metadata only."""
+            parent = parents.get(node)
+            compiled_executor_environment = bool(
+                executor_module_escape_authenticated
+                and module == "sqlglot.executor.env"
+                and isinstance(parent, ast.Dict)
+                and any(
+                    value is node
+                    and isinstance(key, ast.Constant)
+                    and key.value == "exp"
+                    for key, value in zip(parent.keys, parent.values)
+                )
+            )
+            fixed_patch_object = bool(
+                module == "tests.test_optimizer"
+                and isinstance(parent, ast.Call)
+                and len(parent.args) >= 2
+                and parent.args[0] is node
+                and isinstance(parent.args[1], ast.Constant)
+                and parent.args[1].value == "column_table_names"
+                and isinstance(parent.func, ast.Attribute)
+                and parent.func.attr == "object"
+                and isinstance(parent.func.value, ast.Name)
+                and parent.func.value.id == "patch"
+            )
+            metadata_only = bool(
+                module in {"tests.test_generator", "tests.test_serde"}
+                and authenticated_functions.get(("tests.helpers", "is_compiled"))
+                and isinstance(parent, ast.Call)
+                and parent.args
+                and parent.args[0] is node
+                and isinstance(parent.func, ast.Name)
+                and parent.func.id == "is_compiled"
+            )
+            return compiled_executor_environment or fixed_patch_object or metadata_only
+
+        def joined_string_prefix(node: ast.AST) -> str | None:
+            if not isinstance(node, ast.JoinedStr) or not node.values:
+                return None
+            first = node.values[0]
+            return first.value if isinstance(first, ast.Constant) and type(first.value) is str else None
+
+        importlib_names = {"importlib"}
+        dynamic_import_aliases = set()
+        for candidate in ast.walk(tree):
+            if isinstance(candidate, ast.Import):
+                importlib_names.update(
+                    alias.asname or alias.name
+                    for alias in candidate.names
+                    if alias.name == "importlib"
+                )
+            elif isinstance(candidate, ast.ImportFrom) and candidate.module == "importlib":
+                dynamic_import_aliases.update(
+                    alias.asname or alias.name
+                    for alias in candidate.names
+                    if alias.name == "import_module"
+                )
+            elif (
+                isinstance(candidate, (ast.Assign, ast.AnnAssign))
+                and isinstance(candidate.value, ast.Attribute)
+                and candidate.value.attr == "import_module"
+                and isinstance(candidate.value.value, ast.Name)
+                and candidate.value.value.id in importlib_names
+            ):
+                targets = (
+                    candidate.targets
+                    if isinstance(candidate, ast.Assign)
+                    else [candidate.target]
+                )
+                dynamic_import_aliases.update(
+                    target.id for target in targets if isinstance(target, ast.Name)
+                )
+
         def module_target(node: ast.AST) -> str | None:
             if isinstance(node, ast.Name):
                 return aliases.get(node.id)
@@ -382,18 +642,25 @@ def static_unsafe(source: Path, candidates: dict[tuple[str, str], str]) -> set[s
                     base, parts = flattened
                     imported = aliases.get(base)
                     target = ".".join((imported, *parts)) if imported else None
-                    if target in labels_by_module:
+                    if target in export_modules:
                         return target
             return None
 
         for node in ast.walk(tree):
             dynamic_import = False
+            aliased_dynamic_import = False
             imported_name = None
             if isinstance(node, ast.Call):
                 if isinstance(node.func, ast.Name) and node.func.id == "__import__":
                     dynamic_import = True
                 elif isinstance(node.func, ast.Attribute) and node.func.attr == "import_module":
                     dynamic_import = True
+                elif (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id in dynamic_import_aliases
+                ):
+                    dynamic_import = True
+                    aliased_dynamic_import = True
                 if (
                     dynamic_import
                     and node.args
@@ -402,19 +669,80 @@ def static_unsafe(source: Path, candidates: dict[tuple[str, str], str]) -> set[s
                 ):
                     imported_name = node.args[0].value
             if dynamic_import:
-                if imported_name and imported_name.startswith("sqlglot"):
-                    for target, labels in labels_by_module.items():
-                        if target == imported_name or target.startswith(imported_name + "."):
-                            unsafe.update(labels.values())
+                # ``serde._load`` can acquire any module, but its authenticated
+                # body immediately calls the requested attribute as a class.
+                # Every candidate kind in this model is provably non-class and
+                # non-callable; the runtime gate also preserves its exact type.
+                # A candidate-name request therefore raises the same type-only
+                # TypeError before either old or new value can be observed.
+                if module == "sqlglot.serde" and in_authenticated_function(node, "_load"):
+                    pass
+                elif (
+                    aliased_dynamic_import
+                    and module == "tests.test_dialect_imports"
+                    and in_authenticated_scope(
+                        node, "test_dialect_attribute_access_is_cached"
+                    )
+                ):
+                    # The pinned spy forwards only the name supplied by the
+                    # authenticated Snowflake package-attribute lookup; the
+                    # caller then reads that exact class and no other export.
+                    pass
+                # This pinned test dynamically imports typing parents and
+                # observes only their fixed ``EXPRESSION_METADATA`` attribute.
+                # Candidate names are distinct and the test source is part of
+                # the authenticated numbered roster.
+                elif module == "tests.test_typing" and in_authenticated_function(
+                    node, "test_no_redundant_expression_metadata"
+                ):
+                    pass
+                # The authenticated optimizer lazy loader is bounded to its
+                # own package by its literal table and ``__name__`` fallback.
+                elif module == "sqlglot.optimizer" and in_authenticated_function(
+                    node, "__getattr__"
+                ):
+                    unsafe.update(module_surface(module, descendants=True))
+                elif imported_name and imported_name.startswith("sqlglot"):
+                    unsafe.update(module_surface(imported_name, descendants=True))
                 elif imported_name is None:
-                    unsafe.update(candidates.values())
+                    prefix = joined_string_prefix(node.args[0]) if node.args else None
+                    if prefix and prefix.startswith("sqlglot"):
+                        unsafe.update(
+                            label
+                            for (exporter, _name), label in qualified.items()
+                            if exporter.startswith(prefix)
+                        )
+                    else:
+                        unsafe.update(candidates.values())
             if (
                 isinstance(node, ast.Attribute)
                 and node.attr == "modules"
                 and isinstance(node.value, ast.Name)
                 and node.value.id == "sys"
             ):
-                unsafe.update(candidates.values())
+                parent = parents.get(node)
+                membership_only = bool(
+                    isinstance(parent, ast.Compare)
+                    and parent.comparators
+                    and parent.comparators[-1] is node
+                    and isinstance(parent.ops[-1], (ast.In, ast.NotIn))
+                )
+                subclasses_only = (
+                    module == "sqlglot.helper"
+                    and in_authenticated_function(node, "subclasses")
+                )
+                fixed_patch_dict = (
+                    module == "tests.test_sqlglotc"
+                    and in_authenticated_function(
+                        node, "setUpClass"
+                    )
+                )
+                # Membership observes only registry keys. The authenticated
+                # subclasses helper observes candidate values only through
+                # ``inspect.isclass``; all modeled values are statically
+                # non-classes before and after an admitted edit.
+                if not (membership_only or subclasses_only or fixed_patch_dict):
+                    unsafe.update(candidates.values())
             if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
                 flattened = flatten_attribute(node)
                 if flattened:
@@ -443,6 +771,17 @@ def static_unsafe(source: Path, candidates: dict[tuple[str, str], str]) -> set[s
                 and parent.args[0] is node
             ):
                 continue
+            if safe_module_sink(node):
+                continue
+            if (
+                module == "sqlglot.serde"
+                and isinstance(node, ast.Name)
+                and node.id == "exp"
+                and in_authenticated_function(node, "_load")
+            ):
+                # The only bare module alias in the pinned loader feeds the
+                # same authenticated non-class ``getattr(... )()`` path above.
+                continue
             # Passing a module object to arbitrary Python/native code can
             # reflect over its namespace without an observable Attribute node.
             unsafe.update(
@@ -456,7 +795,7 @@ def static_unsafe(source: Path, candidates: dict[tuple[str, str], str]) -> set[s
             if isinstance(node, ast.Attribute) and node.attr == "__dict__":
                 target_module = module_target(node.value)
                 if target_module:
-                    unsafe.update(labels_by_module.get(target_module, {}).values())
+                    unsafe.update(module_surface(target_module))
             if not isinstance(node, ast.Call):
                 continue
             function = node.func.id if isinstance(node.func, ast.Name) else None
@@ -469,18 +808,18 @@ def static_unsafe(source: Path, candidates: dict[tuple[str, str], str]) -> set[s
             if function == "vars" and node.args:
                 target_module = module_target(node.args[0])
                 if target_module:
-                    unsafe.update(labels_by_module.get(target_module, {}).values())
+                    unsafe.update(module_surface(target_module))
             if function not in {"getattr", "hasattr", "setattr", "delattr"} or len(node.args) < 2:
                 continue
             target_module = module_target(node.args[0])
             if not target_module:
                 continue
             if isinstance(node.args[1], ast.Constant) and type(node.args[1].value) is str:
-                label = candidates.get((target_module, node.args[1].value))
+                label = qualified.get((target_module, node.args[1].value))
                 if label and function in {"setattr", "delattr"}:
                     unsafe.add(label)
             else:
-                unsafe.update(labels_by_module.get(target_module, {}).values())
+                unsafe.update(module_surface(target_module))
 
     return unsafe
 
@@ -500,26 +839,77 @@ def main() -> None:
     test_index = {test_id: index for index, test_id in enumerate(test_ids)}
     expected = set(test_ids)
     test_digest = hashlib.sha256("\0".join(test_ids).encode()).hexdigest()
+    collector_sha256 = collector_code_digest()
+    inventory_digest = source_inventory_digest(source)
+    expected_manifest_keys = {
+        "child_logs", "collector_sha256", "completed_tasks", "exitstatus", "mode",
+        "pool_workers", "source_inventory_digest", "source_sha",
+        "standalone_child_logs", "submitted_tasks", "task_attribution",
+        "task_workers", "test_digest", "tests", "trace_sha256", "tracker_version",
+    }
     manifests = [json.loads(path.read_text()) for path in args.manifest]
-    if {manifest.get("mode") for manifest in manifests} != {
+    if any(not isinstance(manifest, dict) for manifest in manifests) or {
+        manifest.get("mode") for manifest in manifests
+    } != {
         "normal", "synchronous-worker"
     }:
         raise SystemExit("both trace modes are required")
     documents = []
+    evidence = {}
     for path, trace_path, manifest in zip(args.manifest, args.trace, manifests):
-        missing = expected - set(manifest.get("tests", ()))
-        if manifest.get("exitstatus") != 0 or missing:
-            raise SystemExit(f"inadmissible manifest {path}: {len(missing)} tests missing")
-        if not isinstance(manifest.get("child_logs"), int) or manifest["child_logs"] <= 0:
-            raise SystemExit(f"manifest {path} lacks subprocess accounting")
+        mode = manifest.get("mode")
+        executed = manifest.get("tests")
+        if manifest.get("exitstatus") != 0 or executed != test_ids:
+            missing = expected - set(executed or ())
+            extras = set(executed or ()) - expected
+            raise SystemExit(
+                f"inadmissible exact-roster manifest {path}: "
+                f"missing={len(missing)} extras={len(extras)} "
+                f"order_match={executed == test_ids}"
+            )
         raw = trace_path.read_bytes()
         if (
-            manifest.get("source_sha") != revision
+            not isinstance(manifest, dict)
+            or set(manifest) != expected_manifest_keys
+            or manifest.get("source_sha") != revision
+            or manifest.get("collector_sha256") != collector_sha256
+            or manifest.get("source_inventory_digest") != inventory_digest
             or manifest.get("test_digest") != test_digest
             or manifest.get("trace_sha256") != hashlib.sha256(raw).hexdigest()
+            or manifest.get("tracker_version") != TRACE_SCHEMA_VERSION
+            or manifest.get("task_attribution") != "submit-wrapper-v3"
+            or manifest.get("pool_workers") != 2
+            or type(manifest.get("child_logs")) is not int
+            or type(manifest.get("standalone_child_logs")) is not int
+            or manifest.get("standalone_child_logs") != 1
+            or type(manifest.get("submitted_tasks")) is not int
+            or type(manifest.get("completed_tasks")) is not int
+            or manifest.get("submitted_tasks") != manifest.get("completed_tasks")
+            or type(manifest.get("task_workers")) is not int
         ):
             raise SystemExit(f"manifest {path} is not bound to its source/tests/trace")
-        documents.append(json.loads(raw))
+        document = json.loads(raw)
+        events, tasks = validated_trace_document(document, mode)
+        worker_count = len({
+            worker for workers in tasks["workers"].values() for worker in workers
+        })
+        if (
+            manifest["submitted_tasks"] != len(tasks["submitted"])
+            or manifest["completed_tasks"] != len(tasks["completed"])
+            or manifest["task_workers"] != worker_count
+            or manifest["child_logs"]
+            != worker_count + manifest["standalone_child_logs"]
+        ):
+            raise SystemExit(f"manifest {path} has incomplete child/task accounting")
+        documents.append(events)
+        evidence[mode] = {
+            "child_logs": manifest["child_logs"],
+            "completed_tasks": manifest["completed_tasks"],
+            "manifest": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "standalone_child_logs": manifest["standalone_child_logs"],
+            "task_workers": manifest["task_workers"],
+            "trace": hashlib.sha256(raw).hexdigest(),
+        }
 
     known_labels = set(source_candidates(source).values())
     unknown_labels = set().union(*(set(document) for document in documents)) - known_labels
@@ -536,7 +926,11 @@ def main() -> None:
         raise SystemExit(f"trace contains {len(unknown_owners)} unknown test owners")
 
     source_entries = entries(source)
-    unsafe = static_unsafe(source, source_candidates(source))
+    unsafe = static_unsafe(
+        source,
+        source_candidates(source),
+        {test_id.split("::", 1)[0] for test_id in test_ids},
+    )
     profile: dict[str, list[list]] = defaultdict(list)
     states = defaultdict(int)
     for relative, _module, statement, name, label, kind, immutable in source_entries:
@@ -570,6 +964,8 @@ def main() -> None:
         else:
             state = "safe"
         readers = sorted(test_index[owner] for owner in owners if owner in test_index)
+        if state != "safe":
+            readers = []
         profile[relative].append([
             statement.lineno,
             statement.end_lineno or statement.lineno,
@@ -588,9 +984,15 @@ def main() -> None:
     payload = {
         "d": ordered,
         "n": len(test_ids),
+        "p": {
+            "builder": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "collector": collector_sha256,
+            "evidence": {mode: evidence[mode] for mode in sorted(evidence)},
+            "source_inventory": inventory_digest,
+        },
         "sha": revision,
         "t": test_digest,
-        "v": 2,
+        "v": MODEL_SCHEMA_VERSION,
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     args.output.write_bytes(gzip.compress(raw, compresslevel=9, mtime=0))
