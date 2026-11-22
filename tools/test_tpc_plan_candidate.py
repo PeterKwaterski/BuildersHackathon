@@ -177,6 +177,55 @@ class TpcPlanCandidateTests(unittest.TestCase):
         self.assert_patch_applies(patch)
         self.assertFalse(selector.tpc_function_docstring_only(patch))
 
+    def test_censused_map_property_docstring_addition_is_accepted(self) -> None:
+        patch = self.patch(
+            """diff --git a/sqlglot/expressions/array.py b/sqlglot/expressions/array.py
+--- a/sqlglot/expressions/array.py
++++ b/sqlglot/expressions/array.py
+@@ -316,4 +316,5 @@ class Map(Expression, Func):
+     @property
+     def values(self) -> list[Expr]:
++        \"\"\"Added docstring.\"\"\"
+         values = self.args.get("values")
+         return values.expressions if values else []
+"""
+        )
+        self.assert_patch_applies(patch)
+        self.assertTrue(selector.map_values_property_docstring_only(patch))
+
+    def test_map_property_docstring_plus_behavior_is_rejected(self) -> None:
+        patch = self.patch(
+            """diff --git a/sqlglot/expressions/array.py b/sqlglot/expressions/array.py
+--- a/sqlglot/expressions/array.py
++++ b/sqlglot/expressions/array.py
+@@ -316,4 +316,5 @@ class Map(Expression, Func):
+     @property
+     def values(self) -> list[Expr]:
++        \"\"\"Added docstring.\"\"\"
+-        values = self.args.get("values")
++        values = self.args.get("keys")
+         return values.expressions if values else []
+"""
+        )
+        self.assert_patch_applies(patch)
+        self.assertFalse(selector.map_values_property_docstring_only(patch))
+
+    def test_uncensused_property_docstring_addition_is_rejected(self) -> None:
+        patch = self.patch(
+            """diff --git a/sqlglot/expressions/array.py b/sqlglot/expressions/array.py
+--- a/sqlglot/expressions/array.py
++++ b/sqlglot/expressions/array.py
+@@ -311,4 +311,5 @@ class Map(Expression, Func):
+     @property
+     def keys(self) -> list[Expr]:
++        \"\"\"Added docstring.\"\"\"
+         keys = self.args.get("keys")
+         return keys.expressions if keys else []
+"""
+        )
+        self.assert_patch_applies(patch)
+        self.assertFalse(selector.map_values_property_docstring_only(patch))
+
     def test_typing_module_docstring_is_rejected(self) -> None:
         patch = self.patch(
             """diff --git a/sqlglot/typing/__init__.py b/sqlglot/typing/__init__.py

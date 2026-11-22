@@ -322,6 +322,98 @@ def tpc_function_docstring_only(patch: Path) -> bool:
     )
 
 
+def map_values_property_docstring_only(patch: Path) -> bool:
+    """Prove an added docstring changes only the censused ``Map.values`` property."""
+    try:
+        if patch.stat().st_size > 65_536:
+            return False
+        changes = patch_changes(patch)
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return False
+    if len(changes) != 1:
+        return False
+    change = changes[0]
+    path = change.get("old")
+    if (
+        path != "sqlglot/expressions/array.py"
+        or change.get("new") != path
+        or change.get("diff_old") != path
+        or change.get("diff_new") != path
+        or change.get("new_file_mode_count")
+        or change.get("structural_invalid")
+        or change.get("non_lf")
+        or any(COMMENT_DIRECTIVE.search(line) for line in change.get("payload", ()))
+    ):
+        return False
+    original = pinned_sources().get(path)
+    prospective = patched_source(change, path)
+    if original is None or prospective is None:
+        return False
+    try:
+        old_tree = ast.parse(original, filename=path, type_comments=True)
+        new_tree = ast.parse(prospective, filename=path, type_comments=True)
+    except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError):
+        return False
+
+    def target(tree: ast.Module) -> ast.FunctionDef | None:
+        owners = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "Map"
+        ]
+        if len(owners) != 1:
+            return None
+        owner = owners[0]
+        if (
+            [ast.dump(base, include_attributes=False) for base in owner.bases]
+            != ["Name(id='Expression', ctx=Load())", "Name(id='Func', ctx=Load())"]
+            or owner.keywords
+            or owner.decorator_list
+        ):
+            return None
+        methods = [
+            node
+            for node in owner.body
+            if isinstance(node, ast.FunctionDef) and node.name == "values"
+        ]
+        if len(methods) != 1:
+            return None
+        method = methods[0]
+        if (
+            len(method.decorator_list) != 1
+            or not isinstance(method.decorator_list[0], ast.Name)
+            or method.decorator_list[0].id != "property"
+        ):
+            return None
+        return method
+
+    old_method = target(old_tree)
+    new_method = target(new_tree)
+    if old_method is None or new_method is None:
+        return False
+    old_doc = ast.get_docstring(old_method, clean=False)
+    new_doc = ast.get_docstring(new_method, clean=False)
+    if (
+        old_doc is not None
+        or new_doc is None
+        or not new_doc
+        or new_doc.isidentifier()
+        or (
+            new_doc.isascii()
+            and all(character.isalnum() or character == "_" for character in new_doc)
+        )
+        or not new_method.body
+        or not isinstance(new_method.body[0], ast.Expr)
+        or not isinstance(new_method.body[0].value, ast.Constant)
+        or not isinstance(new_method.body[0].value.value, str)
+    ):
+        return False
+    del new_method.body[0]
+    return ast.dump(old_tree, include_attributes=False) == ast.dump(
+        new_tree, include_attributes=False
+    )
+
+
 def patch_changes(patch: Path) -> list[dict]:
     """Return each changed path and its affected line anchors in the base tree."""
     changes: list[dict] = []
@@ -2620,7 +2712,8 @@ def main() -> None:
                 "patch": patch,
                 "selected": selected,
                 "prospective_saving": prospective_saving,
-                "docstring_only": tpc_function_docstring_only(patch),
+                "docstring_only": tpc_function_docstring_only(patch)
+                or map_values_property_docstring_only(patch),
                 "eligible": prospective_saving > 16_000
                 and tpc_plan_patch_eligible(patch, changes),
                 "fixture_change": fixture_change,
@@ -2637,9 +2730,9 @@ def main() -> None:
     for index in execution_order:
         job = jobs[index]
         if job["docstring_only"]:
-            # The pinned numbered roster contains no doctest/docstring reader.
-            # A whole-module census also finds no optimizer function __doc__ or
-            # code-constant observer, so the executable outcome is unchanged.
+            # The pinned numbered roster contains no relevant doctest,
+            # docstring, property-fget, source, or code-constant observer for
+            # either narrowly authenticated docstring family.
             job["selected"] = list(unmapped_tests)
         elif job["eligible"]:
             selected = job["selected"]
