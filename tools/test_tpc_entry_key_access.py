@@ -1,7 +1,9 @@
 import gzip
 import hashlib
 import json
+import tempfile
 import unittest
+from pathlib import Path
 
 import selector
 import tpc_entry_key_access as entry
@@ -10,6 +12,8 @@ import tpc_entry_key_access as entry
 MODEL = json.load(gzip.open("selector_model.json.gz", "rt"))
 TEST_IDS = MODEL["t"]
 SOURCE = selector.pinned_sources()[entry.PATH]
+ROOT = Path(__file__).resolve().parents[1]
+PROVENANCE = json.load(gzip.open(ROOT / "tpc_entry_reader_provenance.json.gz", "rt"))
 
 
 def changed(old: str, new: str, count: int = 1) -> str:
@@ -25,7 +29,7 @@ class TpcEntryKeyAccessTest(unittest.TestCase):
             edit,
             entry.EntryEdit("TPCH_SCHEMA", "lineitem", "l_orderkey", "bigint", "int"),
         )
-        selected = entry.readers(entry.PATH, SOURCE, patched, TEST_IDS)
+        selected = entry.readers(entry.PATH, SOURCE, patched, TEST_IDS, PROVENANCE)
         executor = {
             index for index, test_id in enumerate(TEST_IDS)
             if test_id.startswith("tests/test_executor.py::TestExecutor::")
@@ -36,7 +40,7 @@ class TpcEntryKeyAccessTest(unittest.TestCase):
 
     def test_exact_tpcds_leaf_selects_corresponding_optimizer(self):
         patched = changed('"cs_sold_date_sk": "bigint"', '"cs_sold_date_sk": "int"')
-        selected = entry.readers(entry.PATH, SOURCE, patched, TEST_IDS)
+        selected = entry.readers(entry.PATH, SOURCE, patched, TEST_IDS, PROVENANCE)
         self.assertIn(
             TEST_IDS.index("tests/test_optimizer.py::TestOptimizer::test_tpcds"), selected
         )
@@ -90,8 +94,28 @@ class TpcEntryKeyAccessTest(unittest.TestCase):
         patched = changed('"l_orderkey": "bigint"', '"l_orderkey": "int"')
         self.assertIsNone(entry.classify("tests/other.py", SOURCE, patched))
         self.assertIsNone(entry.classify(entry.PATH, SOURCE + "\n", patched + "\n"))
-        self.assertIsNone(entry.readers(entry.PATH, SOURCE, patched, TEST_IDS[:-1]))
-        self.assertFalse(entry.FEATURE_ENABLED)
+        self.assertIsNone(entry.readers(entry.PATH, SOURCE, patched, TEST_IDS[:-1], PROVENANCE))
+        self.assertTrue(entry.FEATURE_ENABLED)
+
+    def test_authenticated_provenance_loader_and_tamper(self):
+        self.assertEqual(
+            entry.load_provenance(
+                ROOT / "tpc_entry_reader_provenance.json.gz",
+                ROOT / "selector_model.json.gz",
+                MODEL,
+                TEST_IDS,
+            ),
+            PROVENANCE,
+        )
+        tampered = dict(PROVENANCE)
+        tampered["owners"] = {**PROVENANCE["owners"], "TPCH_SCHEMA": []}
+        self.assertIsNone(entry.valid_provenance(tampered, MODEL, TEST_IDS))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "profile.json.gz"
+            path.write_bytes((ROOT / "tpc_entry_reader_provenance.json.gz").read_bytes() + b"x")
+            self.assertIsNone(
+                entry.load_provenance(path, ROOT / "selector_model.json.gz", MODEL, TEST_IDS)
+            )
 
     def test_provenance_closes_import_name_reflection_and_collected_graph(self):
         document = json.load(gzip.open("tpc_entry_reader_provenance.json.gz", "rt"))

@@ -14,9 +14,9 @@ TPCH tables and 425 columns across 24 TPCDS tables.
 
 The current candidate and current zero-reader model both fall back to all
 1,620 tests / 36.817s for this patch class. The exact gross marginal is therefore
-**11.363s per applicable patch** beyond both current mechanisms. This branch is
-default-off and disconnected. It does not change candidate/main, use answers,
-run Docker, push or submit.
+**11.363s per applicable patch** beyond both current mechanisms. The original
+research checkpoint was default-off and disconnected; the isolated integration
+is documented in `tools/TPC_ENTRY_INTEGRATION.md`.
 
 ## Exact prospective patch language
 
@@ -140,6 +140,6 @@ artifact or answer data was used.
 Seven focused tests cover TPCH/TPCDS acceptance and exact 61-owner attribution;
 multiple values; key/order/shape/table mutations; aliases/calls/f-strings/
 unpacks/duplicates; comments/imports/reassignment/class/persistent side effects;
-and path/source/manifest/default-off tampering. `py_compile` and
+and path/source/manifest/feature-state tampering. `py_compile` and
 `git diff --check` pass. The provenance builder is deterministic and
 answer-free.

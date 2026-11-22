@@ -1,18 +1,25 @@
-"""Default-off prospective certificate for one pinned TPC schema leaf edit."""
+"""Authenticated certificate for one pinned TPC schema leaf edit."""
 
 from __future__ import annotations
 
 import ast
+import gzip
 import hashlib
+import json
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
 
-FEATURE_ENABLED = False
+FEATURE_ENABLED = True
 PATH = "tests/helpers.py"
 PINNED_REVISION = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
 HELPERS_SHA256 = "c0dc285fccd1b8bee4a451f5962118fe771de005843b56e3af4c7136f74c3ed3"
 TEST_IDS_SHA256 = "31a019981e19c3d1b18d929066da7e118fcf3d57696a360f7b9d31ce3a87bc89"
+SELECTOR_MODEL_SHA256 = "d61c504e9a4a1006217e6702e1c6f05c04846b3dd5a09ec5572523fd8b2cb382"
+PROVENANCE_SHA256 = "5e1049132f3c88793fed8d0fed7a12c76e541cd1dce2598b668e1d88ec25eaf4"
+PROFILE_SHA256 = "0d3b6fdc2ca925e10528e362e44a38a1232db404d4d429fbe6ca859d0bce5c30"
+TRACKED_INDEX_SHA256 = "a2f99e795d6c15564829485f6e761f28922ba471613097d8c41227dd2bb91ca6"
 SCHEMAS = {
     "TPCH_SCHEMA": "tests/test_optimizer.py::TestOptimizer::test_tpch",
     "TPCDS_SCHEMA": "tests/test_optimizer.py::TestOptimizer::test_tpcds",
@@ -147,7 +154,11 @@ def classify(path: str, original_source: str, changed_source: str) -> EntryEdit 
 
 
 def readers(
-    path: str, original_source: str, changed_source: str, test_ids: list[str]
+    path: str,
+    original_source: str,
+    changed_source: str,
+    test_ids: list[str],
+    provenance: dict,
 ) -> set[int] | None:
     edit = classify(path, original_source, changed_source)
     if (
@@ -155,16 +166,98 @@ def readers(
         or type(test_ids) is not list
         or any(type(test_id) is not str for test_id in test_ids)
         or hashlib.sha256("\0".join(test_ids).encode()).hexdigest() != TEST_IDS_SHA256
+        or valid_provenance(provenance, {}, test_ids, check_model=False) is None
     ):
         return None
     optimizer_id = SCHEMAS[edit.schema]
     if test_ids.count(optimizer_id) != 1:
         return None
-    selected = {
+    expected = {
         index for index, test_id in enumerate(test_ids)
         if test_id.startswith("tests/test_executor.py::TestExecutor::")
     }
-    if len(selected) != 60:
+    if len(expected) != 60:
         return None
-    selected.add(test_ids.index(optimizer_id))
-    return selected
+    expected.add(test_ids.index(optimizer_id))
+    owners = provenance["owners"].get(edit.schema)
+    if owners != sorted(expected):
+        return None
+    return expected
+
+
+def valid_provenance(
+    document: object,
+    model: dict,
+    test_ids: list[str],
+    *,
+    check_model: bool = True,
+) -> dict | None:
+    expected_keys = {
+        "v", "revision", "model_sha256", "test_id_sha256", "source_hashes",
+        "tracked_index_sha256", "events", "collected_files", "tracked_file_count",
+        "tracked_python_count", "text_references", "uncollected_reader_imports",
+        "owners", "fixtures", "profile_sha256",
+    }
+    if (
+        not isinstance(document, dict)
+        or set(document) != expected_keys
+        or type(test_ids) is not list
+        or any(type(test_id) is not str for test_id in test_ids)
+        or document.get("v") != 1
+        or document.get("revision") != PINNED_REVISION
+        or document.get("model_sha256") != SELECTOR_MODEL_SHA256
+        or document.get("test_id_sha256") != TEST_IDS_SHA256
+        or document.get("profile_sha256") != PROFILE_SHA256
+        or document.get("tracked_index_sha256") != TRACKED_INDEX_SHA256
+        or document.get("tracked_file_count") != 365
+        or document.get("tracked_python_count") != 258
+        or document.get("uncollected_reader_imports") != []
+        or not isinstance(document.get("source_hashes"), dict)
+        or len(document["source_hashes"]) != 258
+        or document["source_hashes"].get(PATH) != HELPERS_SHA256
+        or hashlib.sha256("\0".join(test_ids).encode()).hexdigest() != TEST_IDS_SHA256
+    ):
+        return None
+    if check_model and (
+        not isinstance(model, dict)
+        or model.get("sha") != PINNED_REVISION
+        or model.get("t") != test_ids
+        or not isinstance(model.get("x"), dict)
+        or not isinstance(model.get("z"), list)
+    ):
+        return None
+    unsigned = {key: document[key] for key in document if key != "profile_sha256"}
+    if hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest() != PROFILE_SHA256:
+        return None
+    owners = document.get("owners")
+    if not isinstance(owners, dict) or set(owners) != set(SCHEMAS):
+        return None
+    for schema, optimizer_id in SCHEMAS.items():
+        expected = {
+            index for index, test_id in enumerate(test_ids)
+            if test_id.startswith("tests/test_executor.py::TestExecutor::")
+        }
+        if test_ids.count(optimizer_id) != 1:
+            return None
+        expected.add(test_ids.index(optimizer_id))
+        if owners.get(schema) != sorted(expected):
+            return None
+    return document
+
+
+def load_provenance(
+    path: Path, model_path: Path, model: dict, test_ids: list[str]
+) -> dict | None:
+    try:
+        if (
+            hashlib.sha256(path.read_bytes()).hexdigest() != PROVENANCE_SHA256
+            or hashlib.sha256(model_path.read_bytes()).hexdigest() != SELECTOR_MODEL_SHA256
+        ):
+            return None
+        with gzip.open(path, "rt", encoding="utf-8") as stream:
+            document = json.load(stream)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return document if valid_provenance(document, model, test_ids) is not None else None
