@@ -39,6 +39,9 @@ SEMANTIC_SOURCES = Path(__file__).with_name("semantic_sources.json.gz")
 ZERO_READER_MODEL = Path(__file__).with_name("zero_reader_model.json.gz")
 REGISTRY_KEY_MODEL = Path(__file__).with_name("registry_key_research_model.json.gz")
 PREDICATE_PROFILE = Path(__file__).with_name("predicate_profile.json.gz")
+PREDICATE_PROFILE_SHA256 = (
+    "3788b4984b69da4fc8aa52428754d9e109070cae112c69b24c00978389d3fb70"
+)
 ARG_TYPE_DERIVATION_MODEL = Path(__file__).with_name(
     "arg_type_derivation_model.json.gz"
 )
@@ -2548,6 +2551,35 @@ def valid_module_constant_model(
     return entry_count > 0
 
 
+def load_predicate_profile(
+    path: Path = PREDICATE_PROFILE,
+    expected_sha256: str = PREDICATE_PROFILE_SHA256,
+) -> dict:
+    """Authenticate compressed comparison evidence before decompression."""
+    try:
+        raw = path.read_bytes()
+        if (
+            not expected_sha256
+            or hashlib.sha256(raw).hexdigest() != expected_sha256
+        ):
+            raise ValueError("predicate-profile artifact digest mismatch")
+        document = json.loads(gzip.decompress(raw).decode("utf-8"))
+        if not isinstance(document, dict):
+            raise TypeError("predicate-profile artifact is not an object")
+        return document
+    except (
+        OSError,
+        EOFError,
+        UnicodeError,
+        json.JSONDecodeError,
+        ValueError,
+        TypeError,
+        RecursionError,
+        MemoryError,
+    ):
+        return {"d": {}}
+
+
 def load_module_constant_model(
     path: Path = MODULE_CONSTANT_MODEL,
     expected_sha256: str = MODULE_CONSTANT_MODEL_SHA256,
@@ -3205,8 +3237,7 @@ def main() -> None:
     model["h"] = set(model.get("h", ()))
     with gzip.open(ZERO_READER_MODEL, "rt", encoding="utf-8") as zero_model_file:
         zero_model = json.load(zero_model_file)
-    with gzip.open(PREDICATE_PROFILE, "rt", encoding="utf-8") as predicate_model_file:
-        predicate_model = json.load(predicate_model_file)
+    predicate_model = load_predicate_profile()
     with gzip.open(ARG_TYPE_DERIVATION_MODEL, "rt", encoding="utf-8") as derivation_model_file:
         derivation_model = json.load(derivation_model_file)
     with gzip.open(CLASS_ATTRIBUTE_MODEL, "rt", encoding="utf-8") as attribute_model_file:

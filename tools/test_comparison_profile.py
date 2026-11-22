@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import gzip
+import hashlib
+import json
 import sys
 import tempfile
 import unittest
@@ -122,6 +125,40 @@ class ComparisonProfileTests(unittest.TestCase):
         model = self.model()
         model["d"][PATH][1][6][0][2][0] = ["error", "", "TypeError"]
         self.assertFalse(self.check(self.patch(), model))
+
+    def test_profile_loader_rejects_raw_append_and_recompressed_tampering(self) -> None:
+        document = {
+            "d": {PATH: []},
+            "n": 2,
+            "sha": "source",
+            "t": "tests",
+            "v": 3,
+        }
+        encoded = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+        raw = gzip.compress(encoded, mtime=0)
+        digest = hashlib.sha256(raw).hexdigest()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "predicate-profile.json.gz"
+        path.write_bytes(raw)
+        self.assertEqual(selector.load_predicate_profile(path, digest), document)
+
+        for tampered in (
+            raw[:-1] + bytes([raw[-1] ^ 1]),
+            raw + b"append",
+            gzip.compress(encoded, mtime=1),
+        ):
+            with self.subTest(digest=hashlib.sha256(tampered).hexdigest()):
+                self.assertNotEqual(tampered, raw)
+                path.write_bytes(tampered)
+                self.assertEqual(
+                    selector.load_predicate_profile(path, digest), {"d": {}}
+                )
+
+    def test_committed_profile_matches_raw_pin(self) -> None:
+        document = selector.load_predicate_profile()
+        self.assertEqual(document.get("v"), 3)
+        self.assertTrue(document.get("d"))
 
 
 if __name__ == "__main__":
