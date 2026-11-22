@@ -4131,12 +4131,7 @@ def selected_indices(
     return selected
 
 
-def main() -> None:
-    # Model loading and the subsequent analysis allocate large acyclic JSON,
-    # AST and index graphs. Reference counting owns their lifetime; cyclic GC
-    # would only rescan the growing immutable graph during this short process.
-    gc_was_enabled = gc.isenabled()
-    gc.disable()
+def _main() -> None:
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     tests_by_id = {test["id"]: test for test in tests}
     test_ids = [test["id"] for test in tests]
@@ -4409,8 +4404,19 @@ def main() -> None:
         f"{len(list((DATA / 'commits').glob('*.patch')))} commits",
         file=sys.stderr,
     )
-    if gc_was_enabled:
-        gc.enable()
+
+
+def main() -> None:
+    """Run with cyclic GC disabled, restoring the caller's exact state."""
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        _main()
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+        else:
+            gc.disable()
 
 
 if __name__ == "__main__":
