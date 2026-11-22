@@ -83,6 +83,7 @@ MAX_WORKERS = 8
 WORKER_COST_MS = 2_000
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 COMMENT_DIRECTIVE = re.compile(r"(?i)(coding\s*[:=]|type:|noqa|pragma|fmt:|pyright|mypy)")
+IDENTITY_EQUALITY_OPERATOR = re.compile(r"\bis\s+not\b|\bis\b|==|!=")
 CODE_OBSERVER = re.compile(
     r"(?i)(__code__|\bco_[a-z0-9_]+|\binspect\b|\bdis\b|\bgetsource\b|"
     r"\bmarshal\b|\blinecache\b|read_text\s*\(|read_bytes\s*\()"
@@ -102,6 +103,7 @@ NEW_SQL_FIXTURE_PATH = re.compile(
 )
 PROCESS_SERIALIZATION_FILES = {"sqlglot/serde.py"}
 _PINNED_SOURCES = None
+_ENUM_SEMANTIC_PROOF = None
 _SOURCE_TREES = {}
 _SOURCE_INDEXES = {}
 _IMPORT_DEFINITION_RANGES = {}
@@ -2607,6 +2609,107 @@ def profile_equivalent_predicate_edit(
     ) and not import_expression_hazard(change, path, hook_attributes)
 
 
+def proven_enum_identity_equality(
+    change: dict,
+    path: str,
+    hook_attributes: set[str] | None = None,
+) -> bool:
+    """Prove an identity/equality operator edit inert for a closed Enum value."""
+    if len(change["removed"]) != 1 or len(change["added"]) != 1:
+        return False
+    old_line, new_line = change["removed"][0], change["added"][0]
+    old_operators = IDENTITY_EQUALITY_OPERATOR.findall(old_line)
+    new_operators = IDENTITY_EQUALITY_OPERATOR.findall(new_line)
+    if (
+        len(old_operators) != 1
+        or len(new_operators) != 1
+        or (old_operators[0], new_operators[0])
+        not in {("is", "=="), ("==", "is"), ("is not", "!="), ("!=", "is not")}
+        or IDENTITY_EQUALITY_OPERATOR.sub("<comparison>", old_line)
+        != IDENTITY_EQUALITY_OPERATOR.sub("<comparison>", new_line)
+    ):
+        return False
+    source = pinned_sources().get(path)
+    changed = patched_source(change, path)
+    if (
+        source is None
+        or changed is None
+        or path in PROCESS_SERIALIZATION_FILES
+        or any(COMMENT_DIRECTIVE.search(line) for line in change["payload"])
+    ):
+        return False
+    try:
+        original_tree = ast.parse(source, filename=path, type_comments=True)
+        changed_tree = ast.parse(changed, filename=path, type_comments=True)
+    except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError):
+        return False
+
+    changed_compares = {
+        (node.lineno, node.col_offset): node
+        for node in ast.walk(changed_tree)
+        if isinstance(node, ast.Compare)
+    }
+    candidates = []
+    positive_pairs = ((ast.Is, ast.Eq), (ast.Eq, ast.Is))
+    negative_pairs = ((ast.IsNot, ast.NotEq), (ast.NotEq, ast.IsNot))
+    for original_compare in ast.walk(original_tree):
+        if (
+            not isinstance(original_compare, ast.Compare)
+            or len(original_compare.ops) != 1
+            or len(original_compare.comparators) != 1
+            or not isinstance(original_compare.comparators[0], ast.Attribute)
+            or not any(
+                original_compare.lineno <= line <= original_compare.end_lineno
+                for line in change["lines"]
+            )
+        ):
+            continue
+        changed_compare = changed_compares.get(
+            (original_compare.lineno, original_compare.col_offset)
+        )
+        if (
+            not isinstance(changed_compare, ast.Compare)
+            or len(changed_compare.ops) != 1
+            or len(changed_compare.comparators) != 1
+            or ast.dump(original_compare.left, include_attributes=False)
+            != ast.dump(changed_compare.left, include_attributes=False)
+            or ast.dump(original_compare.comparators[0], include_attributes=False)
+            != ast.dump(changed_compare.comparators[0], include_attributes=False)
+        ):
+            continue
+        pair = (type(original_compare.ops[0]), type(changed_compare.ops[0]))
+        if pair in positive_pairs:
+            normalized = ast.Eq
+        elif pair in negative_pairs:
+            normalized = ast.NotEq
+        else:
+            continue
+        candidates.append((original_compare, changed_compare, normalized))
+
+    if len(candidates) != 1:
+        return False
+    original_compare, changed_compare, normalized = candidates[0]
+    global _ENUM_SEMANTIC_PROOF
+    if _ENUM_SEMANTIC_PROOF is None:
+        _ENUM_SEMANTIC_PROOF = SemanticProof(
+            {
+                source_path: source_text
+                for source_path, source_text in pinned_sources().items()
+                if source_path.startswith("sqlglot/")
+            }
+        )
+    if not _ENUM_SEMANTIC_PROOF.covers(path, set(change["lines"])):
+        return False
+    original_compare.ops[0] = normalized()
+    changed_compare.ops[0] = normalized()
+    return (
+        ast.dump(original_tree, include_attributes=False)
+        == ast.dump(changed_tree, include_attributes=False)
+        and preserves_function_bindings(change, path, original_compare.lineno)
+        and not import_expression_hazard(change, path, hook_attributes)
+    )
+
+
 def class_attribute_edit(
     change: dict,
     path: str,
@@ -4017,6 +4120,11 @@ def selected_indices(
             if dictionary_indices is not None:
                 selected.update(dictionary_indices)
                 continue
+
+        if len(changes) == 1 and proven_enum_identity_equality(
+            change, path, model.get("h")
+        ):
+            continue
 
         if predicate_model is not None and profile_equivalent_predicate_edit(
             change, path, predicate_model, model.get("h")
