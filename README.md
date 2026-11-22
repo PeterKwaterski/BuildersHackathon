@@ -103,6 +103,11 @@ whole-module AST are pinned. Collection-time keys, filtered or generated keys,
 direct class-construction dependencies, reflection, and opaque/native escapes
 fall back.
 
+`tools/QUERY_MODIFIER_RESEARCH.md` documents the dual-mode, key-sensitive
+certificate for deleting the optional `QUERY_MODIFIERS["where"]` entry. The
+runtime requires an exact whole-file source digest and selects ten authenticated
+readers (6.723 packed seconds) instead of the 36.817-second broad fallback.
+
 `tools/collect_arg_type_derivations.py` and
 `tools/build_arg_type_derivation_model.py` reproduce the source-derived class
 dictionary certificate documented in `tools/ARG_TYPE_DERIVATION.md`. It

@@ -32,12 +32,14 @@ from tpc_plan_runtime import verify_patch as verify_tpc_plan_patch
 from tpc_fixture_verify import FIXTURE as TPCDS_FIXTURE_PATH
 from tpc_fixture_verify import verify as verify_tpcds_fixture
 import registry_key_research
+import query_modifier_research
 
 DATA = Path("/data")
 MODEL = Path(__file__).with_name("selector_model.json.gz")
 SEMANTIC_SOURCES = Path(__file__).with_name("semantic_sources.json.gz")
 ZERO_READER_MODEL = Path(__file__).with_name("zero_reader_model.json.gz")
 REGISTRY_KEY_MODEL = Path(__file__).with_name("registry_key_research_model.json.gz")
+QUERY_MODIFIER_MODEL = Path(__file__).with_name("query_modifier_model.json.gz")
 PREDICATE_PROFILE = Path(__file__).with_name("predicate_profile.json.gz")
 PREDICATE_PROFILE_SHA256 = (
     "3788b4984b69da4fc8aa52428754d9e109070cae112c69b24c00978389d3fb70"
@@ -2972,6 +2974,7 @@ def selected_indices(
     parsed_changes: list[dict] | None = None,
     import_line_profile: dict | None = None,
     registry_key_model: dict | None = None,
+    query_modifier_model: dict | None = None,
 ) -> set[int]:
     if BINARY_FIXTURE_ENABLED and binary_preimages is not None:
         try:
@@ -3019,6 +3022,12 @@ def selected_indices(
         only_path = only.get("old")
         original = pinned_sources().get(only_path) if isinstance(only_path, str) else None
         prospective = patched_source(only, only_path) if isinstance(only_path, str) else None
+        if original is not None and prospective is not None:
+            query_indices = query_modifier_research.readers(
+                only_path, original, prospective, query_modifier_model
+            )
+            if query_indices is not None:
+                return query_indices & all_indices
         if (
             original is not None
             and prospective is not None
@@ -3250,6 +3259,12 @@ def main() -> None:
         "eb11aec4be8cb2122afe713a4816662c3f0fb2fa",
         test_ids,
     )
+    query_modifier_model = query_modifier_research.load_model(
+        QUERY_MODIFIER_MODEL,
+        query_modifier_research.MODEL_GZIP_SHA256,
+        "eb11aec4be8cb2122afe713a4816662c3f0fb2fa",
+        test_ids,
+    )
     binary_preimages = load_preimages(
         BINARY_FIXTURE_PREIMAGES, MODEL, model, model.get("t")
     )
@@ -3360,6 +3375,7 @@ def main() -> None:
             changes,
             import_line_profile=import_line_profile,
             registry_key_model=registry_key_model,
+            query_modifier_model=query_modifier_model,
         )
         selected = [mapped_tests[index] for index in indices if mapped_tests[index] is not None]
         selected.extend(unmapped_tests)

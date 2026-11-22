@@ -18,6 +18,8 @@ os.rename('/app/sqlglot-'+sha,'/app/sqlglot-pinned')" \
 COPY selector.py /app/selector.py
 COPY registry_key_research.py /app/registry_key_research.py
 COPY registry_key_research_model.json.gz /app/registry_key_research_model.json.gz
+COPY query_modifier_research.py /app/query_modifier_research.py
+COPY query_modifier_model.json.gz /app/query_modifier_model.json.gz
 COPY tpc_fixture_verify.py /app/tpc_fixture_verify.py
 COPY tpc_fixture_verify_child.py /app/tpc_fixture_verify_child.py
 COPY broad_verify_manifest.json.gz /app/broad_verify_manifest.json.gz
