@@ -1115,6 +1115,48 @@ def comment_only_addition(change: dict) -> bool:
     )
 
 
+def _directive_code_fingerprint(
+    code: types.CodeType, added_lines: tuple[int, ...] = ()
+) -> tuple:
+    """Fingerprint executable code with prospective lines mapped to originals."""
+
+    def original_line(line: int | None) -> int | None:
+        if line is None:
+            return None
+        return line - sum(added <= line for added in added_lines)
+
+    constants = tuple(
+        _directive_code_fingerprint(value, added_lines)
+        if isinstance(value, types.CodeType)
+        else (type(value).__qualname__, repr(value))
+        for value in code.co_consts
+    )
+    positions = tuple(
+        (original_line(start), original_line(end), start_column, end_column)
+        for start, end, start_column, end_column in code.co_positions()
+    )
+    return (
+        code.co_argcount,
+        code.co_posonlyargcount,
+        code.co_kwonlyargcount,
+        code.co_nlocals,
+        code.co_stacksize,
+        code.co_flags,
+        code.co_code,
+        constants,
+        code.co_names,
+        code.co_varnames,
+        code.co_filename,
+        code.co_name,
+        code.co_qualname,
+        original_line(code.co_firstlineno),
+        code.co_freevars,
+        code.co_cellvars,
+        positions,
+        code.co_exceptiontable,
+    )
+
+
 def patched_source(change: dict, path: str) -> str | None:
     """Apply one file's unified hunks to its pinned source."""
     if "_patched_source" in change:
@@ -1436,8 +1478,18 @@ def load_import_line_profile(
 
 def inert_comment_addition(change: dict, path: str) -> bool:
     """Prove an added comment leaves the complete executable AST unchanged."""
-    if not comment_only_addition(change) or any(
-        COMMENT_DIRECTIVE.search(line) for line in change["added"]
+    if not comment_only_addition(change):
+        return False
+    directive = any(COMMENT_DIRECTIVE.search(line) for line in change["added"])
+    if directive and (
+        not path.endswith(".py")
+        or not path.startswith(("sqlglot/", "tests/"))
+        or path.startswith("sqlglot/typing/")
+        or path == "tests/test_typing.py"
+        or any(
+            re.fullmatch(r"\s*#\s*(?:noqa|type:\s*ignore)\s*", line, re.I) is None
+            for line in change["added"]
+        )
     ):
         return False
     source = pinned_sources().get(path)
@@ -1447,10 +1499,29 @@ def inert_comment_addition(change: dict, path: str) -> bool:
     try:
         original_tree = ast.parse(source, filename=path, type_comments=True)
         changed_tree = ast.parse(changed, filename=path, type_comments=True)
-    except (SyntaxError, ValueError):
+        if directive:
+            original_code = compile(source, path, "exec", dont_inherit=True)
+            changed_code = compile(changed, path, "exec", dont_inherit=True)
+    except (SyntaxError, ValueError, OverflowError, MemoryError, RecursionError):
         return False
-    return ast.dump(original_tree, include_attributes=False) == ast.dump(
-        changed_tree, include_attributes=False
+    if not directive:
+        return ast.dump(original_tree, include_attributes=False) == ast.dump(
+            changed_tree, include_attributes=False
+        )
+    # Standalone ``# type: ignore`` comments are retained only in
+    # ``Module.type_ignores`` for static-analysis consumers. They cannot alter
+    # the code Python compiles. The full executable AST comparison below still
+    # rejects inline type comments and every non-comment change.
+    original_tree.type_ignores = []
+    changed_tree.type_ignores = []
+    added_lines = tuple(
+        sorted(line for line, _text in change.get("added_new_at", ()))
+    )
+    return (
+        ast.dump(original_tree, include_attributes=False)
+        == ast.dump(changed_tree, include_attributes=False)
+        and _directive_code_fingerprint(original_code)
+        == _directive_code_fingerprint(changed_code, added_lines)
     )
 
 
@@ -3073,11 +3144,6 @@ def selected_indices(
             selected.update(all_indices)
             continue
         fresh_receiver_contained = contained_fresh_receiver_edit(change, path)
-        if comment_only_addition(change) and any(
-            COMMENT_DIRECTIVE.search(line) for line in change["added"]
-        ):
-            selected.update(all_indices)
-            continue
         if inert_comment_addition(change, path):
             continue
         if fresh_alias_model is not None and len(changes) == 1 and fresh_table_alias_copy_edit(
