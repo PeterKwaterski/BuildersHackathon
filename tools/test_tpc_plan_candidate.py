@@ -132,14 +132,59 @@ class TpcPlanCandidateTests(unittest.TestCase):
         self.assert_patch_applies(patch)
         self.assertFalse(selector.tpc_function_docstring_only(patch))
 
-    def test_non_optimizer_docstring_is_not_function_docstring_only(self) -> None:
+    def test_module_docstring_is_accepted_outside_optimizer(self) -> None:
         patch = self.patch(
-            """diff --git a/sqlglot/expressions.py b/sqlglot/expressions.py
---- a/sqlglot/expressions.py
-+++ b/sqlglot/expressions.py
-@@ -1,1 +1,1 @@ def helper():
--    \"\"\"Old.\"\"\"
-+    \"\"\"New.\"\"\"
+            """diff --git a/sqlglot/expressions/temporal.py b/sqlglot/expressions/temporal.py
+--- a/sqlglot/expressions/temporal.py
++++ b/sqlglot/expressions/temporal.py
+@@ -1,1 +1,1 @@
+-\"\"\"sqlglot expressions - date, time, and timestamp functions.\"\"\"
++\"\"\"sqlglot expressions - date, time, and timestamp helpers.\"\"\"
+"""
+        )
+        self.assert_patch_applies(patch)
+        self.assertTrue(selector.tpc_function_docstring_only(patch))
+
+    def test_plain_class_method_docstring_is_accepted(self) -> None:
+        patch = self.patch(
+            """diff --git a/sqlglot/generator.py b/sqlglot/generator.py
+--- a/sqlglot/generator.py
++++ b/sqlglot/generator.py
+@@ -5836,5 +5836,5 @@ class Generator:
+     def _replace_line_breaks(self, string: str) -> str:
+-        \"\"\"We don't want to extra indent line breaks so we temporarily replace them with sentinels.\"\"\"
++        \"\"\"We don't want to extra indent line breaks, so we temporarily replace them with sentinels.\"\"\"
+         if self.pretty:
+             return string.replace(\"\\n\", self.SENTINEL_LINE_BREAK)
+         return string
+"""
+        )
+        self.assert_patch_applies(patch)
+        self.assertTrue(selector.tpc_function_docstring_only(patch))
+
+    def test_method_on_inherited_class_is_rejected(self) -> None:
+        patch = self.patch(
+            """diff --git a/sqlglot/tokens.py b/sqlglot/tokens.py
+--- a/sqlglot/tokens.py
++++ b/sqlglot/tokens.py
+@@ -613,3 +613,3 @@ class Tokenizer(_TokenizerBase):
+     def tokenize(self, sql: str) -> list[Token]:
+-        \"\"\"Returns a list of tokens corresponding to the SQL string `sql`.\"\"\"
++        \"\"\"Returns tokens corresponding to the SQL string `sql`.\"\"\"
+         return self._core.tokenize(sql)  # type: ignore
+"""
+        )
+        self.assert_patch_applies(patch)
+        self.assertFalse(selector.tpc_function_docstring_only(patch))
+
+    def test_typing_module_docstring_is_rejected(self) -> None:
+        patch = self.patch(
+            """diff --git a/sqlglot/typing/__init__.py b/sqlglot/typing/__init__.py
+--- a/sqlglot/typing/__init__.py
++++ b/sqlglot/typing/__init__.py
+@@ -1,1 +1,1 @@
+-\"\"\"SQLGlot type metadata.\"\"\"
++\"\"\"SQLGlot typing metadata.\"\"\"
 """
         )
         self.assertFalse(selector.tpc_function_docstring_only(patch))

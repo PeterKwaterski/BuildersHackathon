@@ -192,7 +192,7 @@ def tpc_plan_patch_eligible(patch: Path, changes: list[dict] | None = None) -> b
 
 
 def tpc_function_docstring_only(patch: Path) -> bool:
-    """Prove a patch changes only ordinary function docstring contents."""
+    """Prove a patch changes only inert docstring contents in pinned sources."""
     try:
         if patch.stat().st_size > 65_536:
             return False
@@ -208,8 +208,9 @@ def tpc_function_docstring_only(patch: Path) -> bool:
         or change.get("new") != path
         or change.get("diff_old") != path
         or change.get("diff_new") != path
-        or not path.startswith("sqlglot/optimizer/")
+        or not path.startswith("sqlglot/")
         or not path.endswith(".py")
+        or path.startswith("sqlglot/typing/")
         or change.get("new_file_mode_count")
         or change.get("structural_invalid")
         or change.get("non_lf")
@@ -226,17 +227,53 @@ def tpc_function_docstring_only(patch: Path) -> bool:
     except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError):
         return False
 
-    def docstrings(tree: ast.Module) -> list[tuple[str, str, bool]]:
+    def docstrings(
+        tree: ast.Module,
+    ) -> list[tuple[tuple[str, ...], str, bool, ast.AST]]:
         result = []
+
+        module_doc = ast.get_docstring(tree, clean=False)
+        if module_doc is not None:
+            result.append((("module",), module_doc, True, tree))
+
         for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 value = ast.get_docstring(node, clean=False)
                 if value is not None:
-                    result.append((node.name, value, bool(node.decorator_list)))
+                    result.append(
+                        (("function", node.name), value, not node.decorator_list, node)
+                    )
+            elif isinstance(node, ast.ClassDef):
+                # Generic methods and class docs stay conservative: bases,
+                # metaclasses, decorators and descriptors can observe their
+                # metadata during class creation. Generator is the sole pinned
+                # owner admitted after a complete class-body census.
+                censused_owner = (
+                    path == "sqlglot/generator.py"
+                    and node.name == "Generator"
+                    and not node.bases
+                    and not node.keywords
+                    and not node.decorator_list
+                )
+                if censused_owner:
+                    for child in node.body:
+                        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            value = ast.get_docstring(child, clean=False)
+                            if value is not None:
+                                result.append(
+                                    (
+                                        ("method", node.name, child.name),
+                                        value,
+                                        not child.decorator_list,
+                                        child,
+                                    )
+                                )
         return result
 
     old_docs = docstrings(old_tree)
     new_docs = docstrings(new_tree)
+    old_doc_values = [(owner, value, safe) for owner, value, safe, _node in old_docs]
+    new_doc_values = [(owner, value, safe) for owner, value, safe, _node in new_docs]
 
     def compile_internable(value: str) -> bool:
         return bool(value) and (
@@ -248,19 +285,19 @@ def tpc_function_docstring_only(patch: Path) -> bool:
         )
 
     if (
-        [(name, decorated) for name, _value, decorated in old_docs]
-        != [(name, decorated) for name, _value, decorated in new_docs]
-        or old_docs == new_docs
+        [(owner, safe) for owner, _value, safe in old_doc_values]
+        != [(owner, safe) for owner, _value, safe in new_doc_values]
+        or old_doc_values == new_doc_values
         or any(
-            old_decorated
-            for (_old_name, old_value, old_decorated),
-            (_new_name, new_value, _new_decorated) in zip(old_docs, new_docs)
+            not old_safe
+            for (_old_owner, old_value, old_safe, _old_node),
+            (_new_owner, new_value, _new_safe, _new_node) in zip(old_docs, new_docs)
             if old_value != new_value
         )
         or any(
             compile_internable(old_value) or compile_internable(new_value)
-            for (_old_name, old_value, _old_decorated),
-            (_new_name, new_value, _new_decorated) in zip(old_docs, new_docs)
+            for (_old_owner, old_value, _old_safe, _old_node),
+            (_new_owner, new_value, _new_safe, _new_node) in zip(old_docs, new_docs)
             if old_value != new_value
         )
     ):
@@ -268,15 +305,14 @@ def tpc_function_docstring_only(patch: Path) -> bool:
 
     class Normalize(ast.NodeTransformer):
         def visit_Module(self, node):
-            for child in node.body:
+            for _owner, _value, _safe, documented in docstrings(node):
                 if (
-                    isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and child.body
-                    and isinstance(child.body[0], ast.Expr)
-                    and isinstance(child.body[0].value, ast.Constant)
-                    and isinstance(child.body[0].value.value, str)
+                    documented.body
+                    and isinstance(documented.body[0], ast.Expr)
+                    and isinstance(documented.body[0].value, ast.Constant)
+                    and isinstance(documented.body[0].value.value, str)
                 ):
-                    child.body[0].value.value = "__KASHIMO_DOCSTRING__"
+                    documented.body[0].value.value = "__KASHIMO_DOCSTRING__"
             return node
 
     Normalize().visit(old_tree)
