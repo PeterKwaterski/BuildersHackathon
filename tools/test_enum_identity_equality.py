@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 import selector
+from semantic import SemanticProof
 
 
 PATCH = Path(__file__).parents[1] / "sample" / "commits" / "2haz.patch"
@@ -23,6 +24,22 @@ class EnumIdentityEqualityTest(unittest.TestCase):
         return selector.proven_enum_identity_equality(
             change, "sqlglot/dialects/dialect.py", set()
         )
+
+    def dialect_change(self, line, old, new):
+        patch = (
+            "diff --git a/sqlglot/dialects/dialect.py b/sqlglot/dialects/dialect.py\n"
+            "index fed01b2..508980a 100644\n"
+            "--- a/sqlglot/dialects/dialect.py\n"
+            "+++ b/sqlglot/dialects/dialect.py\n"
+            f"@@ -{line},1 +{line},1 @@\n"
+            f"-{old}\n"
+            f"+{new}\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "candidate.patch"
+            path.write_text(patch, encoding="utf-8")
+            change = selector.patch_changes(path)[0]
+        return self.admitted(change)
 
     def test_exact_operator_only_edit_accepts(self):
         self.assertTrue(self.admitted(self.change()))
@@ -56,6 +73,36 @@ class EnumIdentityEqualityTest(unittest.TestCase):
                     )
                 )
             )
+        )
+
+    def test_certified_local_alias_sites_accept(self):
+        for line, member in (
+            (1223, "CASE_SENSITIVE"),
+            (1226, "CASE_INSENSITIVE_EXCEPT_TABLES"),
+        ):
+            old = f"        if strategy is NormalizationStrategy.{member}:"
+            new = f"        if strategy == NormalizationStrategy.{member}:"
+            with self.subTest(line=line):
+                self.assertTrue(self.dialect_change(line, old, new))
+
+    def test_local_alias_with_any_unproved_write_rejects(self):
+        safe = """\
+from enum import Enum
+class E(Enum):
+    A = 1
+class C:
+    def f(self):
+        self.value = E.A
+        alias = self.value
+        return alias is E.A
+"""
+        hostile = safe.replace(
+            "        return alias is E.A\n",
+            "        alias = object()\n        return alias is E.A\n",
+        )
+        self.assertTrue(SemanticProof({"sqlglot/x.py": safe}).covers("sqlglot/x.py", {8}))
+        self.assertFalse(
+            SemanticProof({"sqlglot/x.py": hostile}).covers("sqlglot/x.py", {9})
         )
 
 
