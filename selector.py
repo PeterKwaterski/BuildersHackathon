@@ -7,6 +7,7 @@ import json
 import re
 import sys
 import types
+from collections import deque
 from pathlib import Path
 
 from binary_copy_patch import FEATURE_ENABLED as BINARY_FIXTURE_ENABLED
@@ -47,6 +48,7 @@ COMMENT_DIRECTIVE = re.compile(r"(?i)(coding\s*[:=]|type:|noqa|pragma|fmt:|pyrig
 PROCESS_SERIALIZATION_FILES = {"sqlglot/serde.py"}
 _PINNED_SOURCES = None
 _SOURCE_TREES = {}
+_SOURCE_INDEXES = {}
 _IMPORT_DEFINITION_RANGES = {}
 _SOURCE_CODE = {}
 _INIT_SUBCLASS_ATTRIBUTES = None
@@ -186,16 +188,84 @@ def source_tree(path: str) -> ast.Module | None:
     return _SOURCE_TREES[path]
 
 
+class _AstIndex:
+    """One breadth-first AST pass with the same node order as ``ast.walk``."""
+
+    __slots__ = ("nodes", "parents", "statements", "definitions", "functions")
+
+    def __init__(self, tree: ast.AST):
+        nodes = []
+        parents = {}
+        pending = deque([tree])
+        while pending:
+            node = pending.popleft()
+            nodes.append(node)
+            children = []
+            for _field, value in ast.iter_fields(node):
+                if isinstance(value, ast.AST):
+                    children.append(value)
+                elif isinstance(value, list):
+                    children.extend(item for item in value if isinstance(item, ast.AST))
+            for child in children:
+                parents[child] = node
+                pending.append(child)
+        self.nodes = tuple(nodes)
+        self.parents = parents
+        self.statements = tuple(node for node in nodes if isinstance(node, ast.stmt))
+        self.definitions = tuple(
+            node
+            for node in nodes
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        )
+        self.functions = tuple(
+            node for node in nodes if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+
+    def path(self, node: ast.AST) -> tuple[tuple[str, int | None], ...] | None:
+        components = []
+        root = self.nodes[0]
+        while node is not root:
+            parent = self.parents.get(node)
+            if parent is None:
+                return None
+            component = None
+            for field, value in ast.iter_fields(parent):
+                if value is node:
+                    component = (field, None)
+                    break
+                if isinstance(value, list):
+                    for index, item in enumerate(value):
+                        if item is node:
+                            component = (field, index)
+                            break
+                    if component is not None:
+                        break
+            if component is None:
+                return None
+            components.append(component)
+            node = parent
+        return tuple(reversed(components))
+
+
+def _source_index(path: str) -> _AstIndex | None:
+    tree = source_tree(path)
+    cached = _SOURCE_INDEXES.get(path)
+    if cached is None or cached[0] is not tree:
+        cached = (tree, _AstIndex(tree) if tree is not None else None)
+        _SOURCE_INDEXES[path] = cached
+    return cached[1]
+
+
 def precise_coverage_line(path: str, line: int) -> bool:
     """Whether executing a line necessarily reaches the changed expression."""
     tree = source_tree(path)
-    if tree is None:
+    index = _source_index(path)
+    if tree is None or index is None:
         return False
     statements = [
         node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.stmt)
-        and node.lineno <= line <= (node.end_lineno or node.lineno)
+        for node in index.statements
+        if node.lineno <= line <= (node.end_lineno or node.lineno)
     ]
     if not statements:
         return False
@@ -207,9 +277,8 @@ def precise_coverage_line(path: str, line: int) -> bool:
         return False
     definitions = [
         node
-        for node in ast.walk(tree)
+        for node in index.definitions
         if node is not statement
-        and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
         and node.lineno <= statement.lineno
         and (node.end_lineno or node.lineno) >= (statement.end_lineno or statement.lineno)
     ]
@@ -275,17 +344,13 @@ def import_definition_line(path: str, line: int) -> bool:
     """Whether a definition fragment executes while its module is imported."""
     if path not in _IMPORT_DEFINITION_RANGES:
         tree = source_tree(path)
-        if tree is None:
+        index = _source_index(path)
+        if tree is None or index is None:
             _IMPORT_DEFINITION_RANGES[path] = []
         else:
-            parents = {}
-            for parent in ast.walk(tree):
-                for child in ast.iter_child_nodes(parent):
-                    parents[child] = parent
+            parents = index.parents
             ranges = []
-            for node in ast.walk(tree):
-                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                    continue
+            for node in index.definitions:
                 ancestor = parents.get(node)
                 nested_in_function = False
                 while ancestor is not None:
@@ -348,7 +413,8 @@ def import_expression_hazard(
     if source is None or changed is None:
         return False
     original_tree = source_tree(path)
-    if original_tree is None:
+    original_index = _source_index(path)
+    if original_tree is None or original_index is None:
         return True
 
     def annotations_deferred(tree: ast.Module) -> bool:
@@ -359,12 +425,12 @@ def import_expression_hazard(
             for statement in tree.body
         )
 
-    def context(tree: ast.Module, line: int) -> tuple[ast.stmt | None, bool]:
-        parents = {}
+    def context(
+        tree: ast.Module, index: _AstIndex, line: int
+    ) -> tuple[ast.stmt | None, bool]:
+        parents = index.parents
         candidates = []
-        for parent in ast.walk(tree):
-            for child in ast.iter_child_nodes(parent):
-                parents[child] = parent
+        for parent in index.nodes:
             start = getattr(parent, "lineno", None)
             end = getattr(parent, "end_lineno", start)
             if start is not None and start <= line <= (end or start):
@@ -397,7 +463,9 @@ def import_expression_hazard(
             node = parents.get(node)
         return statement, nested_runtime
 
-    def assignment_used_later(tree: ast.Module, statement: ast.stmt) -> bool:
+    def assignment_used_later(
+        tree: ast.Module, index: _AstIndex, statement: ast.stmt
+    ) -> bool:
         """Whether an assigned name is loaded later during the same import."""
         if isinstance(statement, ast.Assign):
             targets = statement.targets
@@ -409,10 +477,7 @@ def import_expression_hazard(
         if len(names) != len(targets):
             return True
 
-        parents = {}
-        for parent in ast.walk(tree):
-            for child in ast.iter_child_nodes(parent):
-                parents[child] = parent
+        parents = index.parents
         container = parents.get(statement)
         if not isinstance(container, (ast.Module, ast.ClassDef)):
             return False
@@ -468,24 +533,28 @@ def import_expression_hazard(
         changed_tree = ast.parse(changed, filename=path, type_comments=True)
     except (SyntaxError, ValueError):
         return True
+    changed_index = _AstIndex(changed_tree)
 
     lines = {line for line, _ in change["added_new_at"]}
     if (
         original_lines
-        and all(context(original_tree, line)[1] for line in original_lines)
-        and (not lines or all(context(changed_tree, line)[1] for line in lines))
+        and all(context(original_tree, original_index, line)[1] for line in original_lines)
+        and (
+            not lines
+            or all(context(changed_tree, changed_index, line)[1] for line in lines)
+        )
     ):
         return False
     original_statements = {
         statement
         for line in original_lines
-        for statement, nested_runtime in [context(original_tree, line)]
+        for statement, nested_runtime in [context(original_tree, original_index, line)]
         if statement is not None and not nested_runtime
     }
     patched_statements = {
         statement
         for line in lines
-        for statement, nested_runtime in [context(changed_tree, line)]
+        for statement, nested_runtime in [context(changed_tree, changed_index, line)]
         if statement is not None and not nested_runtime
     }
 
@@ -500,10 +569,9 @@ def import_expression_hazard(
             target = statement.target.id
         else:
             return None
-        parents = {}
-        for parent in ast.walk(tree):
-            for child in ast.iter_child_nodes(parent):
-                parents[child] = parent
+        parents = (
+            original_index.parents if tree is original_tree else changed_index.parents
+        )
         owner = parents.get(statement)
         if not isinstance(owner, ast.ClassDef):
             return None
@@ -593,7 +661,7 @@ def import_expression_hazard(
             # alter every importer even when old coordinates vanish from the
             # patched tree.
             return True
-        if assignment_used_later(original_tree, statement):
+        if assignment_used_later(original_tree, original_index, statement):
             return True
         if value is not None:
             try:
@@ -602,11 +670,13 @@ def import_expression_hazard(
                 return True
 
     for line in lines:
-        statement, nested_runtime = context(changed_tree, line)
+        statement, nested_runtime = context(changed_tree, changed_index, line)
         if nested_runtime:
             continue
         if statement is None:
-            old_statement, old_nested_runtime = context(original_tree, line)
+            old_statement, old_nested_runtime = context(
+                original_tree, original_index, line
+            )
             if old_statement is not None and not old_nested_runtime:
                 return True
             continue
@@ -632,7 +702,7 @@ def import_expression_hazard(
             continue
         if value is None:
             continue
-        if assignment_used_later(changed_tree, statement):
+        if assignment_used_later(changed_tree, changed_index, statement):
             return True
         try:
             ast.literal_eval(value)
@@ -720,13 +790,13 @@ def invalid_python_patch(change: dict, path: str) -> bool:
 def preserves_function_bindings(change: dict, path: str, line: int) -> bool:
     """Prove an edit cannot change name binding or generator semantics elsewhere."""
     tree = source_tree(path)
-    if tree is None:
+    index = _source_index(path)
+    if tree is None or index is None:
         return False
     functions = [
         node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.lineno <= line <= (node.end_lineno or node.lineno)
+        for node in index.functions
+        if node.lineno <= line <= (node.end_lineno or node.lineno)
     ]
     if not functions:
         return False
