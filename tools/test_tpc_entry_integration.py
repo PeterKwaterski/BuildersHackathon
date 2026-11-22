@@ -29,7 +29,11 @@ def diff(original: str, changed: str, path: str = entry.PATH) -> str:
         fromfile=f"a/{path}",
         tofile=f"b/{path}",
     ))
-    return f"diff --git a/{path} b/{path}\n" + body
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        "index 0000000..1111111 100644\n"
+        + body
+    )
 
 
 def selection(document: str, provenance=PROVENANCE) -> set[int]:

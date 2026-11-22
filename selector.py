@@ -446,7 +446,9 @@ def patch_changes(patch: Path) -> list[dict]:
     raw_patch = patch.read_bytes()
     non_lf = b"\r" in raw_patch
     terminal_lf = raw_patch.endswith(b"\n")
-    for line in patch.read_text().splitlines():
+    raw_lines = patch.read_text().splitlines()
+    canonical_start = bool(raw_lines and raw_lines[0].startswith("diff --git "))
+    for line in raw_lines:
         if line.startswith("diff --git "):
             header = line.split(" ")
             change = {
@@ -461,14 +463,27 @@ def patch_changes(patch: Path) -> list[dict]:
                 "hunks": [],
                 "diff_old": header[2][2:] if len(header) == 4 and header[2].startswith("a/") else None,
                 "diff_new": header[3][2:] if len(header) == 4 and header[3].startswith("b/") else None,
+                "diff_line": line,
                 "new_file_mode": None,
                 "new_file_mode_count": 0,
+                "deleted_file_mode": None,
+                "deleted_file_mode_count": 0,
+                "similarity_index": None,
+                "similarity_index_count": 0,
+                "rename_from": None,
+                "rename_from_count": 0,
+                "rename_to": None,
+                "rename_to_count": 0,
                 "old_marker_count": 0,
                 "new_marker_count": 0,
                 "index_count": 0,
+                "index_line": None,
+                "old_marker": None,
+                "new_marker": None,
+                "header_sequence": [],
                 "new_file_index": False,
                 "ordinary_file_index": False,
-                "structural_invalid": False,
+                "structural_invalid": not canonical_start,
                 "binary": False,
                 "non_lf": non_lf,
                 "terminal_lf": terminal_lf,
@@ -486,8 +501,19 @@ def patch_changes(patch: Path) -> list[dict]:
         elif not in_hunk and line.startswith("new file mode "):
             change["new_file_mode"] = line.removeprefix("new file mode ")
             change["new_file_mode_count"] += 1
+            change["header_sequence"].append("new-file-mode")
+        elif not in_hunk and line.startswith("deleted file mode "):
+            change["deleted_file_mode"] = line.removeprefix("deleted file mode ")
+            change["deleted_file_mode_count"] += 1
+            change["header_sequence"].append("deleted-file-mode")
+        elif not in_hunk and line.startswith("similarity index "):
+            change["similarity_index"] = line.removeprefix("similarity index ")
+            change["similarity_index_count"] += 1
+            change["header_sequence"].append("similarity-index")
         elif not in_hunk and line.startswith("index "):
             change["index_count"] += 1
+            change["index_line"] = line
+            change["header_sequence"].append("index")
             change["new_file_index"] = bool(
                 re.fullmatch(r"index 0{7,64}\.\.[0-9a-f]{7,64}", line)
             )
@@ -498,16 +524,18 @@ def patch_changes(patch: Path) -> list[dict]:
             )
         elif not in_hunk and line.startswith("rename from "):
             change["old"] = line.removeprefix("rename from ")
-            change["structural_invalid"] = True
+            change["rename_from"] = change["old"]
+            change["rename_from_count"] += 1
+            change["header_sequence"].append("rename-from")
         elif not in_hunk and line.startswith("rename to "):
             change["new"] = line.removeprefix("rename to ")
-            change["structural_invalid"] = True
+            change["rename_to"] = change["new"]
+            change["rename_to_count"] += 1
+            change["header_sequence"].append("rename-to")
         elif not in_hunk and line.startswith(
             (
                 "old mode ",
                 "new mode ",
-                "deleted file mode ",
-                "similarity index ",
                 "dissimilarity index ",
                 "copy from ",
                 "copy to ",
@@ -530,13 +558,18 @@ def patch_changes(patch: Path) -> list[dict]:
                 "lines": [],
             }
             change["hunks"].append(hunk)
+            change["header_sequence"].append("hunk")
             in_hunk = True
         elif not in_hunk and line.startswith("--- "):
             change["old_marker_count"] += 1
+            change["old_marker"] = line
+            change["header_sequence"].append("old-marker")
             name = line[4:].split("\t", 1)[0]
             change["old"] = name[2:] if name.startswith("a/") else name
         elif not in_hunk and line.startswith("+++ "):
             change["new_marker_count"] += 1
+            change["new_marker"] = line
+            change["header_sequence"].append("new-marker")
             name = line[4:].split("\t", 1)[0]
             change["new"] = name[2:] if name.startswith("b/") else name
         elif line.startswith(("-", "+", " ")) and hunk is None:
@@ -571,7 +604,289 @@ def patch_changes(patch: Path) -> list[dict]:
             addition_anchor = None
         elif in_hunk:
             change["structural_invalid"] = True
+        else:
+            # Every line after ``diff --git`` must belong to the
+            # authenticated Git text-diff grammar above. Silently ignoring an
+            # unknown header could let a semantic shortcut prove a different
+            # source transformation than the patch envelope describes.
+            change["structural_invalid"] = True
     return changes
+
+
+def canonical_text_changes(changes: object) -> bool:
+    """Authenticate a canonical existing/new-100644 Git text-diff envelope."""
+    if not isinstance(changes, list) or not changes:
+        return False
+    for change in changes:
+        if not isinstance(change, dict):
+            return False
+        old = change.get("old")
+        new = change.get("new")
+        header_sequence = change.get("header_sequence")
+        hunks = change.get("hunks")
+        if not isinstance(header_sequence, list) or not isinstance(hunks, list):
+            return False
+        existing = (
+            type(old) is str
+            and old not in {"", "/dev/null"}
+            and new == old
+            and change.get("diff_old") == old
+            and change.get("diff_new") == old
+            and change.get("new_file_mode") is None
+            and change.get("new_file_mode_count") == 0
+            and change.get("ordinary_file_index") is True
+            and change.get("new_file_index") is False
+            and change.get("diff_line") == f"diff --git a/{old} b/{old}"
+            and change.get("old_marker") == f"--- a/{old}"
+            and change.get("new_marker") == f"+++ b/{old}"
+            and header_sequence[:3]
+            == ["index", "old-marker", "new-marker"]
+            and header_sequence[3:] == ["hunk"] * len(hunks)
+            and change.get("deleted_file_mode_count") == 0
+            and change.get("similarity_index_count") == 0
+            and change.get("rename_from_count") == 0
+            and change.get("rename_to_count") == 0
+        )
+        added_file = (
+            old == "/dev/null"
+            and type(new) is str
+            and new not in {"", "/dev/null"}
+            and change.get("diff_old") == new
+            and change.get("diff_new") == new
+            and change.get("new_file_mode") == "100644"
+            and change.get("new_file_mode_count") == 1
+            and change.get("new_file_index") is True
+            and change.get("ordinary_file_index") is False
+            and change.get("diff_line") == f"diff --git a/{new} b/{new}"
+            and change.get("old_marker") == "--- /dev/null"
+            and change.get("new_marker") == f"+++ b/{new}"
+            and header_sequence[:4]
+            == ["new-file-mode", "index", "old-marker", "new-marker"]
+            and header_sequence[4:] == ["hunk"] * len(hunks)
+            and change.get("deleted_file_mode_count") == 0
+            and change.get("similarity_index_count") == 0
+            and change.get("rename_from_count") == 0
+            and change.get("rename_to_count") == 0
+        )
+        deleted_file = (
+            type(old) is str
+            and old not in {"", "/dev/null"}
+            and new == "/dev/null"
+            and change.get("diff_old") == old
+            and change.get("diff_new") == old
+            and change.get("diff_line") == f"diff --git a/{old} b/{old}"
+            and change.get("new_file_mode") is None
+            and change.get("new_file_mode_count") == 0
+            and change.get("deleted_file_mode") == "100644"
+            and change.get("deleted_file_mode_count") == 1
+            and change.get("similarity_index_count") == 0
+            and change.get("rename_from_count") == 0
+            and change.get("rename_to_count") == 0
+            and change.get("old_marker") == f"--- a/{old}"
+            and change.get("new_marker") == "+++ /dev/null"
+            and header_sequence[:4]
+            == ["deleted-file-mode", "index", "old-marker", "new-marker"]
+            and header_sequence[4:] == ["hunk"] * len(hunks)
+        )
+        renamed_file = (
+            type(old) is str
+            and type(new) is str
+            and old not in {"", "/dev/null"}
+            and new not in {"", "/dev/null", old}
+            and change.get("diff_old") == old
+            and change.get("diff_new") == new
+            and change.get("diff_line") == f"diff --git a/{old} b/{new}"
+            and change.get("new_file_mode") is None
+            and change.get("new_file_mode_count") == 0
+            and change.get("deleted_file_mode") is None
+            and change.get("deleted_file_mode_count") == 0
+            and change.get("similarity_index") == "100%"
+            and change.get("similarity_index_count") == 1
+            and change.get("rename_from") == old
+            and change.get("rename_from_count") == 1
+            and change.get("rename_to") == new
+            and change.get("rename_to_count") == 1
+            and change.get("old_marker_count") == 0
+            and change.get("new_marker_count") == 0
+            and change.get("index_count") == 0
+            and header_sequence == ["similarity-index", "rename-from", "rename-to"]
+            and hunks == []
+            and change.get("payload") == []
+            and change.get("removed") == []
+            and change.get("added") == []
+            and change.get("added_at") == []
+            and change.get("added_new_at") == []
+        )
+        if (
+            not (existing or added_file or deleted_file or renamed_file)
+            or change.get("terminal_lf") is not True
+            or change.get("non_lf") is not False
+            or change.get("no_newline_marker") is not False
+            or change.get("binary") is not False
+            or change.get("structural_invalid") is not False
+        ):
+            return False
+        if renamed_file:
+            continue
+        if (
+            change.get("old_marker_count") != 1
+            or change.get("new_marker_count") != 1
+            or change.get("index_count") != 1
+        ):
+            return False
+        index_line = change.get("index_line")
+        if existing:
+            index_match = (
+                re.fullmatch(
+                    r"index ([0-9a-f]{7,64})\.\.([0-9a-f]{7,64}) 100644",
+                    index_line,
+                )
+                if isinstance(index_line, str)
+                else None
+            )
+            if (
+                index_match is None
+                or set(index_match.group(2)) == {"0"}
+            ):
+                return False
+        elif added_file:
+            index_match = (
+                re.fullmatch(
+                    r"index (0{7,64})\.\.([0-9a-f]{7,64})", index_line
+                )
+                if isinstance(index_line, str)
+                else None
+            )
+            if index_match is None or set(index_match.group(2)) == {"0"}:
+                return False
+        else:
+            index_match = (
+                re.fullmatch(
+                    r"index ([0-9a-f]{7,64})\.\.([0-9a-f]{7,64})",
+                    index_line,
+                )
+                if isinstance(index_line, str)
+                else None
+            )
+            if index_match is None or set(index_match.group(2)) == {"0"}:
+                return False
+
+        if not hunks:
+            return False
+        expected_payload = []
+        expected_removed = []
+        expected_added = []
+        expected_added_at = []
+        expected_added_new_at = []
+        has_edit = False
+        previous_old_end = -1
+        previous_new_end = -1
+        delta = 0
+        for hunk in hunks:
+            if not isinstance(hunk, dict):
+                return False
+            old_start = hunk.get("old_start")
+            old_count = hunk.get("old_count")
+            new_start = hunk.get("new_start")
+            new_count = hunk.get("new_count")
+            lines = hunk.get("lines")
+            if (
+                type(old_start) is not int
+                or type(old_count) is not int
+                or type(new_start) is not int
+                or type(new_count) is not int
+                or old_start < 0
+                or old_count < 0
+                or new_start < 0
+                or new_count < 0
+                or (old_start == 0 and old_count != 0)
+                or not isinstance(lines, list)
+                or not lines
+                or old_start < previous_old_end
+                or new_start < previous_new_end
+                or (
+                    (existing or deleted_file)
+                    and (
+                        new_start
+                        != old_start
+                        + delta
+                        + (old_count == 0)
+                        - (new_count == 0)
+                    )
+                )
+            ):
+                return False
+            old_actual = 0
+            new_actual = 0
+            old_line = old_start + (old_count == 0)
+            new_line = new_start
+            addition_anchor = None
+            for item in lines:
+                if (
+                    not isinstance(item, tuple)
+                    or len(item) != 2
+                    or item[0] not in {" ", "-", "+"}
+                    or type(item[1]) is not str
+                ):
+                    return False
+                marker, text = item
+                if marker in {" ", "-"}:
+                    old_actual += 1
+                if marker in {" ", "+"}:
+                    new_actual += 1
+                if marker == " ":
+                    old_line += 1
+                    new_line += 1
+                    addition_anchor = None
+                elif marker == "-":
+                    has_edit = True
+                    expected_payload.append(text)
+                    expected_removed.append(text)
+                    if addition_anchor is None:
+                        addition_anchor = old_line
+                    old_line += 1
+                else:
+                    has_edit = True
+                    expected_payload.append(text)
+                    expected_added.append(text)
+                    expected_added_at.append((old_line, text))
+                    expected_added_new_at.append((new_line, text))
+                    new_line += 1
+            if old_actual != old_count or new_actual != new_count:
+                return False
+            previous_old_end = old_start + old_count
+            previous_new_end = new_start + new_count
+            delta += new_count - old_count
+
+        if (
+            not has_edit
+            or change.get("payload") != expected_payload
+            or change.get("removed") != expected_removed
+            or change.get("added") != expected_added
+            or change.get("added_at") != expected_added_at
+            or change.get("added_new_at") != expected_added_new_at
+        ):
+            return False
+        if added_file and (
+            len(hunks) != 1
+            or hunks[0].get("old_start") != 0
+            or hunks[0].get("old_count") != 0
+            or hunks[0].get("new_start") != 1
+            or expected_removed
+            or any(marker != "+" for marker, _text in hunks[0]["lines"])
+        ):
+            return False
+        if deleted_file and (
+            len(hunks) != 1
+            or hunks[0].get("old_start") != 1
+            or hunks[0].get("old_count", 0) <= 0
+            or hunks[0].get("new_start") != 0
+            or hunks[0].get("new_count") != 0
+            or expected_added
+            or any(marker != "-" for marker, _text in hunks[0]["lines"])
+        ):
+            return False
+    return True
 
 
 def pinned_sources() -> dict[str, str]:
@@ -1498,6 +1813,10 @@ def inert_comment_addition(change: dict, path: str) -> bool:
         or change.get("diff_new") != path
         or change.get("new_file_mode") is not None
         or change.get("new_file_mode_count") != 0
+        or change.get("deleted_file_mode_count") != 0
+        or change.get("similarity_index_count") != 0
+        or change.get("rename_from_count") != 0
+        or change.get("rename_to_count") != 0
         or change.get("old_marker_count") != 1
         or change.get("new_marker_count") != 1
         or change.get("index_count") != 1
@@ -1505,6 +1824,7 @@ def inert_comment_addition(change: dict, path: str) -> bool:
         or change.get("structural_invalid")
         or change.get("binary")
         or change.get("non_lf")
+        or change.get("terminal_lf") is not True
         or change.get("no_newline_marker")
         or not isinstance(hunks, list)
         or not hunks
@@ -3029,6 +3349,10 @@ def isolated_new_module_indices(
         or change.get("diff_new") != path
         or change.get("new_file_mode") != "100644"
         or change.get("new_file_mode_count") != 1
+        or change.get("deleted_file_mode_count") != 0
+        or change.get("similarity_index_count") != 0
+        or change.get("rename_from_count") != 0
+        or change.get("rename_to_count") != 0
         or change.get("old_marker_count") != 1
         or change.get("new_marker_count") != 1
         or change.get("index_count") != 1
@@ -3036,6 +3360,7 @@ def isolated_new_module_indices(
         or change.get("structural_invalid")
         or change.get("binary")
         or change.get("non_lf")
+        or change.get("terminal_lf") is not True
         or change.get("no_newline_marker")
         or path in pinned_sources()
     ):
@@ -3108,6 +3433,10 @@ def isolated_new_test_indices(
         or change.get("diff_new") != path
         or change.get("new_file_mode") != "100644"
         or change.get("new_file_mode_count") != 1
+        or change.get("deleted_file_mode_count") != 0
+        or change.get("similarity_index_count") != 0
+        or change.get("rename_from_count") != 0
+        or change.get("rename_to_count") != 0
         or change.get("old_marker_count") != 1
         or change.get("new_marker_count") != 1
         or change.get("index_count") != 1
@@ -3189,8 +3518,20 @@ def selected_indices(
             return binary_indices
 
     selected: set[int] = set()
-    changes = patch_changes(patch) if parsed_changes is None else parsed_changes
-    if not changes:
+    if parsed_changes is None:
+        try:
+            changes = patch_changes(patch)
+        except (
+            OSError,
+            UnicodeError,
+            ValueError,
+            OverflowError,
+            MemoryError,
+        ):
+            return set(all_indices)
+    else:
+        changes = parsed_changes
+    if not canonical_text_changes(changes):
         return set(all_indices)
     new_test_readers = isolated_new_test_indices(
         changes, test_file_indices, new_module_model
@@ -3224,7 +3565,10 @@ def selected_indices(
                 if entry_indices is not None:
                     return entry_indices & all_indices
         return set(all_indices)
-    if len(changes) == 1:
+    if (
+        len(changes) == 1
+        and changes[0].get("old") == changes[0].get("new")
+    ):
         only = changes[0]
         only_path = only.get("old")
         original = pinned_sources().get(only_path) if isinstance(only_path, str) else None
@@ -3558,7 +3902,17 @@ def main() -> None:
     jobs = []
     tpc_ids = set().union(*TPC_PLAN_TESTS.values())
     for patch in sorted((DATA / "commits").glob("*.patch")):
-        changes = patch_changes(patch)
+        try:
+            changes = patch_changes(patch)
+        except (
+            OSError,
+            UnicodeError,
+            ValueError,
+            OverflowError,
+            MemoryError,
+        ):
+            changes = []
+        canonical_patch = canonical_text_changes(changes)
         indices = selected_indices(
             patch,
             model,
@@ -3599,11 +3953,16 @@ def main() -> None:
                 "patch": patch,
                 "selected": selected,
                 "prospective_saving": prospective_saving,
-                "docstring_only": tpc_function_docstring_only(patch)
-                or map_values_property_docstring_only(patch),
-                "eligible": prospective_saving > 16_000
+                "canonical_patch": canonical_patch,
+                "docstring_only": canonical_patch
+                and (
+                    tpc_function_docstring_only(patch)
+                    or map_values_property_docstring_only(patch)
+                ),
+                "eligible": canonical_patch
+                and prospective_saving > 16_000
                 and tpc_plan_patch_eligible(patch, changes),
-                "fixture_change": fixture_change,
+                "fixture_change": fixture_change if canonical_patch else None,
                 "fixture_saving": best_cost_ms(selected)
                 - best_cost_ms(without_tpcds_executor),
             }

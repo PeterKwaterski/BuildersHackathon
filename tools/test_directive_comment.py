@@ -106,6 +106,7 @@ class DirectiveCommentTest(unittest.TestCase):
             ("structural_invalid", True),
             ("binary", True),
             ("non_lf", True),
+            ("terminal_lf", False),
             ("no_newline_marker", True),
         ):
             change = self.change("# type: ignore")

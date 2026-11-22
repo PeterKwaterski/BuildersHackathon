@@ -198,6 +198,13 @@ class NewModuleProofTests(unittest.TestCase):
                 selector.isolated_new_module_indices(changes, self.profile)
             )
 
+    def test_rejects_patch_without_terminal_lf(self):
+        changes = self.changes()
+        changes[0]["terminal_lf"] = False
+        self.assertIsNone(
+            selector.isolated_new_module_indices(changes, self.profile)
+        )
+
     def test_ordinary_rename_paths_remain_bound_for_dependency_fallback(self):
         patch = (
             "diff --git a/sqlglot/old.py b/sqlglot/new.py\n"
@@ -215,7 +222,8 @@ class NewModuleProofTests(unittest.TestCase):
         self.assertEqual(len(changes), 1)
         self.assertEqual(changes[0]["old"], "sqlglot/old.py")
         self.assertEqual(changes[0]["new"], "sqlglot/new.py")
-        self.assertTrue(changes[0]["structural_invalid"])
+        self.assertFalse(changes[0]["structural_invalid"])
+        self.assertTrue(selector.canonical_text_changes(changes))
 
     def test_rejects_archive_words_and_bad_source(self):
         # Both names occur in pinned imports/data, including from-import sites.
