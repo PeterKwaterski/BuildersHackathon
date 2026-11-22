@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import argparse
 import ast
+import gzip
+import hashlib
 import json
 import os
 import shutil
@@ -22,23 +24,79 @@ from pathlib import Path
 
 
 PINNED_SHA = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
+PINNED_SOURCE_DIGEST = "fc8e3c215f006385b628ef4612295b1d074b93b42de8c773997de3f40103d090"
 
 TRACKER = r'''from __future__ import annotations
 
 import atexit
 import builtins
+import concurrent.futures
 import json
 import os
+import sys
 from collections import defaultdict
 from pathlib import Path
 
 
 CURRENT_TEST = os.environ.get("BR_PARENT_TEST")
 EVENTS = defaultdict(lambda: defaultdict(set))
+IMPORT_EVENTS = set()
+CREATIONS = defaultdict(set)
+SUBMITTED_TASKS = set()
+COMPLETED_TASKS = set()
+TASK_WORKERS = defaultdict(set)
+TASK_SEQUENCE = 0
+ORIGINAL_PROCESS_POOL = concurrent.futures.ProcessPoolExecutor
 
 
-def record(label, key):
-    EVENTS[label][repr(key)].add(CURRENT_TEST or "__NO_TEST__")
+def normalized_filename(filename):
+    filename = filename.replace("\\", "/")
+    matches = [
+        (filename.rfind(marker), marker)
+        for marker in ("/sqlglot/", "/tests/")
+        if marker in filename
+    ]
+    if matches:
+        position, marker = max(matches)
+        return marker[1:] + filename[position + len(marker):]
+    return filename
+
+
+def owner():
+    if CURRENT_TEST:
+        return CURRENT_TEST
+    frame = sys._getframe(2)
+    while frame:
+        filename = normalized_filename(frame.f_code.co_filename)
+        if filename.startswith("tests/"):
+            return "__BR_COLLECT_FILE__:" + filename
+        frame = frame.f_back
+    return "__NO_TEST__"
+
+
+def import_site():
+    frame = sys._getframe(3)
+    filename = normalized_filename(frame.f_code.co_filename)
+    return filename, frame.f_lineno, frame.f_code.co_name
+
+
+def record(label, key, kind="read"):
+    site = None
+    if CURRENT_TEST:
+        event_owner = CURRENT_TEST
+    else:
+        site = import_site()
+        path, _line, function = site
+        event_owner = (
+            "__NO_TEST__"
+            if function.endswith("Parser") and path.startswith("sqlglot/")
+            else owner()
+        )
+    raw_key = repr(key)
+    EVENTS[label][raw_key].add(event_owner)
+    if event_owner == "__NO_TEST__":
+        filename, line, function = site or import_site()
+        IMPORT_EVENTS.add((label, raw_key, kind, filename, line, function))
 
 
 class TrackingDict(dict):
@@ -89,31 +147,31 @@ class TrackingDict(dict):
         return super().copy()
 
     def setdefault(self, key, default=None):
-        record(self._br_label, key)
+        record(self._br_label, key, "mutation")
         return super().setdefault(key, default)
 
     def pop(self, key, *default):
-        record(self._br_label, key)
+        record(self._br_label, key, "mutation")
         return super().pop(key, *default)
 
     def popitem(self):
-        record(self._br_label, ("__BR_WILDCARD__", "values"))
+        record(self._br_label, ("__BR_WILDCARD__", "values"), "mutation")
         return super().popitem()
 
     def __setitem__(self, key, value):
-        record(self._br_label, key)
+        record(self._br_label, key, "mutation")
         return super().__setitem__(key, value)
 
     def __delitem__(self, key):
-        record(self._br_label, key)
+        record(self._br_label, key, "mutation")
         return super().__delitem__(key)
 
     def clear(self):
-        record(self._br_label, ("__BR_WILDCARD__", "shape"))
+        record(self._br_label, ("__BR_WILDCARD__", "shape"), "mutation")
         return super().clear()
 
     def update(self, *args, **kwargs):
-        record(self._br_label, ("__BR_WILDCARD__", "values"))
+        record(self._br_label, ("__BR_WILDCARD__", "values"), "mutation")
         return super().update(*args, **kwargs)
 
     def __or__(self, other):
@@ -125,7 +183,7 @@ class TrackingDict(dict):
         return super().__ror__(other)
 
     def __ior__(self, other):
-        record(self._br_label, ("__BR_WILDCARD__", "values"))
+        record(self._br_label, ("__BR_WILDCARD__", "values"), "mutation")
         return super().__ior__(other)
 
     def __eq__(self, other):
@@ -148,19 +206,25 @@ class TrackingDict(dict):
         record(self._br_label, ("__BR_WILDCARD__", "shape"))
         return super().__sizeof__()
 
+    def __reduce__(self):
+        record(self._br_label, ("__BR_WILDCARD__", "values"), "pickle")
+        return super().__reduce__()
+
+    def __reduce_ex__(self, protocol):
+        record(self._br_label, ("__BR_WILDCARD__", "values"), "pickle")
+        return super().__reduce_ex__(protocol)
+
 
 def trace_dict(label, source):
+    CREATIONS[label].add(CURRENT_TEST or "__NO_TEST__")
     return TrackingDict(source, label)
 
 
 def child_output():
     output_dir = os.environ.get("BR_TRACE_CHILD_DIR")
-    if not output_dir or not CURRENT_TEST:
+    if not output_dir or (not CURRENT_TEST and not COMPLETED_TASKS):
         return
-    output = {
-        label: {key: sorted(tests) for key, tests in sorted(keys.items())}
-        for label, keys in sorted(EVENTS.items())
-    }
+    output = document()
     path = Path(output_dir, f"{os.getpid()}.json")
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(output, sort_keys=True, separators=(",", ":")))
@@ -169,12 +233,72 @@ def child_output():
 
 builtins._br_trace_dict = trace_dict
 atexit.register(child_output)
+
+
+def document():
+    return {
+        "events": {
+            label: {key: sorted(tests) for key, tests in sorted(keys.items())}
+            for label, keys in sorted(EVENTS.items())
+        },
+        "creations": {
+            label: sorted(owners) for label, owners in sorted(CREATIONS.items())
+        },
+        "imports": [list(event) for event in sorted(IMPORT_EVENTS)],
+        "tasks": {
+            "completed": sorted(COMPLETED_TASKS),
+            "submitted": sorted(SUBMITTED_TASKS),
+            "workers": {
+                task: sorted(workers) for task, workers in sorted(TASK_WORKERS.items())
+            },
+        },
+    }
+
+
+def run_with_owner(function, task, task_owner, args, kwargs):
+    global CURRENT_TEST
+    prior = CURRENT_TEST
+    CURRENT_TEST = task_owner
+    if task_owner:
+        os.environ["BR_PARENT_TEST"] = task_owner
+    else:
+        os.environ.pop("BR_PARENT_TEST", None)
+    try:
+        return function(*args, **kwargs)
+    finally:
+        COMPLETED_TASKS.add(task)
+        TASK_WORKERS[task].add(os.getpid())
+        CURRENT_TEST = prior
+        if prior:
+            os.environ["BR_PARENT_TEST"] = prior
+        else:
+            os.environ.pop("BR_PARENT_TEST", None)
+
+
+class AttributedProcessPoolExecutor(ORIGINAL_PROCESS_POOL):
+    def __init__(self, *args, **kwargs):
+        if kwargs.get("max_workers") is None:
+            kwargs["max_workers"] = int(os.environ.get("BR_TRACE_MAX_WORKERS", "2"))
+        super().__init__(*args, **kwargs)
+
+    def submit(self, function, /, *args, **kwargs):
+        global TASK_SEQUENCE
+        task_owner = CURRENT_TEST or os.environ.get("BR_PARENT_TEST")
+        task = f"{os.getpid()}:{task_owner or '__NO_TEST__'}#{TASK_SEQUENCE}"
+        TASK_SEQUENCE += 1
+        SUBMITTED_TASKS.add(task)
+        return super().submit(run_with_owner, function, task, task_owner, args, kwargs)
+
+
+concurrent.futures.ProcessPoolExecutor = AttributedProcessPoolExecutor
 '''
 
 PLUGIN = r'''from __future__ import annotations
 
+import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -201,27 +325,54 @@ def merge_child_logs():
     count = 0
     for path in sorted(Path(os.environ["BR_TRACE_CHILD_DIR"]).glob("*.json")):
         count += 1
-        for label, events in json.loads(path.read_text()).items():
+        document = json.loads(path.read_text())
+        for label, events in document.get("events", {}).items():
             for key, owners in events.items():
                 _br_tracker.EVENTS[label][key].update(owners)
+        _br_tracker.IMPORT_EVENTS.update(
+            tuple(event) for event in document.get("imports", ())
+        )
+        for label, owners in document.get("creations", {}).items():
+            _br_tracker.CREATIONS[label].update(owners)
+        tasks = document.get("tasks", {})
+        _br_tracker.SUBMITTED_TASKS.update(tasks.get("submitted", ()))
+        _br_tracker.COMPLETED_TASKS.update(tasks.get("completed", ()))
+        for task, workers in tasks.get("workers", {}).items():
+            _br_tracker.TASK_WORKERS[task].update(workers)
     return count
 
 
 def pytest_sessionfinish(session, exitstatus):
     child_logs = merge_child_logs()
-    output = {
-        label: {key: sorted(tests) for key, tests in sorted(keys.items())}
-        for label, keys in sorted(_br_tracker.EVENTS.items())
-    }
-    Path(os.environ["BR_TRACE_OUTPUT"]).write_text(
-        json.dumps(output, sort_keys=True, separators=(",", ":"))
+    trace_raw = json.dumps(
+        _br_tracker.document(), sort_keys=True, separators=(",", ":")
     )
+    Path(os.environ["BR_TRACE_OUTPUT"]).write_text(trace_raw)
     Path(os.environ["BR_TRACE_MANIFEST"]).write_text(
         json.dumps(
             {
                 "child_logs": child_logs,
                 "exitstatus": exitstatus,
+                "instrumented": int(os.environ["BR_TRACE_INSTRUMENTED"]),
+                "mode": os.environ["BR_TRACE_MODE"],
+                "python": sys.version,
+                "pool_workers": int(os.environ["BR_TRACE_MAX_WORKERS"]),
+                "roster_count": int(os.environ["BR_TRACE_ROSTER_COUNT"]),
+                "roster_digest": os.environ["BR_TRACE_ROSTER_DIGEST"],
+                "selection": "numbered-roster",
+                "source_digest": os.environ["BR_TRACE_SOURCE_DIGEST"],
+                "source_sha": os.environ["BR_TRACE_SOURCE_SHA"],
+                "submitted_tasks": len(_br_tracker.SUBMITTED_TASKS),
+                "completed_tasks": len(_br_tracker.COMPLETED_TASKS),
+                "task_workers": len({
+                    worker
+                    for workers in _br_tracker.TASK_WORKERS.values()
+                    for worker in workers
+                }),
+                "tracker_version": 5,
+                "task_attribution": "submit-wrapper-v2",
                 "tests": sorted(EXECUTED),
+                "trace_sha256": hashlib.sha256(trace_raw.encode()).hexdigest(),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -286,10 +437,12 @@ SYNC_EXECUTOR = '''class ProcessPoolExecutor:
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=Path, required=True)
+    parser.add_argument("--sources", type=Path, required=True)
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
-    parser.add_argument("--tests", type=Path)
+    parser.add_argument("--tests", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--normal-workers", action="store_true")
     parser.add_argument("pytest_args", nargs=argparse.REMAINDER)
     return parser.parse_args()
 
@@ -343,7 +496,9 @@ def absolute_offset(
 
 def instrument_source(source: Path) -> int:
     count = 0
-    for path in sorted((source / "sqlglot").rglob("*.py")):
+    paths = sorted((source / "sqlglot").rglob("*.py"))
+    paths.extend(sorted((source / "tests").rglob("*.py")))
+    for path in paths:
         text = path.read_text()
         tree = ast.parse(text, filename=path.as_posix(), type_comments=True)
         parents = {}
@@ -356,7 +511,7 @@ def instrument_source(source: Path) -> int:
         for node in ast.walk(tree):
             if not isinstance(node, (ast.Assign, ast.AnnAssign)):
                 continue
-            if not isinstance(node.value, ast.Dict):
+            if not isinstance(node.value, (ast.Dict, ast.DictComp)):
                 continue
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             if len(targets) != 1 or not isinstance(targets[0], ast.Name):
@@ -385,18 +540,37 @@ def instrument_source(source: Path) -> int:
     return count
 
 
-def validate_source(source: Path) -> None:
-    revision = subprocess.check_output(
-        ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
-    ).strip()
-    if revision != PINNED_SHA:
-        raise SystemExit(f"source is {revision}, expected {PINNED_SHA}")
-    status = subprocess.check_output(
-        ["git", "-C", str(source), "status", "--porcelain", "--", "sqlglot", "tests"],
-        text=True,
-    )
-    if status:
-        raise SystemExit("pinned sqlglot/tests checkout must be clean")
+def validate_source(source: Path, sources_path: Path) -> None:
+    with gzip.open(sources_path, "rt", encoding="utf-8") as stream:
+        expected = json.load(stream)
+    if not isinstance(expected, dict) or any(
+        type(path) is not str or type(text) is not str
+        for path, text in expected.items()
+    ):
+        raise SystemExit("malformed pinned source bundle")
+    digest = hashlib.sha256(
+        "".join(f"{path}\0{expected[path]}\0" for path in sorted(expected)).encode()
+    ).hexdigest()
+    if digest != PINNED_SOURCE_DIGEST:
+        raise SystemExit("pinned source bundle digest mismatch")
+    expected_paths = {
+        path for path in expected
+        if path.startswith("sqlglot/") or path.startswith("tests/")
+    }
+    actual_paths = {
+        path.relative_to(source).as_posix()
+        for base in ("sqlglot", "tests")
+        for path in (source / base).rglob("*.py")
+    }
+    if actual_paths != expected_paths:
+        raise SystemExit("pinned source file inventory mismatch")
+    for path in sorted(expected_paths):
+        try:
+            actual = (source / path).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            raise SystemExit(f"unreadable pinned source {path}")
+        if actual != expected[path]:
+            raise SystemExit(f"pinned source bytes mismatch {path}")
 
 
 def main() -> None:
@@ -407,7 +581,10 @@ def main() -> None:
     python = args.python.expanduser().absolute()
     output = args.output.resolve()
     manifest = (args.manifest or output.with_suffix(".manifest.json")).resolve()
-    validate_source(source)
+    validate_source(source, args.sources.resolve())
+    roster = json.loads(args.tests.read_text())["tests"]
+    roster_ids = [test["id"] for test in roster]
+    roster_digest = hashlib.sha256("\0".join(roster_ids).encode()).hexdigest()
     output.parent.mkdir(parents=True, exist_ok=True)
     manifest.parent.mkdir(parents=True, exist_ok=True)
 
@@ -429,7 +606,8 @@ def main() -> None:
         (support / "dict_tracking_plugin.py").write_text(PLUGIN)
         (support / "sitecustomize.py").write_text("import _br_tracker\n")
 
-        synchronous_worker_tests(work)
+        if not args.normal_workers:
+            synchronous_worker_tests(work)
         instrumented = instrument_source(work)
         environment = os.environ.copy()
         environment.update(
@@ -437,6 +615,13 @@ def main() -> None:
                 "BR_TRACE_CHILD_DIR": str(children),
                 "BR_TRACE_MANIFEST": str(manifest),
                 "BR_TRACE_OUTPUT": str(output),
+                "BR_TRACE_INSTRUMENTED": str(instrumented),
+                "BR_TRACE_MODE": "normal" if args.normal_workers else "synchronous-worker",
+                "BR_TRACE_MAX_WORKERS": "2",
+                "BR_TRACE_ROSTER_COUNT": str(len(roster_ids)),
+                "BR_TRACE_ROSTER_DIGEST": roster_digest,
+                "BR_TRACE_SOURCE_SHA": PINNED_SHA,
+                "BR_TRACE_SOURCE_DIGEST": PINNED_SOURCE_DIGEST,
                 "PYTHONPATH": os.pathsep.join(
                     (str(support), str(work), environment.get("PYTHONPATH", ""))
                 ).rstrip(os.pathsep),
@@ -444,7 +629,8 @@ def main() -> None:
             }
         )
         command = [str(python), "-m", "pytest", "-q", "-p", "dict_tracking_plugin"]
-        command.extend(arg for arg in args.pytest_args if arg != "--")
+        requested = [arg for arg in args.pytest_args if arg != "--"]
+        command.extend(requested or roster_ids)
         result = subprocess.run(command, cwd=work, env=environment, check=False)
         if result.returncode:
             raise SystemExit(f"pytest exited {result.returncode}; trace is not admissible")
@@ -452,10 +638,13 @@ def main() -> None:
     trace_manifest = json.loads(manifest.read_text())
     if trace_manifest["exitstatus"] != 0:
         raise SystemExit("pytest manifest records a nonzero exit status")
-    if args.tests and not args.pytest_args:
-        expected = {
-            test["id"] for test in json.loads(args.tests.read_text())["tests"]
-        }
+    trace_raw = output.read_bytes()
+    if trace_manifest.get("trace_sha256") != hashlib.sha256(trace_raw).hexdigest():
+        raise SystemExit("trace and manifest digest mismatch")
+    if trace_manifest.get("submitted_tasks") != trace_manifest.get("completed_tasks"):
+        raise SystemExit("one or more submitted process-pool tasks lacks attribution")
+    if not args.pytest_args:
+        expected = set(roster_ids)
         executed = set(trace_manifest["tests"])
         missing = expected - executed
         if missing:

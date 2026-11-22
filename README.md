@@ -96,6 +96,13 @@ entry can never itself be certified. Every uncertainty falls back to the ordinar
 assignment dependency cone. The certificate is derived from pinned sources and
 tests and contains no sample commit, patch, or answer information.
 
+`tools/REGISTRY_KEY_RESEARCH.md` documents the dual-mode parser-registry key
+certificate. It admits only an exact value-preserving key rename whose
+inheritance/copy graph, collection behavior, source bytes, and normalized
+whole-module AST are pinned. Collection-time keys, filtered or generated keys,
+direct class-construction dependencies, reflection, and opaque/native escapes
+fall back.
+
 `tools/collect_arg_type_derivations.py` and
 `tools/build_arg_type_derivation_model.py` reproduce the source-derived class
 dictionary certificate documented in `tools/ARG_TYPE_DERIVATION.md`. It

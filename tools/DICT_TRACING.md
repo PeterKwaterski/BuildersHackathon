@@ -21,6 +21,7 @@ With the environment from `requirements.lock`, collect the trace with:
 ```sh
 python tools/collect_dict_access.py \
   --source /path/to/sqlglot-at-eb11aec4 \
+  --sources semantic_sources.json.gz \
   --python /path/to/locked-venv/bin/python \
   --tests sample/tests.json \
   --output /tmp/dict-access.json

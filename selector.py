@@ -31,11 +31,13 @@ from shared_arg_write_runtime import (
 from tpc_plan_runtime import verify_patch as verify_tpc_plan_patch
 from tpc_fixture_verify import FIXTURE as TPCDS_FIXTURE_PATH
 from tpc_fixture_verify import verify as verify_tpcds_fixture
+import registry_key_research
 
 DATA = Path("/data")
 MODEL = Path(__file__).with_name("selector_model.json.gz")
 SEMANTIC_SOURCES = Path(__file__).with_name("semantic_sources.json.gz")
 ZERO_READER_MODEL = Path(__file__).with_name("zero_reader_model.json.gz")
+REGISTRY_KEY_MODEL = Path(__file__).with_name("registry_key_research_model.json.gz")
 PREDICATE_PROFILE = Path(__file__).with_name("predicate_profile.json.gz")
 ARG_TYPE_DERIVATION_MODEL = Path(__file__).with_name(
     "arg_type_derivation_model.json.gz"
@@ -2875,6 +2877,7 @@ def selected_indices(
     new_module_model: dict | None = None,
     parsed_changes: list[dict] | None = None,
     import_line_profile: dict | None = None,
+    registry_key_model: dict | None = None,
 ) -> set[int]:
     if BINARY_FIXTURE_ENABLED and binary_preimages is not None:
         try:
@@ -2922,6 +2925,18 @@ def selected_indices(
         only_path = only.get("old")
         original = pinned_sources().get(only_path) if isinstance(only_path, str) else None
         prospective = patched_source(only, only_path) if isinstance(only_path, str) else None
+        if (
+            original is not None
+            and prospective is not None
+            and registry_key_model is not None
+            and isinstance(registry_key_model.get("d"), dict)
+            and only_path in registry_key_model.get("d", {})
+        ):
+            registry_indices = registry_key_research.readers(
+                only_path, original, prospective, only, registry_key_model
+            )
+            if registry_indices is not None:
+                return registry_indices & all_indices
         retained = match_none_static(changes, none_static_profile, original, prospective)
         if retained is not None:
             return retained & all_indices
@@ -3122,6 +3137,7 @@ def selected_indices(
 def main() -> None:
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     tests_by_id = {test["id"]: test for test in tests}
+    test_ids = [test["id"] for test in tests]
     with gzip.open(MODEL, "rt", encoding="utf-8") as model_file:
         model = json.load(model_file)
     model["h"] = set(model.get("h", ()))
@@ -3136,6 +3152,11 @@ def main() -> None:
     constant_model = load_module_constant_model()
     with gzip.open(FRESH_ALIAS_PROFILE, "rt", encoding="utf-8") as fresh_alias_file:
         fresh_alias_model = json.load(fresh_alias_file)
+    registry_key_model = registry_key_research.load_model(
+        REGISTRY_KEY_MODEL,
+        "eb11aec4be8cb2122afe713a4816662c3f0fb2fa",
+        test_ids,
+    )
     binary_preimages = load_preimages(
         BINARY_FIXTURE_PREIMAGES, MODEL, model, model.get("t")
     )
@@ -3245,6 +3266,7 @@ def main() -> None:
             new_module_model,
             changes,
             import_line_profile=import_line_profile,
+            registry_key_model=registry_key_model,
         )
         selected = [mapped_tests[index] for index in indices if mapped_tests[index] is not None]
         selected.extend(unmapped_tests)
