@@ -79,6 +79,9 @@ NEW_MODULE_PATH = re.compile(
     r"sqlglot(?:/[A-Za-z_][A-Za-z0-9_]*)*/[A-Za-z_][A-Za-z0-9_]*\.py\Z"
 )
 NEW_TEST_MODULE_PATH = re.compile(r"tests/test_[A-Za-z_][A-Za-z0-9_]*\.py\Z")
+NEW_SQL_FIXTURE_PATH = re.compile(
+    r"tests/fixtures/(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_][A-Za-z0-9_.-]*\.sql\Z"
+)
 PROCESS_SERIALIZATION_FILES = {"sqlglot/serde.py"}
 _PINNED_SOURCES = None
 _SOURCE_TREES = {}
@@ -3487,6 +3490,94 @@ def isolated_new_test_indices(
     return set()
 
 
+def isolated_new_fixture_indices(
+    changes: list[dict], discovery_profile: dict | None
+) -> set[int] | None:
+    """Return authenticated filesystem readers for one fresh SQL fixture."""
+    if not isinstance(discovery_profile, dict) or len(changes) != 1:
+        return None
+    try:
+        discovery_body = {
+            key: discovery_profile[key]
+            for key in ("a", "b", "d", "f", "i", "k", "m", "r", "w")
+        }
+    except KeyError:
+        return None
+    readers = discovery_profile.get("r")
+    if (
+        discovery_profile.get("d") != NEW_MODULE_SOURCE_SHA256
+        or discovery_profile.get("p") != NEW_MODULE_PROFILE_SHA256
+        or _stable_json_digest(discovery_profile.get("i"))
+        != NEW_MODULE_INVENTORY_SHA256
+        or _stable_json_digest(discovery_body) != NEW_MODULE_PROFILE_SHA256
+        or not isinstance(readers, list)
+        or readers != sorted(set(readers))
+        or any(type(reader) is not int or reader < 0 for reader in readers)
+    ):
+        return None
+    change = changes[0]
+    path = change.get("new")
+    if (
+        change.get("old") != "/dev/null"
+        or type(path) is not str
+        or not NEW_SQL_FIXTURE_PATH.fullmatch(path)
+        or any(part in {"", ".", ".."} or part.startswith(".") for part in Path(path).parts)
+        or change.get("diff_old") != path
+        or change.get("diff_new") != path
+        or change.get("new_file_mode") != "100644"
+        or change.get("new_file_mode_count") != 1
+        or change.get("old_marker_count") != 1
+        or change.get("new_marker_count") != 1
+        or change.get("index_count") != 1
+        or not change.get("new_file_index")
+        or change.get("ordinary_file_index")
+        or change.get("structural_invalid")
+        or change.get("binary")
+        or change.get("non_lf")
+        or change.get("terminal_lf") is not True
+        or change.get("no_newline_marker")
+    ):
+        return None
+    relative = path.removeprefix("tests/fixtures/")
+    basename = Path(path).name
+    relative_stem = relative.removesuffix(".sql")
+    full_stem = path.removesuffix(".sql")
+    stem_references = (full_stem,)
+    if "/" in relative_stem:
+        stem_references += (relative_stem,)
+    if any(
+        path in source
+        or relative in source
+        or basename in source
+        or any(reference in source for reference in stem_references)
+        for source in pinned_sources().values()
+    ):
+        return None
+    hunks = change.get("hunks")
+    added = change.get("added")
+    if (
+        not isinstance(hunks, list)
+        or len(hunks) != 1
+        or hunks[0].get("old_start") != 0
+        or hunks[0].get("old_count") != 0
+        or hunks[0].get("new_start") != 1
+        or not isinstance(added, list)
+        or not added
+        or hunks[0].get("new_count") != len(added)
+        or len(hunks[0].get("lines", ())) != len(added)
+        or change.get("removed")
+        or change.get("payload") != added
+        or any(marker != "+" for marker, _text in hunks[0].get("lines", ()))
+        or change.get("added_new_at")
+        != list(zip(range(1, len(added) + 1), added))
+    ):
+        return None
+    content = "\n".join(added) + "\n"
+    if len(content.encode("utf-8")) > 65_536:
+        return None
+    return set(readers)
+
+
 def selected_indices(
     patch: Path,
     model: dict,
@@ -3538,6 +3629,9 @@ def selected_indices(
     )
     if new_test_readers is not None:
         return new_test_readers
+    new_fixture_readers = isolated_new_fixture_indices(changes, new_module_model)
+    if new_fixture_readers is not None:
+        return new_fixture_readers & all_indices
     new_module_readers = (
         isolated_new_module_indices(changes, new_module_model)
         if NEW_MODULE_PROOF_ENABLED
