@@ -1,9 +1,9 @@
 # Module-assignment reader precision vertical
 
-Status: independently audited v3 implementation. Fresh provenance-bound normal
-and synchronous-worker traces are required; the final model and mutation
-certificates are still pending. No validation answer or patch identity is used
-by the mechanism.
+Status: independently audited v3 model with v4 task-attributed traces. Fresh
+provenance-bound normal and synchronous-worker traces and a byte-identical
+artifact rebuild have completed. No validation answer or patch identity is
+used by the mechanism.
 
 ## Val11 diagnosis
 
@@ -43,9 +43,10 @@ reader identity can be followed through that re-export.
   selector authenticates compressed bytes before decompression; an absent or
   mismatched SHA-256 pin disables this proof family.
 - Attribute every process-pool submission to its exact numbered owner and
-  require submitted/completed ledger equality. Both trace modes bind the
-  collector plus its synchronous-rewrite dependency and the complete
-  `sqlglot`/`tests` source inventory.
+  require submitted/completed ledger equality. Reads in a child process but
+  outside an attributed submitted task are marked ambient and conservatively
+  expanded to the creator's test file. Both trace modes bind the self-contained
+  collector and the complete `sqlglot`/`tests` source inventory.
 
 ## Changed files
 
@@ -91,13 +92,13 @@ traces and an artifact rebuild.
 The final v3 artifact admits six shapes. `SAFE_IDENTIFIER_RE` and
 `UNWRAPPED_QUERIES` remain `import-read`; mutable `QUERY_MODIFIERS` remains
 unsupported. Exact answer-independent packed costs are: `PERCENTILES` 3.451s,
-`OPERATORS` 3.275s, `CONSTANTS` 27.454s, `SQLGLOT_META` 36.650s,
-`TABLE_PARTS` 27.454s, and `COLUMN_PARTS` 12.908s. Against their six 36.817s
-fallbacks this is a 109.710s public simulated ceiling before selector CPU.
+`OPERATORS` 3.275s, `CONSTANTS` 25.454s, `SQLGLOT_META` 6.475s,
+`TABLE_PARTS` 26.040s, and `COLUMN_PARTS` 3.501s. Against their six 36.817s
+fallbacks this is a 152.706s public simulated ceiling before selector CPU.
 
 ## Validation performed
 
-`python tools/test_module_assignment_precision.py` passes 41 focused tests
+`python tools/test_module_assignment_precision.py` passes 42 focused tests
 with three deliberately disabled derived-alias cases. They cover star and explicit re-exports, static/absent/
 dynamic/mutated `__all__`, re-export rebinding, alias ambiguity and local
 shadowing, transitive unresolved exports, module `__getattr__`, star cycles, class-tuple resolution and
@@ -108,9 +109,9 @@ recompressed artifact tampering. `py_compile` and `git diff --check` pass. A
 two-test normal/synchronous smoke collection also passes with exact task and
 child-process accounting.
 
-Both exact full collectors, deterministic artifact rebuild, exact image build,
-and complete repository regression have been performed. No push, leaderboard
-submission, or answer-file inspection has been performed.
+Both exact full collectors, the deterministic artifact rebuild, exact image
+runs, and the complete repository regression have been performed. No push,
+leaderboard submission, or answer-file inspection has been performed.
 
 ## Artifact reproduction
 
@@ -121,20 +122,20 @@ instrumented reader sites changed:
 ```sh
 python tools/collect_module_constant_reads.py \
   --source /path/to/pinned/sqlglot --python /path/to/python3.13 \
-  --tests sample/tests.json --output /tmp/module-normal-v6.json \
-  --manifest /tmp/module-normal-v6.manifest.json
+  --tests sample/tests.json --output /tmp/module-normal-v7.json \
+  --manifest /tmp/module-normal-v7.manifest.json
 
 python tools/collect_module_constant_reads.py \
   --source /path/to/pinned/sqlglot --python /path/to/python3.13 \
   --tests sample/tests.json --synchronous-workers \
-  --output /tmp/module-sync-v6.json \
-  --manifest /tmp/module-sync-v6.manifest.json
+  --output /tmp/module-sync-v7.json \
+  --manifest /tmp/module-sync-v7.manifest.json
 
 python tools/build_module_constant_model.py \
   --source /path/to/pinned/sqlglot --tests sample/tests.json \
-  --manifest /tmp/module-normal-v6.manifest.json \
-  --manifest /tmp/module-sync-v6.manifest.json \
-  --trace /tmp/module-normal-v6.json --trace /tmp/module-sync-v6.json \
+  --manifest /tmp/module-normal-v7.manifest.json \
+  --manifest /tmp/module-sync-v7.manifest.json \
+  --trace /tmp/module-normal-v7.json --trace /tmp/module-sync-v7.json \
   --output module_constant_model.json.gz
 ```
 
@@ -194,21 +195,26 @@ fail-closed result for unknown shapes:
   the authenticated helper reads the fixed `__file__` attribute. Other bare
   module-object escapes remain unsafe.
 
-Focused coverage is now 41 green tests with three deliberately disabled
+Focused coverage is now 42 green tests with three deliberately disabled
 derived-alias cases. After closing the imported-support-module hole, static
 census admits all nine public val11 shapes; runtime evidence still marks the
 mutable dictionary unsupported and must reject unobserved, import-read, or
-incomplete entries. The pinned source uses top-level
+incomplete entries. Version-4 traces distinguish exact submitted-task reads
+from ambient child-process reads, so only ambient observations expand to every
+test in the creator's file. The pinned source uses top-level
 `concurrent.futures.ProcessPoolExecutor`; its sole standalone child is the fixed
 `python -c` in `TestDialect.test_lazy_load`, so both modes require exactly one
 standalone log. Normal mode passed 1,620 tests and 25,440 subtests with an exact
 2,183/2,183 task ledger, six task workers, seven child logs, and one standalone
 child. Synchronous mode passed the same roster/subtests with no pool tasks and
-one standalone child. Both bind collector bundle
-`812caa982a1e5057bf754b1c0b2b965d83064ae3e9ff32077650ca3b5fd16564`,
+one standalone child. Both bind the self-contained collector bundle
+`e409aa6114d0b1267d269a361a31afaac3890465a4cabc3d53ec3e51e115ade0`,
 source inventory `c57e9c6fbda07a4dc88c54debe29d963831994f931d4d9eed727667630f8165b`,
-and their exact trace digests. The model rebuild is byte-identical at SHA-256
-`d5b09e7a548935758dcbada36ec14cc170a24518e43fdf964d33f556ddb3b1f8`.
-The complete repository suite is 128 green with three intentional skips; two
+and exact trace digests
+`a943182e0a834472abd73921b084ed7bcd20f4f9ea3fcbf4bf7e7900667d14b6`
+and `648f90cb09f7e43a7dbee57445576d45b66633971a87f092619bd71200017c80`.
+The model rebuild is byte-identical at SHA-256
+`521dc82a084a6890d68eda5ba6166fdf1d3cf7534673d6276402e1eadaf92ebe`.
+The complete repository suite is 129 green with three intentional skips; two
 exact image runs emitted the same 30-line output SHA-256
 `4d8bc3d459b8e57e9906579c2d6ac90afbb269e0910ac7e05abb858f931f95b4`.

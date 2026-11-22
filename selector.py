@@ -44,7 +44,7 @@ CLASS_ATTRIBUTE_MODEL = Path(__file__).with_name("class_attribute_model.json.gz"
 MODULE_CONSTANT_MODEL = Path(__file__).with_name("module_constant_model.json.gz")
 # Filled only after the final provenance-bearing v3 artifact is rebuilt twice
 # to identical bytes. An empty or mismatched pin disables this proof family.
-MODULE_CONSTANT_MODEL_SHA256 = "d5b09e7a548935758dcbada36ec14cc170a24518e43fdf964d33f556ddb3b1f8"
+MODULE_CONSTANT_MODEL_SHA256 = "521dc82a084a6890d68eda5ba6166fdf1d3cf7534673d6276402e1eadaf92ebe"
 FRESH_ALIAS_PROFILE = Path(__file__).with_name("fresh_alias_profile.json.gz")
 IMPORT_LINE_PROFILE = Path(__file__).with_name("import_line_profile.json.gz")
 IMPORT_LINE_PROFILE_SHA256 = "7c95117f6c5bee66bf0931a1ee2668367f1d9f937df41066efd07fa7a6fe2a74"

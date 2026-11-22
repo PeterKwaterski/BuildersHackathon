@@ -31,6 +31,7 @@ from collect_module_constant_reads import (
 
 PINNED_SHA = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
 CHILD_SENTINEL = "__BR_CHILD__"
+AMBIENT_PREFIX = "__BR_AMBIENT__:"
 SERDE_LOAD_AST_SHA256 = "659b519ac3e700459bcf6b1b0e733dc220a9437e818dd34dbf529415b80cddaa"
 SUBCLASSES_AST_SHA256 = "86e955dd0d21cbfb62e080f063b8a87b81fb6f28a42fde3b6342c97ad2a314bf"
 IS_COMPILED_AST_SHA256 = "cee552b88c482f8a2cfbc3be92d9f7240880fd0b2426338d54517747f6a5e4c7"
@@ -42,7 +43,7 @@ EXECUTOR_ENV_MODULE_AST_SHA256 = "8b0919c9be54766a3586593dcee1ccc5097ed6aef1afb5
 EXECUTOR_PYTHON_MODULE_AST_SHA256 = "72444981bcfa62f6a082d0fdf2ad3b8464d2b11b67088c1f7a95b9901aea8695"
 EXECUTOR_CONTEXT_MODULE_AST_SHA256 = "baa03f665069c9b814230a0448eba0ed9f7af8961beee75d2d8dfe0ab3d5dd50"
 PYTHON_GENERATOR_MODULE_AST_SHA256 = "afaf387a9833002d3b0475a721699ca27f393b90a5e5cd109e6c639364217128"
-TRACE_SCHEMA_VERSION = 3
+TRACE_SCHEMA_VERSION = 4
 MODEL_SCHEMA_VERSION = 3
 
 
@@ -54,6 +55,33 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--trace", type=Path, action="append", required=True)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
+
+
+def conservative_child_owners(
+    owners: set[str], expected: set[str], test_ids: list[str]
+) -> set[str]:
+    """Expand only reads outside an attributed process-pool task."""
+    result = set(owners)
+    result.discard(CHILD_SENTINEL)
+    ambient = {
+        owner.removeprefix(AMBIENT_PREFIX)
+        for owner in owners
+        if owner.startswith(AMBIENT_PREFIX)
+    }
+    result.difference_update(
+        owner for owner in tuple(result) if owner.startswith(AMBIENT_PREFIX)
+    )
+    if "__NO_TEST__" in ambient:
+        result.add("__NO_TEST__")
+    ambient_files = {
+        owner.split("::", 1)[0] for owner in ambient if owner in expected
+    }
+    result.update(
+        test_id
+        for test_id in test_ids
+        if test_id.split("::", 1)[0] in ambient_files
+    )
+    return result
 
 
 def immutable_literal(value: object) -> bool:
@@ -877,7 +905,7 @@ def main() -> None:
             or manifest.get("test_digest") != test_digest
             or manifest.get("trace_sha256") != hashlib.sha256(raw).hexdigest()
             or manifest.get("tracker_version") != TRACE_SCHEMA_VERSION
-            or manifest.get("task_attribution") != "submit-wrapper-v3"
+            or manifest.get("task_attribution") != "submit-wrapper-v4-ambient"
             or manifest.get("pool_workers") != 2
             or type(manifest.get("child_logs")) is not int
             or type(manifest.get("standalone_child_logs")) is not int
@@ -920,7 +948,12 @@ def main() -> None:
         for document in documents
         for owners in document.values()
         for owner in owners
-        if owner not in {"__NO_TEST__", CHILD_SENTINEL} and owner not in expected
+        if owner not in {"__NO_TEST__", CHILD_SENTINEL}
+        and owner not in expected
+        and not (
+            owner.startswith(AMBIENT_PREFIX)
+            and owner.removeprefix(AMBIENT_PREFIX) in expected | {"__NO_TEST__"}
+        )
     }
     if unknown_owners:
         raise SystemExit(f"trace contains {len(unknown_owners)} unknown test owners")
@@ -935,22 +968,11 @@ def main() -> None:
     states = defaultdict(int)
     for relative, _module, statement, name, label, kind, immutable in source_entries:
         observations = [document.get(label) for document in documents]
-        owners = set().union(*(set(item or ()) for item in observations))
-        if CHILD_SENTINEL in owners:
-            # A spawned process can survive across several tests while its
-            # inherited BR_PARENT_TEST remains the creator. Any child-observed
-            # read therefore belongs conservatively to every test in each
-            # recorded creator's file, not merely to the first method.
-            child_files = {
-                owner.split("::", 1)[0]
-                for owner in owners
-                if owner in expected
-            }
-            owners.update(
-                test_id
-                for test_id in test_ids
-                if test_id.split("::", 1)[0] in child_files
-            )
+        owners = conservative_child_owners(
+            set().union(*(set(item or ()) for item in observations)),
+            expected,
+            test_ids,
+        )
         if not immutable:
             state = "mutable"
         elif label in unsafe:

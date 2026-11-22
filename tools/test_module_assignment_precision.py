@@ -16,7 +16,11 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from build_module_constant_model import static_unsafe, validated_trace_document
+from build_module_constant_model import (
+    conservative_child_owners,
+    static_unsafe,
+    validated_trace_document,
+)
 from collect_module_constant_reads import (
     DERIVED_CLASS_ALIASES_ENABLED,
     TRACKER_TEMPLATE,
@@ -81,7 +85,7 @@ class ModuleAssignmentPrecisionTests(unittest.TestCase):
 
     def test_trace_task_ledger_rejects_missing_or_unattributed_work(self):
         normal = {
-            "v": 3,
+            "v": 4,
             "events": {"label": ["tests/test_owner.py::test_owner"]},
             "tasks": {
                 "completed": ["task-1"],
@@ -111,12 +115,47 @@ class ModuleAssignmentPrecisionTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             validated_trace_document(synchronous, "normal")
 
-    def test_collector_digest_binds_synchronous_rewrite_dependency(self):
+    def test_collector_digest_binds_self_contained_synchronous_rewrite(self):
         self.write("collect_module_constant_reads.py", "collector-v1\n")
         self.write("collect_dict_access.py", "rewrite-v1\n")
         first = collector_code_digest(self.source)
         self.write("collect_dict_access.py", "rewrite-v2\n")
+        self.assertEqual(first, collector_code_digest(self.source))
+        self.write("collect_module_constant_reads.py", "collector-v2\n")
         self.assertNotEqual(first, collector_code_digest(self.source))
+
+    def test_only_ambient_child_reads_expand_to_creator_file(self):
+        expected = {
+            "tests/test_pool.py::TestPool::test_first",
+            "tests/test_pool.py::TestPool::test_second",
+            "tests/test_other.py::TestOther::test_exact",
+        }
+        test_ids = sorted(expected)
+        owners = {
+            "__BR_CHILD__",
+            "__BR_AMBIENT__:tests/test_pool.py::TestPool::test_first",
+            "tests/test_other.py::TestOther::test_exact",
+        }
+        self.assertEqual(
+            conservative_child_owners(owners, expected, test_ids),
+            expected,
+        )
+        self.assertEqual(
+            conservative_child_owners(
+                {"__BR_CHILD__", "tests/test_other.py::TestOther::test_exact"},
+                expected,
+                test_ids,
+            ),
+            {"tests/test_other.py::TestOther::test_exact"},
+        )
+        self.assertEqual(
+            conservative_child_owners(
+                {"__BR_CHILD__", "__BR_AMBIENT__:__NO_TEST__"},
+                expected,
+                test_ids,
+            ),
+            {"__NO_TEST__"},
+        )
 
     def test_module_model_recursive_validation_rejects_forged_body(self):
         digest = "a" * 64

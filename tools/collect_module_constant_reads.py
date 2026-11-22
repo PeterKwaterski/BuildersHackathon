@@ -16,9 +16,7 @@ import tempfile
 from collections import defaultdict
 from pathlib import Path
 
-from collect_dict_access import PINNED_SHA, synchronous_worker_tests, validate_source
-
-
+PINNED_SHA = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
 RUNTIME_HELPERS = {
     "_br_module_constant_read",
     "_br_module_constant_class_attr",
@@ -35,8 +33,8 @@ RUNTIME_HELPERS = {
 # separate proof exists; direct module readers and class-tuple constants do not
 # depend on it.
 DERIVED_CLASS_ALIASES_ENABLED = False
-TRACE_SCHEMA_VERSION = 3
-TASK_ATTRIBUTION = "submit-wrapper-v3"
+TRACE_SCHEMA_VERSION = 4
+TASK_ATTRIBUTION = "submit-wrapper-v4-ambient"
 POOL_WORKERS = 2
 
 
@@ -44,7 +42,7 @@ def collector_code_digest(directory: Path | None = None) -> str:
     """Bind every repository file that can change collection semantics."""
     directory = directory or Path(__file__).parent
     digest = hashlib.sha256()
-    for name in ("collect_module_constant_reads.py", "collect_dict_access.py"):
+    for name in ("collect_module_constant_reads.py",):
         raw = (directory / name).read_bytes()
         encoded_name = name.encode()
         digest.update(len(encoded_name).to_bytes(4, "big"))
@@ -52,6 +50,102 @@ def collector_code_digest(directory: Path | None = None) -> str:
         digest.update(len(raw).to_bytes(8, "big"))
         digest.update(raw)
     return digest.hexdigest()
+
+
+SYNC_OPTIMIZER = '''class ProcessPoolExecutor:
+    """Synchronous executor used only by the module-constant collector."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.shutdown()
+
+    def submit(self, func, *args, **kwargs):
+        future = Future()
+        try:
+            future.set_result(func(*args, **kwargs))
+        except BaseException as error:
+            future.set_exception(error)
+        return future
+
+    def shutdown(self, *args, **kwargs):
+        pass
+
+
+'''
+
+SYNC_EXECUTOR = '''class ProcessPoolExecutor:
+    """Synchronous executor used only by the module-constant collector."""
+
+    def __init__(self, *args, initializer=None, initargs=(), **kwargs):
+        if initializer:
+            initializer(*initargs)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.shutdown()
+
+    def submit(self, func, *args, **kwargs):
+        future = Future()
+        try:
+            future.set_result(func(*args, **kwargs))
+        except BaseException as error:
+            future.set_exception(error)
+        return future
+
+    def shutdown(self, *args, **kwargs):
+        pass
+
+
+'''
+
+
+def replace_once(path: Path, old: str, new: str) -> None:
+    source = path.read_text()
+    if source.count(old) != 1:
+        raise SystemExit(f"expected one pinned marker in {path}: {old!r}")
+    path.write_text(source.replace(old, new))
+
+
+def synchronous_worker_tests(source: Path) -> None:
+    optimizer = source / "tests/test_optimizer.py"
+    replace_once(
+        optimizer,
+        "from concurrent.futures import ProcessPoolExecutor, as_completed, wait",
+        "from concurrent.futures import Future, as_completed, wait",
+    )
+    replace_once(
+        optimizer,
+        "def parse_and_optimize(func, sql, read_dialect, **kwargs):",
+        SYNC_OPTIMIZER + "def parse_and_optimize(func, sql, read_dialect, **kwargs):",
+    )
+    executor = source / "tests/test_executor.py"
+    replace_once(
+        executor,
+        "from concurrent.futures import ProcessPoolExecutor",
+        "from concurrent.futures import Future",
+    )
+    replace_once(executor, "DIR_TPCH =", SYNC_EXECUTOR + "DIR_TPCH =")
+
+
+def validate_source(source: Path) -> None:
+    revision = subprocess.check_output(
+        ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
+    ).strip()
+    if revision != PINNED_SHA:
+        raise SystemExit(f"source is {revision}, expected {PINNED_SHA}")
+    status = subprocess.check_output(
+        ["git", "-C", str(source), "status", "--porcelain", "--", "sqlglot", "tests"],
+        text=True,
+    )
+    if status:
+        raise SystemExit("pinned sqlglot/tests checkout must be clean")
 
 
 def source_inventory_digest(source: Path) -> str:
@@ -765,6 +859,8 @@ from pathlib import Path
 CURRENT_TEST = os.environ.get("BR_PARENT_TEST")
 EVENTS = defaultdict(set)
 CLASS_ALIASES = __CLASS_ALIASES__
+ROOT_PID = int(os.environ.setdefault("MODULE_CONSTANT_ROOT_PID", str(os.getpid())))
+ACTIVE_TASK = False
 SUBMITTED_TASKS = set()
 COMPLETED_TASKS = set()
 TASK_WORKERS = defaultdict(set)
@@ -772,7 +868,10 @@ TASK_SEQUENCE = 0
 ORIGINAL_PROCESS_POOL = concurrent.futures.ProcessPoolExecutor
 
 def owner():
-    return CURRENT_TEST or "__NO_TEST__"
+    current = CURRENT_TEST or "__NO_TEST__"
+    if os.getpid() != ROOT_PID and not ACTIVE_TASK:
+        return "__BR_AMBIENT__:" + current
+    return current
 
 def read(label, value):
     EVENTS[label].add(owner())
@@ -843,7 +942,7 @@ def reflect_call(function, value, *args, **kwargs):
 
 def document():
     return {
-        "v": 3,
+        "v": 4,
         "events": {
             label: sorted(owners) for label, owners in sorted(EVENTS.items())
         },
@@ -874,9 +973,11 @@ def write_child():
     temporary.replace(path)
 
 def run_with_owner(function, task, task_owner, args, kwargs):
-    global CURRENT_TEST
+    global ACTIVE_TASK, CURRENT_TEST
     prior = CURRENT_TEST
+    prior_active = ACTIVE_TASK
     CURRENT_TEST = task_owner
+    ACTIVE_TASK = True
     if task_owner:
         os.environ["BR_PARENT_TEST"] = task_owner
     else:
@@ -886,6 +987,7 @@ def run_with_owner(function, task, task_owner, args, kwargs):
     finally:
         COMPLETED_TASKS.add(task)
         TASK_WORKERS[task].add(os.getpid())
+        ACTIVE_TASK = prior_active
         CURRENT_TEST = prior
         if prior:
             os.environ["BR_PARENT_TEST"] = prior
@@ -954,7 +1056,7 @@ def pytest_sessionfinish(session, exitstatus):
         if (
             not isinstance(document, dict)
             or set(document) != {"events", "tasks", "v"}
-            or document.get("v") != 3
+            or document.get("v") != 4
             or not isinstance(document.get("events"), dict)
             or not isinstance(document.get("tasks"), dict)
             or set(document["tasks"]) != {"completed", "submitted", "workers"}
@@ -1012,14 +1114,14 @@ def pytest_sessionfinish(session, exitstatus):
         "source_inventory_digest": os.environ["MODULE_CONSTANT_SOURCE_INVENTORY"],
         "standalone_child_logs": standalone_child_logs,
         "submitted_tasks": len(_br_module_constant.SUBMITTED_TASKS),
-        "task_attribution": "submit-wrapper-v3",
+        "task_attribution": "submit-wrapper-v4-ambient",
         "task_workers": len({
             worker
             for workers in _br_module_constant.TASK_WORKERS.values()
             for worker in workers
         }),
         "test_digest": os.environ["MODULE_CONSTANT_TEST_DIGEST"],
-        "tracker_version": 3,
+        "tracker_version": 4,
         "trace_sha256": hashlib.sha256(encoded).hexdigest(),
         "tests": EXECUTED,
     }, sort_keys=True, separators=(",", ":")))
